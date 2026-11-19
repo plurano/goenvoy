@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Verify workflow links and reject Shields actions workflow/status badges everywhere.
-# Reject legacy Shields and native workflow status badges outside governance blocks.
+# Allow plain static Shields badges and verify workflow links.
+# Reject other Shields references everywhere and badge.svg outside governance blocks.
 #   usage: tools/readme-badges.sh --repo owner/name [root]
 set -euo pipefail
 
@@ -92,7 +92,18 @@ for f in "${files[@]}"; do
   governance_seen=0
   for ((lnum = 1; lnum <= ${#lines[@]}; lnum++)); do
     line="${lines[lnum - 1]}"
-    lower_line="${line,,}"
+    stripped="$line"
+    static_badge_re="https://img\.shields\.io/badge/([A-Za-z0-9_.+-]|%20)+(\?[A-Za-z0-9_.=&;:/%+-]*)?([\"')>[:space:]]|$)"
+    for ((strip_i = 0; strip_i < ${#line}; strip_i++)); do
+      if [[ "$stripped" =~ $static_badge_re ]]; then
+        matched="${BASH_REMATCH[0]}"
+        delimiter="${BASH_REMATCH[3]}"
+        stripped="${stripped/"$matched"/ $delimiter}"
+      else
+        break
+      fi
+    done
+    lower_line="${stripped,,}"
     decoded=""
     rest="$lower_line"
     for ((decode_i = 0; decode_i < ${#lower_line} && ${#rest} > 0; decode_i++)); do
@@ -172,12 +183,12 @@ for f in "${files[@]}"; do
         in_governance=0
       fi
     fi
-    if [[ "$lower_line" =~ (^|[^a-z0-9.-])([a-z0-9-]+\.)*shields\.io/github/actions/workflow/status/ ]]; then
-      printf 'readme-badges: %s:%s: shields workflow/status badge reads the last default-branch run; use a static badge\n' "$rel" "$lnum" >&2
+    if [[ "$lower_line" == *shields* ]]; then
+      printf 'readme-badges: %s:%s: shields reference is not a plain static badge\n' "$rel" "$lnum" >&2
       misses=$((misses + 1))
     fi
-    if [ "$in_governance" -ne 1 ] && [[ "$lower_line" =~ (^|[^a-z0-9.-])([a-z0-9-]+\.)*shields\.io/github/workflow/status/ || "$lower_line" =~ actions/workflows/[A-Za-z0-9._-]+/badge\.svg ]]; then
-      printf 'readme-badges: %s:%s: workflow status badge reads the last default-branch run; use a static badge\n' "$rel" "$lnum" >&2
+    if [ "$in_governance" -ne 1 ] && [[ "$lower_line" == *badge.svg* ]]; then
+      printf 'readme-badges: %s:%s: badge.svg outside the governance block\n' "$rel" "$lnum" >&2
       misses=$((misses + 1))
     fi
     if [[ "$line" != *actions/workflows* ]]; then
