@@ -2,7 +2,8 @@
 # Detect privileged in-place writes; privileged install must stage to .new
 # or create directories. Only allow listed commands without redirects.
 # Bash splits words on space and tab only.
-# Makefile recipe prefixes @ - + and $$ are read as make reads them.
+# Make files (Makefile, makefile, GNUmakefile, *.mk) read recipe prefixes
+# @ - + and $$ as make reads them.
 # Scope: honest mistakes, read one physical line at a time. Out of scope:
 # line continuation, quotes spanning lines, quoted or escaped launcher
 # names. Compensating step: shfmt syntax tree, golusoris/goenvoy#363.
@@ -20,13 +21,17 @@ cd "$root"
 count=0
 failed=0
 while IFS= read -r -d '' file; do
+  is_make=0
+  case "${file##*/}" in
+    Makefile|makefile|GNUmakefile|*.mk) is_make=1 ;;
+  esac
   case "$file" in
-    *.sh|*.bash|Makefile|*/Makefile|.github/workflows/*.yml|.github/workflows/*.yaml|.github/actions/*.yml|.github/actions/*.yaml) ;;
-    *) continue ;;
+    *.sh|*.bash|.github/workflows/*.yml|.github/workflows/*.yaml|.github/actions/*.yml|.github/actions/*.yaml) ;;
+    *) (( is_make )) || continue ;;
   esac
   [[ -f "$file" ]] || continue
   count=$((count + 1))
-  if awk '
+  if awk -v is_make="$is_make" '
     BEGIN {
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
       variable = "\\$(" name ")|\\$\\{(" name ")\\}|\\$\\((" name ")\\)"
@@ -41,7 +46,7 @@ while IFS= read -r -d '' file; do
       line = $0
       active_prefix = prefix
       active_command = command
-      if (FILENAME ~ /(^|\/)Makefile$/) {
+      if (is_make) {
         gsub(/\$\$/, "$", line)
         active_prefix = make_prefix
         active_command = make_command
