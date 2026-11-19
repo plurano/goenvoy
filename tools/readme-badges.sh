@@ -82,6 +82,7 @@ for f in "${files[@]}"; do
   in_governance=0
   for ((lnum = 1; lnum <= ${#lines[@]}; lnum++)); do
     line="${lines[lnum - 1]}"
+    lower_line="${line,,}"
     marker="${line#"${line%%[![:space:]]*}"}"
     marker="${marker%"${marker##*[![:space:]]}"}"
     if [[ "$marker" == '<!-- praetor:readme-governance:start -->' ]]; then
@@ -101,11 +102,11 @@ for f in "${files[@]}"; do
         in_governance=0
       fi
     fi
-    if [[ "$line" == *img.shields.io/github/actions/workflow/status/* ]]; then
+    if [[ "$lower_line" == *img.shields.io/github/actions/workflow/status/* ]]; then
       printf 'readme-badges: %s:%s: shields workflow/status badge reads the last default-branch run; use a static badge\n' "$rel" "$lnum" >&2
       misses=$((misses + 1))
     fi
-    if [ "$in_governance" -eq 0 ] && [[ "$line" == *img.shields.io/github/workflow/status/* || "$line" =~ actions/workflows/[A-Za-z0-9._-]+/badge\.svg ]]; then
+    if [ "$in_governance" -eq 0 ] && [[ "$lower_line" == *img.shields.io/github/workflow/status/* || "$lower_line" =~ actions/workflows/[A-Za-z0-9._-]+/badge\.svg ]]; then
       printf 'readme-badges: %s:%s: workflow status badge reads the last default-branch run; use a static badge\n' "$rel" "$lnum" >&2
       misses=$((misses + 1))
     fi

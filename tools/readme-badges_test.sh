@@ -288,6 +288,22 @@ touch "$WORK/case_ae/.github/workflows/ci.yml"
 printf '%s\n' '  <!-- praetor:readme-governance:start -->  ' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' '  <!-- praetor:readme-governance:end -->  ' > "$WORK/case_ae/README.md"
 expect_output "case_ae: whitespace around markers" "readme-badges: 1 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_ae"
 
+# Case (af): uppercase shields host inside governance -> 1.
+mkdir -p "$WORK/case_af"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://IMG.SHIELDS.IO/github/actions/workflow/status/acme/widgets/ci.yml' '<!-- praetor:readme-governance:end -->' > "$WORK/case_af/README.md"
+expect_refusal "case_af: uppercase shields host" "README.md:2: shields workflow/status" "${SUT[@]}" --repo acme/widgets "$WORK/case_af"
+
+# Case (ag): mixed-case legacy shields host outside governance -> 1.
+mkdir -p "$WORK/case_ag"
+printf '%s\n' 'https://Img.Shields.IO/github/workflow/status/acme/widgets/CI' > "$WORK/case_ag/README.md"
+expect_refusal "case_ag: mixed-case legacy shields host" "README.md:1: workflow status badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ag"
+
+# Case (ah): mixed-case native badge outside governance -> 1.
+mkdir -p "$WORK/case_ah/.github/workflows"
+touch "$WORK/case_ah/.github/workflows/ci.yml"
+printf '%s\n' 'https://GitHub.com/acme/widgets/Actions/Workflows/ci.yml/badge.svg' > "$WORK/case_ah/README.md"
+expect_refusal "case_ah: mixed-case native badge" "README.md:1: workflow status badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ah"
+
 # Real check on the repo root -> 0
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 expect_pattern "repo: real check" "workflow references ok" --repo golusoris/goenvoy "$REPO_ROOT"
