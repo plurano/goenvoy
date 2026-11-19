@@ -387,6 +387,11 @@ mkdir -p "$WORK/case_ax/docs"
 printf '%s\n' 'https://img.shields.io/github/actions/workflow/status/a/b/c.yml' > "$WORK/case_ax/docs/Readme.md"
 expect_refusal "case_ax: mixed-case docs README" "docs/Readme.md:1: shields workflow/status" "${SUT[@]}" --repo a/b "$WORK/case_ax"
 
+# Case (ay): HTML reference forms an uppercase percent escape -> 1.
+mkdir -p "$WORK/case_ay"
+printf '%s\n' '<img src="https://img&#37;2&#x45;shields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_ay/README.md"
+expect_refusal "case_ay: HTML then uppercase percent" "README.md:1: shields workflow/status" "${SUT[@]}" --repo a/b "$WORK/case_ay"
+
 # Real check on the repo root -> 0
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 expect_pattern "repo: real check" "workflow references ok" --repo golusoris/goenvoy "$REPO_ROOT"

@@ -126,7 +126,7 @@ for f in "${files[@]}"; do
       fi
       rest="${rest:${#token}}"
     done
-    rest="$decoded"
+    rest="${decoded,,}"
     decoded=""
     limit=${#rest}
     for ((decode_i = 0; decode_i < limit && ${#rest} > 0; decode_i++)); do
