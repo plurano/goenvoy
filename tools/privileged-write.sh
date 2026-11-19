@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Detect privileged in-place writes; privileged install must stage to .new
 # or create directories. Only allow listed commands without redirects.
+# Single-line quoted YAML run values and &> / &>> redirects are read.
 # Bash splits words on space and tab only.
 # Make files (Makefile, makefile, GNUmakefile, *.mk) read recipe prefixes
 # @ - +, $$, and a leading punctuation .RECIPEPREFIX as make reads them.
@@ -23,16 +24,18 @@ count=0
 failed=0
 while IFS= read -r -d '' file; do
   is_make=0
+  is_yaml=0
   case "${file##*/}" in
     Makefile|makefile|GNUmakefile|*.mk) is_make=1 ;;
   esac
   case "$file" in
-    *.sh|*.bash|.github/workflows/*.yml|.github/workflows/*.yaml|.github/actions/*.yml|.github/actions/*.yaml) ;;
+    .github/workflows/*.yml|.github/workflows/*.yaml|.github/actions/*.yml|.github/actions/*.yaml) is_yaml=1 ;;
+    *.sh|*.bash) ;;
     *) (( is_make )) || continue ;;
   esac
   [[ -f "$file" ]] || continue
   count=$((count + 1))
-  if awk -v is_make="$is_make" '
+  if PRIVWRITE_FILE="$file" awk -v is_make="$is_make" -v is_yaml="$is_yaml" '
     BEGIN {
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
       variable = "\\$(" name ")|\\$\\{(" name ")\\}|\\$\\((" name ")\\)"
@@ -41,10 +44,15 @@ while IFS= read -r -d '' file; do
       command = prefix "[[:space:]]+[^[:space:];|&]+"
       make_command = make_prefix "[[:space:]]+[^[:space:];|&]+"
     }
-    FNR > 100000 { print FILENAME ":" FNR; failed = 1; nextfile }
+    FNR > 100000 { print ENVIRON["PRIVWRITE_FILE"] ":" FNR; failed = 1; nextfile }
     /^[ \t]*#/ { next }
     {
       line = $0
+      if (is_yaml && match(line, "^[ \t]*(-[ \t]+)?run:[ \t]*[" sprintf("%c", 39) "\"]")) {
+        yaml_quote = substr(line, RLENGTH, 1)
+        line = substr(line, 1, RLENGTH - 1) " " substr(line, RLENGTH + 1)
+        if (substr(line, length(line), 1) == yaml_quote) line = substr(line, 1, length(line) - 1)
+      }
       active_prefix = prefix
       active_command = command
       if (is_make) {
@@ -64,6 +72,7 @@ while IFS= read -r -d '' file; do
           continue
         }
         call = substr(call, RLENGTH + 1)
+        gsub(/&>/, ">", rest)
         split(rest, segments, /[;|&]/)
         install_ok = 0
         if (call == "install") {
@@ -138,14 +147,14 @@ while IFS= read -r -d '' file; do
           if (!refused && (directory || last ~ /\.new$/)) install_ok = 1
         }
         if (call !~ /^(install|mv|rm|chown|chmod|test|cat|systemctl)$/ || segments[1] ~ />/ || (call == "install" && !install_ok)) {
-          print FILENAME ":" FNR
+          print ENVIRON["PRIVWRITE_FILE"] ":" FNR
           failed = 1
         }
         line = rest
       }
     }
     END { exit failed }
-  ' "$file" > "$list.hits"; then :; else
+  ' "./$file" < /dev/null > "$list.hits"; then :; else
     status=$?
     if (( status != 1 )); then rm -f "$list.hits"; exit "$status"; fi
     failed=1

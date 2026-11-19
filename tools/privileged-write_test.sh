@@ -12,6 +12,16 @@ GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" init -q
 printf "clean\n" > "$WORK/a.sh"
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add a.sh
 SUT=(bash "$HERE/privileged-write.sh" "$WORK")
+printf '%s\n' 'sudo'' cp a b' > "$WORK/a.sh"
+if output="$("${SUT[@]}" 2>&1)"; then
+  echo "FAIL message_filename: accepted" >&2
+  exit 1
+fi
+case "$output" in
+  'privileged-write: a.sh:1: '*) echo "ok   message_filename: tracked name" ;;
+  *) printf 'FAIL message_filename: unexpected message: %s\n' "$output" >&2; exit 1 ;;
+esac
+printf "clean\n" > "$WORK/a.sh"
 printf '%s\v%s\n' 'sudo'' install source' '-d victim' > "$WORK/a.sh"
 expect_refusal vt_separator "a.sh:1:" "${SUT[@]}"
 printf '%s\f%s\n' 'sudo'' install source' '-d victim' > "$WORK/a.sh"
@@ -128,7 +138,39 @@ printf "clean\n" > "$WORK/a.sh"
 printf "%s\n" 'run: sudo'' cp a b' > "$WORK/.github/workflows/w.yml"
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add .github/workflows/w.yml
 expect_refusal workflow ".github/workflows/w.yml:1:" "${SUT[@]}"
+printf "%s\n" "- run: 'sudo"" cp a b'" > "$WORK/.github/workflows/w.yml"
+expect_refusal workflow_single_quoted ".github/workflows/w.yml:1:" "${SUT[@]}"
+printf '%s\n' 'run: "sudo'' cp a b"' > "$WORK/.github/workflows/w.yml"
+expect_refusal workflow_double_quoted ".github/workflows/w.yml:1:" "${SUT[@]}"
+printf "%s\n" "run: 'sudo"" install -m 0644 a /etc/x.new'" > "$WORK/.github/workflows/w.yml"
+expect_pass workflow_quoted_staged "${SUT[@]}"
+printf "%s\n" "name: 'sudo"" cp a b'" > "$WORK/.github/workflows/w.yml"
+expect_pass workflow_quoted_other_key "${SUT[@]}"
 printf "clean\n" > "$WORK/.github/workflows/w.yml"
+mkdir -p "$WORK/.github/actions/x"
+printf "%s\n" "run: 'sudo"" cp a b'" > "$WORK/.github/actions/x/action.yml"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add .github/actions/x/action.yml
+expect_refusal action_single_quoted ".github/actions/x/action.yml:1:" "${SUT[@]}"
+printf "clean\n" > "$WORK/.github/actions/x/action.yml"
+printf '%s\n' 'sudo'' cat source &> /etc/config' > "$WORK/a.sh"
+expect_refusal sudo_amp_redirect "a.sh:1:" "${SUT[@]}"
+printf '%s\n' 'sudo'' cat source &>> /etc/config' > "$WORK/a.sh"
+expect_refusal sudo_amp_append "a.sh:1:" "${SUT[@]}"
+printf '%s\n' 'sudo'' cat source&>/etc/config' > "$WORK/a.sh"
+expect_refusal sudo_amp_tight "a.sh:1:" "${SUT[@]}"
+printf '%s\n' 'sudo'' systemctl restart x & echo hi > log' > "$WORK/a.sh"
+expect_pass sudo_background_then_redirect "${SUT[@]}"
+printf '%s\n' 'sudo'' systemctl restart x && echo hi > log' > "$WORK/a.sh"
+expect_pass sudo_and_then_redirect "${SUT[@]}"
+printf "clean\n" > "$WORK/a.sh"
+printf '%s\n' 'sudo'' cp a b' > "$WORK/a=b.sh"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add 'a=b.sh'
+expect_refusal assignment_named_file "a=b.sh:1:" "${SUT[@]}"
+printf "clean\n" > "$WORK/a=b.sh"
+printf '%s\n' 'sudo'' cp a b' > "$WORK/zz.sh"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add zz.sh
+expect_refusal after_assignment_named_file "zz.sh:1:" "${SUT[@]}"
+printf "clean\n" > "$WORK/zz.sh"
 printf "\t%s\n" 'sudo'' cp a b' > "$WORK/Makefile"
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add Makefile
 expect_refusal makefile "Makefile:1:" "${SUT[@]}"
