@@ -304,6 +304,38 @@ touch "$WORK/case_ah/.github/workflows/ci.yml"
 printf '%s\n' 'https://GitHub.com/acme/widgets/Actions/Workflows/ci.yml/badge.svg' > "$WORK/case_ah/README.md"
 expect_refusal "case_ah: mixed-case native badge" "README.md:1: workflow status badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ah"
 
+# Case (ai): percent-encoded shields host -> 1.
+mkdir -p "$WORK/case_ai"
+printf '%s\n' 'https://img%2eshields.io/github/actions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_ai/README.md"
+expect_refusal "case_ai: encoded host" "README.md:1: shields workflow/status" "${SUT[@]}" --repo acme/widgets "$WORK/case_ai"
+
+# Case (aj): bare shields host -> 1.
+mkdir -p "$WORK/case_aj"
+printf '%s\n' 'https://shields.io/github/actions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_aj/README.md"
+expect_refusal "case_aj: bare host" "README.md:1: shields workflow/status" "${SUT[@]}" --repo acme/widgets "$WORK/case_aj"
+
+# Case (ak): numeric character reference in host -> 1.
+mkdir -p "$WORK/case_ak"
+printf '%s\n' '<img src="https://img.shields&#46;io/github/actions/workflow/status/acme/widgets/ci.yml">' > "$WORK/case_ak/README.md"
+expect_refusal "case_ak: numeric host" "README.md:1: shields workflow/status" "${SUT[@]}" --repo acme/widgets "$WORK/case_ak"
+
+# Case (al): second governance block -> 1 without exemption.
+mkdir -p "$WORK/case_al/.github/workflows"
+touch "$WORK/case_al/.github/workflows/ci.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' '<!-- praetor:readme-governance:end -->' '<!-- praetor:readme-governance:start -->' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' '<!-- praetor:readme-governance:end -->' > "$WORK/case_al/README.md"
+expect_status "case_al: second block" 1 "README.md:4: workflow status badge" --repo acme/widgets "$WORK/case_al"
+
+# Case (am): governance block in another file -> 1 without exemption.
+mkdir -p "$WORK/case_am/.github/workflows"
+touch "$WORK/case_am/.github/workflows/ci.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' '<!-- praetor:readme-governance:end -->' > "$WORK/case_am/CONTRIBUTING.md"
+expect_status "case_am: other file block" 1 "CONTRIBUTING.md:2: workflow status badge" --repo acme/widgets "$WORK/case_am"
+
+# Case (an): encoded static badge -> 0.
+mkdir -p "$WORK/case_an"
+printf '%s\n' 'https://img.shields.io/badge/hello%20world-blue' > "$WORK/case_an/README.md"
+expect_output "case_an: encoded static badge" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_an"
+
 # Real check on the repo root -> 0
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 expect_pattern "repo: real check" "workflow references ok" --repo golusoris/goenvoy "$REPO_ROOT"

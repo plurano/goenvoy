@@ -80,17 +80,61 @@ for f in "${files[@]}"; do
   rel="${f#"$ROOT"/}"
   readarray -t lines <"$f"
   in_governance=0
+  governance_seen=0
   for ((lnum = 1; lnum <= ${#lines[@]}; lnum++)); do
     line="${lines[lnum - 1]}"
     lower_line="${line,,}"
+    decoded=""
+    rest="$lower_line"
+    for ((decode_i = 0; decode_i < ${#line} && ${#rest} > 0; decode_i++)); do
+      if [[ "$rest" =~ ^%([0-9a-f]{2}) ]]; then
+        token="${BASH_REMATCH[0]}"
+        code=$((16#${BASH_REMATCH[1]}))
+      elif [[ "$rest" =~ ^\&\#([0-9]+)\; ]]; then
+        token="${BASH_REMATCH[0]}"
+        digits="${BASH_REMATCH[1]}"
+        digits="${digits#"${digits%%[!0]*}"}"
+        code=0
+        if ((${#digits} > 0 && ${#digits} <= 7)); then
+          code=$((10#$digits))
+        fi
+      elif [[ "$rest" =~ ^\&\#x([0-9a-f]+)\; ]]; then
+        token="${BASH_REMATCH[0]}"
+        digits="${BASH_REMATCH[1]}"
+        digits="${digits#"${digits%%[!0]*}"}"
+        code=0
+        if ((${#digits} > 0 && ${#digits} <= 6)); then
+          code=$((16#$digits))
+        fi
+      else
+        decoded+="${rest:0:1}"
+        rest="${rest:1}"
+        continue
+      fi
+      if ((code > 0 && code <= 1114111 && (code < 55296 || code > 57343))); then
+        printf -v escape '\\U%08x' "$code"
+        printf -v char '%b' "$escape"
+        decoded+="$char"
+      else
+        decoded+="$token"
+      fi
+      rest="${rest:${#token}}"
+    done
+    lower_line="${decoded,,}"
     marker="${line#"${line%%[![:space:]]*}"}"
     marker="${marker%"${marker##*[![:space:]]}"}"
     if [[ "$marker" == '<!-- praetor:readme-governance:start -->' ]]; then
-      if [ "$in_governance" -eq 1 ]; then
+      if [ "$in_governance" -ne 0 ]; then
         printf 'readme-badges: %s:%s: governance start inside block\n' "$rel" "$lnum" >&2
         misses=$((misses + 1))
+      elif [[ "$rel" != README.md ]] || [ "$governance_seen" -eq 1 ]; then
+        printf 'readme-badges: %s:%s: governance start not allowed here\n' "$rel" "$lnum" >&2
+        misses=$((misses + 1))
+        in_governance=2
+        governance_start="$lnum"
       else
         in_governance=1
+        governance_seen=1
         governance_start="$lnum"
       fi
     fi
@@ -102,11 +146,11 @@ for f in "${files[@]}"; do
         in_governance=0
       fi
     fi
-    if [[ "$lower_line" == *img.shields.io/github/actions/workflow/status/* ]]; then
+    if [[ "$lower_line" =~ (^|[^a-z0-9.-])([a-z0-9-]+\.)*shields\.io/github/actions/workflow/status/ ]]; then
       printf 'readme-badges: %s:%s: shields workflow/status badge reads the last default-branch run; use a static badge\n' "$rel" "$lnum" >&2
       misses=$((misses + 1))
     fi
-    if [ "$in_governance" -eq 0 ] && [[ "$lower_line" == *img.shields.io/github/workflow/status/* || "$lower_line" =~ actions/workflows/[A-Za-z0-9._-]+/badge\.svg ]]; then
+    if [ "$in_governance" -ne 1 ] && [[ "$lower_line" =~ (^|[^a-z0-9.-])([a-z0-9-]+\.)*shields\.io/github/workflow/status/ || "$lower_line" =~ actions/workflows/[A-Za-z0-9._-]+/badge\.svg ]]; then
       printf 'readme-badges: %s:%s: workflow status badge reads the last default-branch run; use a static badge\n' "$rel" "$lnum" >&2
       misses=$((misses + 1))
     fi
@@ -142,7 +186,7 @@ for f in "${files[@]}"; do
       fi
     done
   done
-  if [ "$in_governance" -eq 1 ]; then
+  if [ "$in_governance" -ne 0 ]; then
     printf 'readme-badges: %s:%s: unclosed governance block\n' "$rel" "$governance_start" >&2
     misses=$((misses + 1))
   fi

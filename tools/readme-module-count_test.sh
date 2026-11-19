@@ -15,7 +15,7 @@ if [ "${1:-}" = "--fixture" ]; then
   git init -q
   # Why: ensure Git tracks the fixture rather than a redirected repository.
   git_dir="$(git rev-parse --absolute-git-dir)"
-  if [ "$git_dir" != "$PWD/.git" ]; then
+  if [ "$git_dir" != "$(pwd -P)/.git" ]; then
     printf 'FAIL tracked fixture: git resolves to %s, not the fixture; an exported GIT_DIR or GIT_WORK_TREE redirected it\n' "$git_dir" >&2
     exit 1
   fi
@@ -44,7 +44,13 @@ import sys
 
 environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
 environment["GIT_CONFIG_GLOBAL"] = os.devnull
-os.execve(sys.argv[1], [sys.argv[1], sys.argv[2], "--fixture", sys.argv[3]], environment)
+import subprocess
+
+subprocess.run([sys.argv[1], sys.argv[2], "--fixture", sys.argv[3]], env=environment, check=True)
+os.mkdir(os.path.join(sys.argv[3], "physical"))
+os.symlink(os.path.join(sys.argv[3], "physical"), os.path.join(sys.argv[3], "link"))
+os.mkdir(os.path.join(sys.argv[3], "physical", "fixture"))
+subprocess.run([sys.argv[1], sys.argv[2], "--fixture", os.path.join(sys.argv[3], "link", "fixture")], env=environment, check=True)
 PYENV
 
 printf '{"one":"1.0.0","two":"1.0.0"}\n' > "$WORK/manifest.json"
