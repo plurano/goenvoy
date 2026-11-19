@@ -336,6 +336,21 @@ mkdir -p "$WORK/case_an"
 printf '%s\n' 'https://img.shields.io/badge/hello%20world-blue' > "$WORK/case_an/README.md"
 expect_output "case_an: encoded static badge" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_an"
 
+# Case (ao): bare legacy shields host outside governance -> 1.
+mkdir -p "$WORK/case_ao"
+printf '%s\n' 'https://shields.io/github/workflow/status/acme/widgets/CI' > "$WORK/case_ao/README.md"
+expect_refusal "case_ao: bare legacy host" "README.md:1: workflow status badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ao"
+
+# Case (ap): hex character reference in host -> 1.
+mkdir -p "$WORK/case_ap"
+printf '%s\n' '<img src="https://img.shields&#x2e;io/github/actions/workflow/status/acme/widgets/ci.yml">' > "$WORK/case_ap/README.md"
+expect_refusal "case_ap: hex host" "README.md:1: shields workflow/status" "${SUT[@]}" --repo acme/widgets "$WORK/case_ap"
+
+# Case (aq): percent-encoded uppercase letter in path -> 1.
+mkdir -p "$WORK/case_aq"
+printf '%s\n' 'https://img.shields.io/github/%41ctions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_aq/README.md"
+expect_refusal "case_aq: encoded uppercase path" "README.md:1: shields workflow/status" "${SUT[@]}" --repo acme/widgets "$WORK/case_aq"
+
 # Real check on the repo root -> 0
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 expect_pattern "repo: real check" "workflow references ok" --repo golusoris/goenvoy "$REPO_ROOT"
