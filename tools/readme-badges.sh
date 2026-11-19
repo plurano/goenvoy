@@ -66,6 +66,15 @@ for f in "$ROOT"/*.md "$ROOT"/*.markdown; do
   fi
   files+=("$f")
 done
+for f in "$ROOT"/.github/* "$ROOT"/docs/*; do
+  if [ ! -f "$f" ]; then
+    continue
+  fi
+  name="${f##*/}"
+  if [[ "${name,,}" == readme.md || "${name,,}" == readme.markdown ]]; then
+    files+=("$f")
+  fi
+done
 
 # Pattern for workflow references:
 # 1) github.com/<owner>/<repo>/actions/workflows/<file>
@@ -86,11 +95,8 @@ for f in "${files[@]}"; do
     lower_line="${line,,}"
     decoded=""
     rest="$lower_line"
-    for ((decode_i = 0; decode_i < ${#line} && ${#rest} > 0; decode_i++)); do
-      if [[ "$rest" =~ ^%([0-9a-f]{2}) ]]; then
-        token="${BASH_REMATCH[0]}"
-        code=$((16#${BASH_REMATCH[1]}))
-      elif [[ "$rest" =~ ^\&\#([0-9]+)\; ]]; then
+    for ((decode_i = 0; decode_i < ${#lower_line} && ${#rest} > 0; decode_i++)); do
+      if [[ "$rest" =~ ^\&\#([0-9]+)\;? ]]; then
         token="${BASH_REMATCH[0]}"
         digits="${BASH_REMATCH[1]}"
         digits="${digits#"${digits%%[!0]*}"}"
@@ -98,7 +104,7 @@ for f in "${files[@]}"; do
         if ((${#digits} > 0 && ${#digits} <= 7)); then
           code=$((10#$digits))
         fi
-      elif [[ "$rest" =~ ^\&\#x([0-9a-f]+)\; ]]; then
+      elif [[ "$rest" =~ ^\&\#x([0-9a-f]+)\;? ]]; then
         token="${BASH_REMATCH[0]}"
         digits="${BASH_REMATCH[1]}"
         digits="${digits#"${digits%%[!0]*}"}"
@@ -119,6 +125,26 @@ for f in "${files[@]}"; do
         decoded+="$token"
       fi
       rest="${rest:${#token}}"
+    done
+    rest="$decoded"
+    decoded=""
+    limit=${#rest}
+    for ((decode_i = 0; decode_i < limit && ${#rest} > 0; decode_i++)); do
+      if [[ "$rest" =~ ^%([0-9a-f]{2}) ]]; then
+        token="${BASH_REMATCH[0]}"
+        code=$((16#${BASH_REMATCH[1]}))
+        if ((code > 0)); then
+          printf -v escape '\\U%08x' "$code"
+          printf -v char '%b' "$escape"
+          decoded+="$char"
+        else
+          decoded+="$token"
+        fi
+        rest="${rest:${#token}}"
+      else
+        decoded+="${rest:0:1}"
+        rest="${rest:1}"
+      fi
     done
     lower_line="${decoded,,}"
     marker="${line#"${line%%[![:space:]]*}"}"

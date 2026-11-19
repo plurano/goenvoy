@@ -351,6 +351,42 @@ mkdir -p "$WORK/case_aq"
 printf '%s\n' 'https://img.shields.io/github/%41ctions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_aq/README.md"
 expect_refusal "case_aq: encoded uppercase path" "README.md:1: shields workflow/status" "${SUT[@]}" --repo acme/widgets "$WORK/case_aq"
 
+# Case (ar): decimal reference without semicolon -> 1.
+mkdir -p "$WORK/case_ar"
+printf '%s\n' '<img src="https://img.shields&#46io/github/actions/workflow/status/a/b/c">' > "$WORK/case_ar/README.md"
+expect_refusal "case_ar: decimal without semicolon" "README.md:1: shields workflow/status" "${SUT[@]}" --repo a/b "$WORK/case_ar"
+
+# Case (as): HTML reference forms a percent escape -> 1.
+mkdir -p "$WORK/case_as"
+printf '%s\n' '<img src="https://img&#37;2eshields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_as/README.md"
+expect_refusal "case_as: HTML then percent" "README.md:1: shields workflow/status" "${SUT[@]}" --repo a/b "$WORK/case_as"
+
+# Case (at): percent decoding does not repeat HTML decoding -> 0.
+mkdir -p "$WORK/case_at"
+printf '%s\n' 'https://img.shields%26%2346;io/github/actions/workflow/status/a/b/c' > "$WORK/case_at/README.md"
+expect_output "case_at: no second HTML pass" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_at"
+
+# Case (au): status badge in .github README -> 1.
+mkdir -p "$WORK/case_au/.github"
+printf '%s\n' 'https://img.shields.io/github/actions/workflow/status/a/b/c.yml' > "$WORK/case_au/.github/README.md"
+expect_refusal "case_au: github README" ".github/README.md:1: shields workflow/status" "${SUT[@]}" --repo a/b "$WORK/case_au"
+
+# Case (av): docs README cannot exempt native badge -> 1.
+mkdir -p "$WORK/case_av/.github/workflows" "$WORK/case_av/docs"
+touch "$WORK/case_av/.github/workflows/c.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://github.com/a/b/actions/workflows/c.yml/badge.svg' '<!-- praetor:readme-governance:end -->' > "$WORK/case_av/docs/README.md"
+expect_refusal "case_av: docs governance" "docs/README.md:2: workflow status badge" "${SUT[@]}" --repo a/b "$WORK/case_av"
+
+# Case (aw): hex reference without semicolon -> 1.
+mkdir -p "$WORK/case_aw"
+printf '%s\n' '<img src="https://img.shields&#x2eio/github/actions/workflow/status/a/b/c">' > "$WORK/case_aw/README.md"
+expect_refusal "case_aw: hex without semicolon" "README.md:1: shields workflow/status" "${SUT[@]}" --repo a/b "$WORK/case_aw"
+
+# Case (ax): mixed-case docs README -> 1.
+mkdir -p "$WORK/case_ax/docs"
+printf '%s\n' 'https://img.shields.io/github/actions/workflow/status/a/b/c.yml' > "$WORK/case_ax/docs/Readme.md"
+expect_refusal "case_ax: mixed-case docs README" "docs/Readme.md:1: shields workflow/status" "${SUT[@]}" --repo a/b "$WORK/case_ax"
+
 # Real check on the repo root -> 0
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 expect_pattern "repo: real check" "workflow references ok" --repo golusoris/goenvoy "$REPO_ROOT"
