@@ -58,6 +58,22 @@ printf '2 modules\n' > "$WORK/matching.md"
 printf 'heading\n1 modules and 2 modules\n' > "$WORK/stale.md"
 printf 'no count\n' > "$WORK/empty.md"
 printf '{"one":"1","one":"2"}\n' > "$WORK/duplicate.json"
+printf '1,002 modules\n' > "$WORK/comma.md"
+printf '1.002 modules\n' > "$WORK/dot.md"
+printf '1\xe2\x80\xaf002 modules\n' > "$WORK/narrow.md"
+printf 'Since 2024, 2 modules\n' > "$WORK/prose.md"
+python3 - "$WORK/large-manifest.json" <<'PYMANIFEST'
+import json
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({str(i): "1" for i in range(1002)}), encoding="utf-8")
+PYMANIFEST
+expect_refusal 'comma count tail' '1,002' "${SUT[@]}" "$WORK/manifest.json" "$WORK/comma.md"
+expect_refusal 'dot separator' 'module count 1.002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/dot.md"
+expect_refusal 'narrow space separator' 'module count 1 002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/narrow.md"
+expect_pass 'comma count match' "${SUT[@]}" "$WORK/large-manifest.json" "$WORK/comma.md"
+expect_pass 'plain count after comma prose' "${SUT[@]}" "$WORK/manifest.json" "$WORK/prose.md"
 expect_pass 'matching count' "${SUT[@]}" "$WORK/manifest.json" "$WORK/matching.md"
 expect_refusal 'stale count' "$WORK/stale.md:2: says 1 modules, manifest has 2" "${SUT[@]}" "$WORK/manifest.json" "$WORK/stale.md"
 expect_refusal 'missing count' "$WORK/empty.md" "${SUT[@]}" "$WORK/manifest.json" "$WORK/empty.md"

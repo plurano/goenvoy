@@ -38,6 +38,7 @@ try:
         raise ValueError("manifest must be an object")
     count = len(manifest)
     failed = False
+    count_pattern = re.compile(r"(?<!\w)(?<![0-9][,.'_\u00a0\u202f])([0-9]+(?:[,.'_\u00a0\u202f][0-9]+)*) modules\b")
     filenames = sys.argv[3:]
     if tracked:
         filenames = ["README.md", "docs/index.md"]
@@ -67,14 +68,19 @@ try:
                 content = data.decode("utf-8")
             except UnicodeDecodeError:
                 continue
-            if re.search(r"\b[0-9]+ modules\b", content):
+            if count_pattern.search(content):
                 filenames.append(filename)
     for filename in filenames:
         found = False
         for line_number, line in enumerate(Path(filename).read_text(encoding="utf-8").splitlines(), 1):
-            for match in re.finditer(r"\b([0-9]+) modules\b", line):
+            for match in count_pattern.finditer(line):
                 found = True
-                if int(match.group(1)) != count:
+                token = match.group(1)
+                if not re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)", token):
+                    print(f"{filename}:{line_number}: module count {token} is not a plain number", file=sys.stderr)
+                    failed = True
+                    continue
+                if int(token.replace(",", "")) != count:
                     print(f"{filename}:{line_number}: says {match.group(1)} modules, manifest has {count}", file=sys.stderr)
                     failed = True
         if not found:
