@@ -2,6 +2,9 @@
 # Detect privileged in-place writes; privileged install must stage to .new
 # or create directories. Only allow listed commands without redirects.
 # Bash splits words on space and tab only.
+# Scope: honest mistakes, read one physical line at a time. Out of scope:
+# line continuation, quotes spanning lines, quoted or escaped launcher
+# names. Compensating step: shfmt syntax tree, golusoris/goenvoy#363.
 set -euo pipefail
 
 if (( $# > 1 )); then
