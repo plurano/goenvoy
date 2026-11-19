@@ -3,7 +3,7 @@
 # or create directories. Only allow listed commands without redirects.
 # Bash splits words on space and tab only.
 # Make files (Makefile, makefile, GNUmakefile, *.mk) read recipe prefixes
-# @ - + and $$ as make reads them.
+# @ - +, $$, and a leading punctuation .RECIPEPREFIX as make reads them.
 # Scope: honest mistakes, read one physical line at a time. Out of scope:
 # line continuation, quotes spanning lines, quoted or escaped launcher
 # names. Compensating step: shfmt syntax tree, golusoris/goenvoy#363.
@@ -36,7 +36,7 @@ while IFS= read -r -d '' file; do
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
       variable = "\\$(" name ")|\\$\\{(" name ")\\}|\\$\\((" name ")\\)"
       prefix = "(^|[;&|([:space:]])(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
-      make_prefix = "(^|[;&|([:space:]])[@+-]*(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
+      make_prefix = "(^[[:punct:]]?|[;&|([:space:]])[@+-]*(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
       command = prefix "[[:space:]]+[^[:space:];|&]+"
       make_command = make_prefix "[[:space:]]+[^[:space:];|&]+"
     }
