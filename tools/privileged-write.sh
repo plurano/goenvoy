@@ -2,6 +2,7 @@
 # Detect privileged in-place writes; privileged install must stage to .new
 # or create directories. Only allow listed commands without redirects.
 # Bash splits words on space and tab only.
+# Makefile recipe prefixes @ - + and $$ are read as make reads them.
 # Scope: honest mistakes, read one physical line at a time. Out of scope:
 # line continuation, quotes spanning lines, quoted or escaped launcher
 # names. Compensating step: shfmt syntax tree, golusoris/goenvoy#363.
@@ -30,17 +31,26 @@ while IFS= read -r -d '' file; do
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
       variable = "\\$(" name ")|\\$\\{(" name ")\\}|\\$\\((" name ")\\)"
       prefix = "(^|[;&|([:space:]])(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
+      make_prefix = "(^|[;&|([:space:]])[@+-]*(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
       command = prefix "[[:space:]]+[^[:space:];|&]+"
+      make_command = make_prefix "[[:space:]]+[^[:space:];|&]+"
     }
     FNR > 100000 { print FILENAME ":" FNR; failed = 1; nextfile }
     /^[ \t]*#/ { next }
     {
       line = $0
-      while (match(tolower(line), command)) {
+      active_prefix = prefix
+      active_command = command
+      if (FILENAME ~ /(^|\/)Makefile$/) {
+        gsub(/\$\$/, "$", line)
+        active_prefix = make_prefix
+        active_command = make_command
+      }
+      while (match(tolower(line), active_command)) {
         start = RSTART
         call = substr(line, RSTART, RLENGTH)
         rest = substr(line, RSTART + RLENGTH)
-        match(tolower(call), prefix "[[:space:]]+")
+        match(tolower(call), active_prefix "[[:space:]]+")
         candidate = tolower(substr(call, 1, RLENGTH))
         gsub(/[^a-z0-9_]/, "", candidate)
         if (candidate ~ "^su" "do_(askpass|command|editor|gid|home|prompt|ps1|tty|uid|user)$") {
