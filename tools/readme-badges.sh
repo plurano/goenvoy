@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Allow plain static Shields badges and verify workflow links.
 # Reject other Shields references everywhere and badge.svg outside governance blocks.
+# Scope: honest mistakes, read one line at a time with one delimiter set.
+# Out of scope: delimiters read differently across contexts (a quote, space
+# or ")" inside an HTML attribute) and other deliberate URL spellings.
+# Compensating step: CommonMark parser nodes, golusoris/goenvoy#364.
 #   usage: tools/readme-badges.sh --repo owner/name [root]
 set -euo pipefail
 
