@@ -17,6 +17,8 @@
 #   o) stub sleeps 5 s on pulls endpoint when STUB_SLEEP=1, RELEASE_TAG_TIMEOUT=1 -> exit 1 within 4 s, stderr names step
 #   p) two changed paths whose C-locale order differs from natural-language order -> stdout tags in C-locale order
 #   q) REPO bad repo -> exit 2, no gh call
+#   q2) REPO owner -> exit 2, no gh call, stderr has invalid repository
+#   q3) REPO own er/repo -> exit 2, no gh call, stderr has invalid repository
 #   r) tag: 101 pulls entries, 100 merged and labelled tagged, with pending PR last -> stdout tags, pulls call carries --paginate
 #   s) tag: annotated tag object at merge commit -> no ref POST, tag in stdout
 #   t) tag: annotated tag object at another commit -> exit 1, no writes
@@ -349,15 +351,12 @@ OUT="$WORK/out"
 ERR="$WORK/err"
 CALLS="$WORK/calls"
 
-# run_tag MODE [REPO]: runs tools/release-tag.sh against the stub gh and captures stdout, stderr, writes and calls.
-run_tag() {
-  local mode="$1"
-  local target_repo="${2:-owner/repo}"
+# run_release_tag ARGS...: runs tools/release-tag.sh against the stub gh and captures stdout, stderr, writes and calls.
+run_release_tag() {
   : > "$LOG"
   : > "$OUT"
   : > "$ERR"
   : > "$CALLS"
-  rm -f "$WORK/ref_post_failed"
   local rc=0
   (
     PATH="$WORK/bin:$PATH" \
@@ -372,34 +371,22 @@ run_tag() {
     STUB_LABELS_JSON="$LABELS_JSON" \
     STUB_LOG="$LOG" \
     STUB_TREES_DIR="$TREES_DIR" \
-    bash "$HERE/release-tag.sh" "$mode" "$target_repo" > "$OUT" 2> "$ERR"
+    bash "$HERE/release-tag.sh" "$@" > "$OUT" 2> "$ERR"
   ) || rc=$?
   return "$rc"
 }
 
+# run_tag MODE [REPO]: runs tools/release-tag.sh against the stub gh and captures stdout, stderr, writes and calls.
+run_tag() {
+  local mode="$1"
+  local target_repo="${2:-owner/repo}"
+  rm -f "$WORK/ref_post_failed"
+  run_release_tag "$mode" "$target_repo"
+}
+
 # run_tag_no_args: runs tools/release-tag.sh without arguments.
 run_tag_no_args() {
-  : > "$LOG"
-  : > "$OUT"
-  : > "$ERR"
-  : > "$CALLS"
-  local rc=0
-  (
-    PATH="$WORK/bin:$PATH" \
-    GH_BIN="$WORK/gh" \
-    STUB_WORK="$WORK" \
-    STUB_CALLS="$CALLS" \
-    STUB_PR_JSON="$PR_JSON" \
-    STUB_COMMITS_DIR="$COMMITS_DIR" \
-    STUB_MANIFESTS_DIR="$MANIFESTS_DIR" \
-    STUB_MATCHING_REFS_MAP="$MATCHING_REFS" \
-    STUB_TAG_OBJECTS_MAP="$TAG_OBJECTS_MAP" \
-    STUB_LABELS_JSON="$LABELS_JSON" \
-    STUB_LOG="$LOG" \
-    STUB_TREES_DIR="$TREES_DIR" \
-    bash "$HERE/release-tag.sh" > "$OUT" 2> "$ERR"
-  ) || rc=$?
-  return "$rc"
+  run_release_tag
 }
 
 # Case a: one pending PR, two changed paths -> 2 ref POSTs, no label writes, stdout tags
@@ -781,8 +768,23 @@ echo "ok   case_p (locale ${natural_locale:-C only, no natural-language locale i
 # Case q: REPO bad repo -> exit 2, no gh call
 rc=0; run_tag tag "bad repo" || rc=$?
 [ "$rc" -eq 2 ] || fail "case_q" "exit $rc, want 2"
+grep -q "invalid repository" "$ERR" || fail "case_q" "stderr missing invalid repository: $(cat "$ERR")"
 [ "$(wc -l < "$CALLS")" -eq 0 ] || fail "case_q" "want 0 gh calls, got $(wc -l < "$CALLS")"
 echo "ok   case_q"
+
+# Case q2: REPO owner (no slash) -> exit 2, no gh call, stderr has invalid repository
+rc=0; run_tag tag "owner" || rc=$?
+[ "$rc" -eq 2 ] || fail "case_q2" "exit $rc, want 2"
+grep -q "invalid repository" "$ERR" || fail "case_q2" "stderr missing invalid repository: $(cat "$ERR")"
+[ "$(wc -l < "$CALLS")" -eq 0 ] || fail "case_q2" "want 0 gh calls, got $(wc -l < "$CALLS")"
+echo "ok   case_q2"
+
+# Case q3: REPO own er/repo (space) -> exit 2, no gh call, stderr has invalid repository
+rc=0; run_tag tag "own er/repo" || rc=$?
+[ "$rc" -eq 2 ] || fail "case_q3" "exit $rc, want 2"
+grep -q "invalid repository" "$ERR" || fail "case_q3" "stderr missing invalid repository: $(cat "$ERR")"
+[ "$(wc -l < "$CALLS")" -eq 0 ] || fail "case_q3" "want 0 gh calls, got $(wc -l < "$CALLS")"
+echo "ok   case_q3"
 
 # Reset fixtures for new cases
 cat > "$MANIFESTS_DIR/$SHA_PARENT.json" <<'EOF'

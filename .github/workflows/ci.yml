@@ -102,6 +102,10 @@ jobs:
         run: bash tools/release-config_test.sh
       - name: Test fixtures stay apart from the calling repository
         run: bash tools/testlib_test.sh
+      - name: Module discovery maps paths to go.mod directories
+        run: bash tools/module-dirs_test.sh
+      - name: Per-module golangci-lint dispatch matches changed modules
+        run: bash tools/golangci-modules_test.sh
       - name: Pinned versions and digests live only in the pin file
         run: bash tools/pin-literals_test.sh
       - name: Documented module count matches the release manifest
@@ -124,7 +128,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - &checkout-no-credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-tools-go
@@ -140,9 +145,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
+      - *checkout-no-credentials
       - uses: ./.github/actions/setup-tools-go
       - name: Check the exceptions
         run: make lint-exceptions
@@ -189,7 +192,7 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -uo pipefail
-          ALL=$(find . -name go.mod -not -path './.workingdir/*' -not -path './tools/go/*' -exec dirname {} \; | sed 's#^\./##' | sort)
+          ALL=$(bash tools/module-dirs.sh --all) || { echo "::error::module discovery failed"; exit 1; }
 
           # Diff base: PR base for pull_request, the pushed-from commit otherwise.
           if [ "$EVENT" = "pull_request" ]; then DIFF_BASE="$BASE_SHA"; else DIFF_BASE="$BEFORE_SHA"; fi
@@ -200,7 +203,7 @@ jobs:
           fi
 
           # Files whose change can affect every module's gate -> run the full matrix.
-          FORCE_FULL_RE='^(\.github/workflows/ci\.yml|\.golangci\.yml|tools/coverage-thresholds\.json)$'
+          FORCE_FULL_RE='^(\.github/workflows/ci\.yml|\.golangci\.yml|tools/coverage-thresholds\.json|tools/module-dirs\.sh)$'
           FULL=false
           if [ -z "$CHANGED" ]; then
             FULL=true   # unknown base (first push, shallow, force-push) -> be safe
@@ -212,20 +215,13 @@ jobs:
             SELECTED="$ALL"
             echo "Full matrix (shared config changed or diff base unavailable)."
           else
-            # Map each changed file to its nearest ancestor module directory.
-            SELECTED=$(while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              d=$(dirname "$f")
-              # A path has fewer than 64 directory levels.
-              depth=0
-              while [ "$depth" -lt 64 ]; do
-                depth=$((depth + 1))
-                if printf '%s\n' "$ALL" | grep -qx "$d"; then echo "$d"; break; fi
-                [ "$d" = "." ] && break
-                d=$(dirname "$d")
-              done
-            done <<< "$CHANGED" | sort -u)
-            echo "Changed modules:"; printf '%s\n' "$SELECTED" | sed 's/^/  /'
+            # A refused list (more than 4096 changed paths) selects every module, never none.
+            if SELECTED=$(printf '%s\n' "$CHANGED" | bash tools/module-dirs.sh); then
+              echo "Changed modules:"; printf '%s\n' "$SELECTED" | sed 's/^/  /'
+            else
+              SELECTED="$ALL"
+              echo "Full matrix (changed-path mapping refused)."
+            fi
           fi
 
           # Node builds the matrix: it is always present, because JavaScript

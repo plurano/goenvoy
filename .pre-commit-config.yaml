@@ -11,8 +11,15 @@ repos:
     rev: v0.5.1
     hooks:
       - id: go-fmt
+
+  - repo: local
+    hooks:
       - id: golangci-lint
-        args: [--config=.golangci.yml]
+        name: golangci-lint (per go.mod module)
+        entry: bash tools/golangci-modules.sh
+        language: system
+        types: [go]
+        require_serial: true
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.20.0
