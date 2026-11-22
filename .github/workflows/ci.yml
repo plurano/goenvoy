@@ -1,8 +1,8 @@
 name: CI
 
 # Per-module Go gates (lint, gosec, govulncheck, race test + coverage, build)
-# delegate to golusoris/golusoris's reusable ci-go.yml, one call per module in
-# the `discover` matrix (golusoris/golusoris#184). apidiff stays local: this
+# delegate to plurano/golusoris's reusable ci-go.yml, one call per module in
+# the `discover` matrix (plurano/golusoris#184). apidiff stays local: this
 # repo tags each module independently (release-please, tag-separator "/", e.g.
 # anime/shoko/v1.2.3), and ci-go.yml's apidiff job only knows a single global
 # `git describe` tag, which would compare against an unrelated module's most
@@ -270,7 +270,7 @@ jobs:
     permissions:
       contents: read
       security-events: write   # gosec SARIF upload inside ci-go.yml (capped by this grant)
-    uses: golusoris/golusoris/.github/workflows/ci-go.yml@7c3fabe83c1bfa77120f7efa6bcef29448a9170e # v0.22.2
+    uses: plurano/golusoris/.github/workflows/ci-go.yml@7c3fabe83c1bfa77120f7efa6bcef29448a9170e # v0.22.2
     with:
       runs-on: ubuntu-26.04
       working-directory: ${{ matrix.module }}
@@ -296,7 +296,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: ${{ matrix.module }}/go.mod
           cache-dependency-path: ${{ matrix.module }}/go.mod
