@@ -5,11 +5,13 @@ set -euo pipefail
 readonly MAX_ANCESTOR_DEPTH=64
 readonly MAX_INPUT_PATHS=4096
 
+# all_modules: prints every go.mod directory outside .workingdir and tools/go, sorted.
 all_modules() {
   find . -name go.mod -not -path './.workingdir*' -not -path './tools/go/*' -exec dirname {} \; \
     | sed 's#^\./##' | sort -u
 }
 
+# nearest_module FILE ALL_LIST: prints the closest module directory that holds FILE.
 nearest_module() {
   local file="$1"
   local all_list="$2"

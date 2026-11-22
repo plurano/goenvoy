@@ -23,11 +23,13 @@ printf 'module example/toolsgo\n\ngo 1.22\n' >"$FIXTURE/tools/go/go.mod"
 : >"$FIXTURE/.workingdir2/x/f.go"
 : >"$FIXTURE/README.md"
 
+# run_in_fixture ARGS...: runs tools/module-dirs.sh with ARGS inside the fixture tree.
 run_in_fixture() {
   # Why: the script resolves modules from its working directory, so every case runs inside the fixture.
   (cd "$FIXTURE" && bash "$HERE/module-dirs.sh" "$@")
 }
 
+# run_stdin_in_fixture: runs tools/module-dirs.sh inside the fixture tree with stdin.txt as input.
 run_stdin_in_fixture() {
   (cd "$FIXTURE" && bash "$HERE/module-dirs.sh" <"$WORK/stdin.txt")
 }

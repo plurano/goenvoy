@@ -39,6 +39,7 @@ exit 0
 STUB
 chmod +x "$STUB_BIN/golangci-lint"
 
+# invoke_sut ARGS...: runs the fixture copy of tools/golangci-modules.sh with the stub golangci-lint.
 invoke_sut() {
   # Why: copies under the fixture tree resolve the repository root from their own location.
   (
