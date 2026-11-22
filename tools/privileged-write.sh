@@ -4,6 +4,8 @@
 # Path-qualified sudo/doas, a redirect before the launcher, and separators
 # inside $( ) or backticks still count as one simple command. $( and a
 # backtick open a new quoting level, also inside double quotes.
+# <( and >( open a level too; a launcher inside $( ), ( ) or backticks
+# ends at the ) or backtick that closes it.
 # Single-line quoted YAML run values and &> / &>> redirects are read.
 # A quoted or backslash-escaped ; | & does not end a command.
 # Bash splits words on space and tab only.
@@ -192,10 +194,15 @@ while IFS= read -r -d '' file; do
             in_squote = 1
           } else if (char == "\"") {
             in_dquote = 1
-          } else if (char == "(" && depth > 0) {
+          } else if (char == "(" && (depth > 0 || (p > 1 && substr(rest, p - 1, 1) ~ /[<>]/))) {
+            # Why: process substitution <( ) and >( ) opens a level, so its separators stay inside.
             qsaved[depth++] = 0
           } else if (char == ")" && depth > 0) {
             in_dquote = qsaved[--depth]
+          } else if (char == ")" && ldepth > 0 && in_backtick == 0) {
+            # Why: the launcher sits inside a $( or ( of the text before it; its command ends at the ) closing that level.
+            segment_first = substr(rest, 1, p - 1)
+            break
           } else if ((char == ";" || char == "|" || char == "&") && depth == 0 && in_backtick == 0) {
             segment_first = substr(rest, 1, p - 1)
             break
