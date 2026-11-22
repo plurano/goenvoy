@@ -22,6 +22,9 @@ const (
 
 var errLoginResponseTooLarge = errors.New("login response too large")
 
+// sentTokenKey carries the bearer token get captured, so the auth hook sends exactly that token.
+type sentTokenKey struct{}
+
 // Client is a TheTVDB API v4 client.
 type Client struct {
 	*metadata.BaseClient
@@ -44,9 +47,10 @@ func NewWithPIN(apiKey, pin string, opts ...metadata.Option) *Client {
 	bc := metadata.NewBaseClient(defaultBaseURL, "tvdb", opts...)
 	c := &Client{BaseClient: bc, apiKey: apiKey, pin: pin, loginGate: make(chan struct{}, 1)}
 	c.SetAuth(func(req *http.Request) {
-		c.mu.Lock()
-		token := c.token
-		c.mu.Unlock()
+		token, ok := req.Context().Value(sentTokenKey{}).(string)
+		if !ok {
+			token = c.currentToken()
+		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		if req.Method != http.MethodGet {
 			req.Header.Set("Content-Type", "application/json")
@@ -154,7 +158,7 @@ func (c *Client) get(ctx context.Context, path string, dst any) error {
 	}
 
 	sent := c.currentToken()
-	err := c.doGet(ctx, path, dst)
+	err := c.doGetAs(ctx, sent, path, dst)
 	if err == nil {
 		return nil
 	}
@@ -168,6 +172,11 @@ func (c *Client) get(ctx context.Context, path string, dst any) error {
 		return c.doGet(ctx, path, dst)
 	}
 	return err
+}
+
+// doGetAs performs a GET using exactly the given bearer token on the wire.
+func (c *Client) doGetAs(ctx context.Context, token, path string, dst any) error {
+	return c.doGet(context.WithValue(ctx, sentTokenKey{}, token), path, dst)
 }
 
 func (c *Client) doGet(ctx context.Context, path string, dst any) error {
