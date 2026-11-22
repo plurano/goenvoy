@@ -478,7 +478,7 @@ expect_output "case_bh: multiple static badges and governance" "readme-badges: 1
 
 # Real check on the repo root -> 0
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
-expect_pattern "repo: real check" "workflow references ok" --repo golusoris/goenvoy "$REPO_ROOT"
-(cd "$REPO_ROOT" && expect_pattern "repo: default root" "workflow references ok" --repo golusoris/goenvoy)
+expect_pattern "repo: real check" "workflow references ok" --repo plurano/goenvoy "$REPO_ROOT"
+(cd "$REPO_ROOT" && expect_pattern "repo: default root" "workflow references ok" --repo plurano/goenvoy)
 
 echo "readme-badges: all planted cases pass"
