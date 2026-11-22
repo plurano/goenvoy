@@ -12,16 +12,29 @@
 # line continuation, quotes spanning lines, quoted or escaped launcher
 # names, a .RECIPEPREFIX of \# (every recipe then reads as a comment).
 # Compensating step: shfmt syntax tree, golusoris/goenvoy#363.
+# PRIVWRITE_TIMEOUT (default 60) bounds git ls-files and each awk run, in seconds.
 set -euo pipefail
 
 if (( $# > 1 )); then
   printf "usage: tools/privileged-write.sh [root]\n" >&2
   exit 2
 fi
+deadline="${PRIVWRITE_TIMEOUT:-60}"
+if [[ ! "$deadline" =~ ^[1-9][0-9]{0,2}$ ]]; then
+  printf "privileged-write: invalid PRIVWRITE_TIMEOUT: '%s'\n" "$deadline" >&2
+  exit 2
+fi
+command -v timeout >/dev/null 2>&1 || {
+  printf "privileged-write: timeout is required\n" >&2
+  exit 2
+}
 root="$(cd "${1:-$(dirname "${BASH_SOURCE[0]}")/..}" && pwd)"
 list="$(mktemp)"
 trap 'rm -f "$list" "$list.hits"' EXIT
-git -C "$root" ls-files -z > "$list"
+if ! timeout "$deadline" git -C "$root" ls-files -z > "$list"; then
+  printf "privileged-write: git ls-files failed or passed the %ss deadline\n" "$deadline" >&2
+  exit 2
+fi
 cd "$root"
 count=0
 failed=0
@@ -38,7 +51,7 @@ while IFS= read -r -d '' file; do
   esac
   [[ -f "$file" ]] || continue
   count=$((count + 1))
-  if PRIVWRITE_FILE="$file" awk -v is_make="$is_make" -v is_yaml="$is_yaml" '
+  if PRIVWRITE_FILE="$file" timeout "$deadline" awk -v is_make="$is_make" -v is_yaml="$is_yaml" '
     BEGIN {
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
       variable = "\\$(" name ")|\\$\\{(" name ")\\}|\\$\\((" name ")\\)"
@@ -75,9 +88,11 @@ while IFS= read -r -d '' file; do
           line = substr(line, start + RLENGTH - 1)
           continue
         }
-        lead = substr(line, 1, start - 1)
+        lead = substr(line, 1, start)
         lead_redirect = 0
         lead_backtick = 0
+        ldepth = 0
+        lprev = ""
         in_squote = 0
         in_dquote = 0
         for (lp = 1; lp <= length(lead); lp++) {
@@ -94,12 +109,32 @@ while IFS= read -r -d '' file; do
           } else if (lchar == "\"") {
             in_dquote = 1
           } else if (lchar == "`") {
-            lead_backtick = 1 - lead_backtick
+            if (lead_backtick == 0) {
+              lsaved_bt = lead_redirect
+              lead_redirect = 0
+              lead_backtick = 1
+            } else {
+              lead_redirect = lsaved_bt
+              lead_backtick = 0
+            }
+            lprev = lchar
+          } else if (lchar == "(") {
+            lsaved[ldepth++] = lead_redirect
             lead_redirect = 0
+            lprev = lchar
+          } else if (lchar == ")") {
+            if (ldepth > 0) lead_redirect = lsaved[--ldepth]
+            lprev = lchar
           } else if (lchar == ">") {
             lead_redirect = 1
-          } else if (lchar == ";" || lchar == "|" || lchar == "&" || lchar == "(") {
-            lead_redirect = 0
+            lprev = lchar
+          } else if (lchar == ";" || lchar == "|" || lchar == "&") {
+            if (lchar == ";" || ((lchar == "&" || lchar == "|") && lprev != ">" && lprev != "<")) {
+              lead_redirect = 0
+            }
+            lprev = lchar
+          } else {
+            lprev = lchar
           }
         }
         call = substr(call, RLENGTH + 1)
@@ -223,7 +258,16 @@ while IFS= read -r -d '' file; do
     END { exit failed }
   ' "./$file" < /dev/null > "$list.hits"; then :; else
     status=$?
-    if (( status != 1 )); then rm -f "$list.hits"; exit "$status"; fi
+    if (( status == 124 )); then
+      printf "privileged-write: %s: scan passed the %ss deadline\n" "$file" "$deadline" >&2
+      rm -f "$list.hits"
+      exit 124
+    fi
+    if (( status != 1 )); then
+      printf "privileged-write: %s: awk failed with status %d\n" "$file" "$status" >&2
+      rm -f "$list.hits"
+      exit "$status"
+    fi
     failed=1
   fi
   while IFS= read -r hit; do

@@ -300,7 +300,6 @@ printf "clean\n" > "$WORK/.github/workflows/w.yml"
 printf '%s\n' 'echo `''date` sudo-free' > "$WORK/a.sh"
 expect_pass backtick_plain_word "${SUT[@]}"
 printf '%s\n' '/usr/bin/su''do cp source /etc/config' > "$WORK/a.sh"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add a.sh
 expect_refusal path_launcher_cp "a.sh:1:" "${SUT[@]}"
 printf '%s\n' './bin/do''as cp a /etc/b' > "$WORK/a.sh"
 expect_refusal relative_launcher_copy "a.sh:1:" "${SUT[@]}"
@@ -320,16 +319,50 @@ printf '%s\n' 'echo ready > log; su''do cat source' > "$WORK/a.sh"
 expect_pass lead_redirect_prior_command "${SUT[@]}"
 printf '%s\n' 'FOO="a>b" su''do cat source' > "$WORK/a.sh"
 expect_pass lead_quoted_gt "${SUT[@]}"
-printf '%s\n' 'su''do cat $(find configs -name "*.conf" | sort) > /etc/config' > "$WORK/a.sh"
+printf '%s\n' 'su''do cat $''(find configs -name "*.conf" | sort) > /etc/config' > "$WORK/a.sh"
 expect_refusal subst_pipe_redirect "a.sh:1:" "${SUT[@]}"
-printf '%s\n' 'su''do cat `find configs | sort` > /etc/config' > "$WORK/a.sh"
+printf '%s\n' 'su''do cat `''find configs | sort` > /etc/config' > "$WORK/a.sh"
 expect_refusal backtick_pipe_redirect "a.sh:1:" "${SUT[@]}"
 printf '%s\n' 'su''do cat source | grep x' > "$WORK/a.sh"
 expect_pass outer_pipe_no_redirect "${SUT[@]}"
-printf '%s\n' 'x=$(su''do cat a); echo hi > log' > "$WORK/a.sh"
+printf '%s\n' 'x=$''(su''do cat a); echo hi > log' > "$WORK/a.sh"
 expect_pass inside_subst_then_redirect "${SUT[@]}"
 printf '%s\n' 'x=`su''do cat a`; echo hi > log' > "$WORK/a.sh"
 expect_pass inside_backtick_then_redirect "${SUT[@]}"
+printf '%s\n' '> /etc/b 2>&1 su''do cat a' > "$WORK/a.sh"
+expect_refusal lead_redirect_dup "a.sh:1:" "${SUT[@]}"
+printf '%s\n' '>| /etc/b su''do cat a' > "$WORK/a.sh"
+expect_refusal lead_redirect_clobber "a.sh:1:" "${SUT[@]}"
+printf '%s\n' '>& /etc/b su''do cat a' > "$WORK/a.sh"
+expect_refusal lead_redirect_amp_gt "a.sh:1:" "${SUT[@]}"
+printf '%s\n' '> /etc/b $''(true) su''do cat a' > "$WORK/a.sh"
+expect_refusal lead_redirect_after_subst "a.sh:1:" "${SUT[@]}"
+printf '%s\n' 'echo ready 2>&1 | su''do cat source' > "$WORK/a.sh"
+expect_pass prior_pipe_dup "${SUT[@]}"
+printf '%s\n' 'x=$''(echo a > b) su''do cat c' > "$WORK/a.sh"
+expect_pass subst_redirect_then_launcher "${SUT[@]}"
+if output="$(
+  PRIVWRITE_TIMEOUT=abc bash "$HERE/privileged-write.sh" "$WORK" 2>&1
+)"; then
+  echo "FAIL deadline_invalid: accepted" >&2
+  exit 1
+fi
+case "$output" in
+  *'privileged-write: invalid PRIVWRITE_TIMEOUT: '"'"'abc'"'"'') echo "ok   deadline_invalid: rejected bad timeout" ;;
+  *) printf 'FAIL deadline_invalid: unexpected message: %s\n' "$output" >&2; exit 1 ;;
+esac
+if output="$(
+  PRIVWRITE_TIMEOUT=0 bash "$HERE/privileged-write.sh" "$WORK" 2>&1
+)"; then
+  echo "FAIL deadline_zero: accepted" >&2
+  exit 1
+fi
+case "$output" in
+  *'privileged-write: invalid PRIVWRITE_TIMEOUT: '"'"'0'"'"'') echo "ok   deadline_zero: rejected zero timeout" ;;
+  *) printf 'FAIL deadline_zero: unexpected message: %s\n' "$output" >&2; exit 1 ;;
+esac
+printf "clean\n" > "$WORK/a.sh"
+expect_pass deadline_one_second env PRIVWRITE_TIMEOUT=1 "${SUT[@]}"
 printf "clean\n" > "$WORK/a.sh"
 expect_pass repository bash "$HERE/privileged-write.sh"
 echo "privileged-write: all planted cases pass"
