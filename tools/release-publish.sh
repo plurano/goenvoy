@@ -10,6 +10,9 @@
 #   The workflow step runs stage, then gh release edit TAG --draft=false, then confirm.
 set -euo pipefail
 
+# shellcheck source=tools/repo-slug.sh
+. "$(dirname "${BASH_SOURCE[0]}")/repo-slug.sh"
+
 # usage: prints the usage line and exits 2.
 usage() {
   echo "usage: ${0##*/} stage OWNER/REPO TAG TITLE NOTES_FILE ASSET..." >&2
@@ -41,10 +44,7 @@ else
 fi
 
 [ -n "$REPO" ] || usage
-if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-  echo "error: invalid repository '$REPO', expected OWNER/REPO" >&2
-  exit 2
-fi
+require_repo_slug "$REPO"
 
 [ -n "$TAG" ] || usage
 
