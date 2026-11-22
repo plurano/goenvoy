@@ -2,6 +2,7 @@
 # Detect privileged in-place writes; privileged install must stage to .new
 # or create directories. Only allow listed commands without redirects.
 # Single-line quoted YAML run values and &> / &>> redirects are read.
+# A quoted or backslash-escaped ; | & does not end a command.
 # Bash splits words on space and tab only.
 # Make files (Makefile, makefile, GNUmakefile, *.mk) read recipe prefixes
 # @ - +, $$, and a leading punctuation .RECIPEPREFIX as make reads them.
@@ -73,7 +74,28 @@ while IFS= read -r -d '' file; do
         }
         call = substr(call, RLENGTH + 1)
         gsub(/&>/, ">", rest)
-        split(rest, segments, /[;|&]/)
+        segment_first = rest
+        in_squote = 0
+        in_dquote = 0
+        for (p = 1; p <= length(rest); p++) {
+          char = substr(rest, p, 1)
+          if (in_squote) {
+            if (char == "\047") in_squote = 0
+          } else if (in_dquote) {
+            if (char == "\\" && p < length(rest)) p++
+            else if (char == "\"") in_dquote = 0
+          } else if (char == "\\" && p < length(rest)) {
+            p++
+          } else if (char == "\047") {
+            in_squote = 1
+          } else if (char == "\"") {
+            in_dquote = 1
+          } else if (char == ";" || char == "|" || char == "&") {
+            segment_first = substr(rest, 1, p - 1)
+            break
+          }
+        }
+        segments[1] = segment_first
         install_ok = 0
         if (call == "install") {
           delete args
