@@ -51,6 +51,7 @@ while IFS= read -r -d '' file; do
   esac
   [[ -f "$file" ]] || continue
   count=$((count + 1))
+  # shellcheck disable=SC2016 # Why: awk program text; the timeout prefix hides awk from shellcheck.
   if PRIVWRITE_FILE="$file" timeout "$deadline" awk -v is_make="$is_make" -v is_yaml="$is_yaml" '
     BEGIN {
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
@@ -88,7 +89,8 @@ while IFS= read -r -d '' file; do
           line = substr(line, start + RLENGTH - 1)
           continue
         }
-        lead = substr(line, 1, start)
+        # Why: in a make recipe, column 1 is the recipe prefix, not a shell boundary.
+        lead = (is_make && start == 1) ? "" : substr(line, 1, start)
         lead_redirect = 0
         lead_backtick = 0
         ldepth = 0
