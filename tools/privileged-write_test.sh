@@ -8,9 +8,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/.github/workflows"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" init -q
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" init -q
 printf "clean\n" > "$WORK/a.sh"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add a.sh
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add a.sh
 SUT=(bash "$HERE/privileged-write.sh" "$WORK")
 printf '%s\n' 'sudo'' cp a b' > "$WORK/a.sh"
 if output="$("${SUT[@]}" 2>&1)"; then
@@ -136,7 +136,7 @@ printf "%s\n" 'sudo'' tee /etc/x' > "$WORK/a.sh"
 expect_refusal tee "a.sh:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/a.sh"
 printf "%s\n" 'run: sudo'' cp a b' > "$WORK/.github/workflows/w.yml"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add .github/workflows/w.yml
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add .github/workflows/w.yml
 expect_refusal workflow ".github/workflows/w.yml:1:" "${SUT[@]}"
 printf "%s\n" "- run: 'sudo"" cp a b'" > "$WORK/.github/workflows/w.yml"
 expect_refusal workflow_single_quoted ".github/workflows/w.yml:1:" "${SUT[@]}"
@@ -149,7 +149,7 @@ expect_pass workflow_quoted_other_key "${SUT[@]}"
 printf "clean\n" > "$WORK/.github/workflows/w.yml"
 mkdir -p "$WORK/.github/actions/x"
 printf "%s\n" "run: 'sudo"" cp a b'" > "$WORK/.github/actions/x/action.yml"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add .github/actions/x/action.yml
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add .github/actions/x/action.yml
 expect_refusal action_single_quoted ".github/actions/x/action.yml:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/.github/actions/x/action.yml"
 printf '%s\n' 'sudo'' cat source &> /etc/config' > "$WORK/a.sh"
@@ -174,15 +174,15 @@ printf '%s\n' 'sudo'' systemctl restart "x\"y" ; echo hi > log' > "$WORK/a.sh"
 expect_pass sudo_double_quoted_escape_then_separator "${SUT[@]}"
 printf "clean\n" > "$WORK/a.sh"
 printf '%s\n' 'sudo'' cp a b' > "$WORK/a=b.sh"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add 'a=b.sh'
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add 'a=b.sh'
 expect_refusal assignment_named_file "a=b.sh:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/a=b.sh"
 printf '%s\n' 'sudo'' cp a b' > "$WORK/zz.sh"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add zz.sh
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add zz.sh
 expect_refusal after_assignment_named_file "zz.sh:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/zz.sh"
 printf "\t%s\n" 'sudo'' cp a b' > "$WORK/Makefile"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add Makefile
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add Makefile
 expect_refusal makefile "Makefile:1:" "${SUT[@]}"
 printf '%s\n' '.RECIPEPREFIX := >' 'all:' '>sudo'' cp a b' > "$WORK/Makefile"
 expect_refusal make_recipeprefix "Makefile:3:" "${SUT[@]}"
@@ -197,7 +197,7 @@ printf '%s\n' '.RECIPEPREFIX := >' 'all:' '>sudo'' install -m 0644 a /etc/x.new'
 expect_pass make_recipeprefix_staged "${SUT[@]}"
 printf "clean\n" > "$WORK/Makefile"
 printf '%s\n' '>sudo'' cp a b' > "$WORK/rules.mk"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add rules.mk
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add rules.mk
 expect_refusal mk_recipeprefix_undeclared "rules.mk:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/rules.mk"
 printf '%s\n' '>sudo'' cp a b' > "$WORK/a.sh"
@@ -226,25 +226,25 @@ expect_pass make_sudo_user "${SUT[@]}"
 printf "clean\n" > "$WORK/Makefile"
 mkdir -p "$WORK/.config/x"
 printf "\t%s\n" '@sudo'' cp a b' > "$WORK/.config/x/engine.mk"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add .config/x/engine.mk
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add .config/x/engine.mk
 expect_refusal mk_fragment "engine.mk:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/.config/x/engine.mk"
 printf "\t%s\n" '@sudo'' cp a b' > "$WORK/makefile"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add makefile
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add makefile
 expect_refusal lower_makefile "makefile:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/makefile"
 printf "\t%s\n" '@sudo'' cp a b' > "$WORK/GNUmakefile"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add GNUmakefile
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add GNUmakefile
 expect_refusal gnu_makefile "GNUmakefile:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/GNUmakefile"
 printf "\t\044\044%s\n" 'SUDO cp a b' > "$WORK/rules.mk"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add rules.mk
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add rules.mk
 expect_refusal mk_dollar_dollar "rules.mk:1:" "${SUT[@]}"
 printf "\t%s\n" '@sudo'' install -m 0644 a /etc/x.new' > "$WORK/rules.mk"
 expect_pass mk_staged "${SUT[@]}"
 printf "clean\n" > "$WORK/rules.mk"
 printf "\t%s\n" '@sudo'' cp a b' > "$WORK/notes.mkd"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add notes.mkd
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add notes.mkd
 expect_pass mk_lookalike "${SUT[@]}"
 printf "clean\n" > "$WORK/notes.mkd"
 printf "clean\n" > "$WORK/Makefile"
@@ -268,7 +268,7 @@ expect_pass comment "${SUT[@]}"
 printf "%s\n" 'sudo'' cp a b' > "$WORK/b.sh"
 expect_pass untracked "${SUT[@]}"
 printf "%s\n" 'sudo'' cp a b' > "$WORK/README.md"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add README.md
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add README.md
 expect_pass ignored_type "${SUT[@]}"
 printf '%s\n' 'sudo'' chown "$''SUDO_USER" /x' > "$WORK/a.sh"
 expect_pass sudo_user_argument "${SUT[@]}"
@@ -290,11 +290,11 @@ printf '%s\n' 'echo "now" `sudo'' tee /etc/b`' > "$WORK/a.sh"
 expect_refusal backtick_after_text "a.sh:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/a.sh"
 printf 't:\n\t%s\n' 'x=`sudo'' cp a /etc/b`' > "$WORK/Makefile"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add Makefile
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add Makefile
 expect_refusal make_backtick_copy "Makefile:2:" "${SUT[@]}"
 printf "clean\n" > "$WORK/Makefile"
 printf '%s\n' '      - run: x=`sudo'' cp a /etc/b`' > "$WORK/.github/workflows/w.yml"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add .github/workflows/w.yml
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add .github/workflows/w.yml
 expect_refusal workflow_backtick_copy ".github/workflows/w.yml:1:" "${SUT[@]}"
 printf "clean\n" > "$WORK/.github/workflows/w.yml"
 printf '%s\n' 'echo `''date` sudo-free' > "$WORK/a.sh"
@@ -308,7 +308,7 @@ expect_pass path_launcher_install_new "${SUT[@]}"
 printf '%s\n' 'echo "/usr/bin/su''do cp a /etc/b"' > "$WORK/a.sh"
 expect_pass quoted_path_mention "${SUT[@]}"
 printf 't:\n\t%s\n' '/usr/bin/su''do cp a /etc/b' > "$WORK/Makefile"
-GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$WORK" add Makefile
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 timeout 60 git -C "$WORK" add Makefile
 expect_refusal make_path_launcher "Makefile:2:" "${SUT[@]}"
 printf "clean\n" > "$WORK/Makefile"
 printf '%s\n' '> /etc/config su''do cat source' > "$WORK/a.sh"
