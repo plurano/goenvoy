@@ -26,11 +26,13 @@ Verify a release archive:
 ```bash
 cosign verify-blob \
   --bundle <module>_<version>_source.checksums.txt.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/(golusoris|plurano)/goenvoy/' \
+  --certificate-identity-regexp '^https://github\.com/(golusoris|plurano)/goenvoy/\.github/workflows/release\.yml@refs/heads/main$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   <module>_<version>_source.checksums.txt &&
 sha256sum -c <module>_<version>_source.checksums.txt
 ```
+
+The identity pins the release workflow on `main`, the only ref that signs Sigstore bundles, and keeps the `golusoris` owner so releases signed before the move to `plurano` still verify.
 
 ## Security practices
 
