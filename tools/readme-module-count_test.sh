@@ -50,11 +50,11 @@ environment = {key: value for key, value in os.environ.items() if not key.starts
 environment["GIT_CONFIG_GLOBAL"] = os.devnull
 import subprocess
 
-subprocess.run([sys.argv[1], sys.argv[2], "--fixture", sys.argv[3]], env=environment, check=True)
+subprocess.run([sys.argv[1], sys.argv[2], "--fixture", sys.argv[3]], env=environment, check=True, timeout=120)
 os.mkdir(os.path.join(sys.argv[3], "physical"))
 os.symlink(os.path.join(sys.argv[3], "physical"), os.path.join(sys.argv[3], "link"))
 os.mkdir(os.path.join(sys.argv[3], "physical", "fixture"))
-subprocess.run([sys.argv[1], sys.argv[2], "--fixture", os.path.join(sys.argv[3], "link", "fixture")], env=environment, check=True)
+subprocess.run([sys.argv[1], sys.argv[2], "--fixture", os.path.join(sys.argv[3], "link", "fixture")], env=environment, check=True, timeout=120)
 PYENV
 
 printf '{"one":"1.0.0","two":"1.0.0"}\n' > "$WORK/manifest.json"

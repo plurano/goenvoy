@@ -392,6 +392,32 @@ mkdir -p "$WORK/case_ay"
 printf '%s\n' '<img src="https://img&#37;2&#x45;shields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_ay/README.md"
 expect_refusal "case_ay: HTML then uppercase percent" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_ay"
 
+# Case (bo): decimal reference inside the host word -> 1.
+mkdir -p "$WORK/case_bo"
+printf '%s\n' '<img src="https://img.&#115;hields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_bo/README.md"
+expect_refusal "case_bo: decimal reference inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bo"
+
+# Case (bp): hex reference inside the host word -> 1.
+mkdir -p "$WORK/case_bp"
+printf '%s\n' '<img src="https://img.&#x73;hields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_bp/README.md"
+expect_refusal "case_bp: hex reference inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bp"
+
+# Case (bq): percent escape inside the host word -> 1.
+mkdir -p "$WORK/case_bq"
+printf '%s\n' 'https://img.%73hields.io/github/actions/workflow/status/a/b/c' > "$WORK/case_bq/README.md"
+expect_refusal "case_bq: percent escape inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bq"
+
+# Case (br): reference that forms a percent escape inside the host word -> 1.
+mkdir -p "$WORK/case_br"
+printf '%s\n' '<img src="https://img.&#37;7&#x33;hields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_br/README.md"
+expect_refusal "case_br: HTML percent inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_br"
+
+# Case (bs): native badge with an escaped dot outside governance -> 1.
+mkdir -p "$WORK/case_bs/.github/workflows"
+touch "$WORK/case_bs/.github/workflows/c.yml"
+printf '%s\n' 'https://github.com/a/b/actions/workflows/c.yml/badge%2Esvg' > "$WORK/case_bs/README.md"
+expect_refusal "case_bs: escaped dot badge" "README.md:1: badge.svg outside the governance block" "${SUT[@]}" --repo a/b "$WORK/case_bs"
+
 # Case (bi): static badge C%2B%2B.
 mkdir -p "$WORK/case_bi"
 printf '%s\n' '![badge](https://img.shields.io/badge/language-C%2B%2B-blue)' > "$WORK/case_bi/README.md"
