@@ -578,10 +578,22 @@ func TestLoginError(t *testing.T) {
 	}
 }
 
-// TestTokenRefreshOn401Concurrent checks concurrent 401 retries share a single re-login.
-func TestTokenRefreshOn401Concurrent(t *testing.T) {
-	t.Parallel()
-	var loginCount atomic.Int32
+// serveStaleThenFreshLogin answers /login with token "stale" on the first call and "fresh" after it.
+func serveStaleThenFreshLogin(w http.ResponseWriter, loginCount *atomic.Int32) {
+	token := "stale"
+	if loginCount.Add(1) > 1 {
+		token = "fresh"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "success",
+		"data":   map[string]any{"token": token},
+	})
+}
+
+// newStaleGateServer returns a server that 401s stale bearer tokens until n concurrent requests arrive.
+func newStaleGateServer(t *testing.T, n int32, loginCount *atomic.Int32) *httptest.Server {
+	t.Helper()
 	var staleArrived atomic.Int32
 	staleGate := make(chan struct{})
 	seriesOK := map[string]any{
@@ -589,24 +601,15 @@ func TestTokenRefreshOn401Concurrent(t *testing.T) {
 		"data":   map[string]any{"id": float64(1), "name": "Test Series"},
 	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/login" {
-			loginCount.Add(1)
-			token := "stale"
-			if loginCount.Load() > 1 {
-				token = "fresh"
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"status": "success",
-				"data":   map[string]any{"token": token},
-			})
+			serveStaleThenFreshLogin(w, loginCount)
 			return
 		}
 		auth := r.Header.Get("Authorization")
-		switch {
-		case auth == "Bearer stale":
-			if staleArrived.Add(1) == 8 {
+		switch auth {
+		case "Bearer stale":
+			if staleArrived.Add(1) == n {
 				close(staleGate)
 			}
 			select {
@@ -616,7 +619,7 @@ func TestTokenRefreshOn401Concurrent(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]any{"message": "token expired"})
-		case auth == "Bearer fresh":
+		case "Bearer fresh":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(seriesOK)
 		default:
@@ -624,6 +627,13 @@ func TestTokenRefreshOn401Concurrent(t *testing.T) {
 			http.Error(w, "bad auth", http.StatusBadRequest)
 		}
 	}))
+}
+
+// TestTokenRefreshOn401Concurrent checks concurrent 401 retries share a single re-login.
+func TestTokenRefreshOn401Concurrent(t *testing.T) {
+	t.Parallel()
+	var loginCount atomic.Int32
+	srv := newStaleGateServer(t, 8, &loginCount)
 	defer srv.Close()
 
 	c := tvdb.New("test-key", metadata.WithBaseURL(srv.URL))

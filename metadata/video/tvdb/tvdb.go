@@ -135,6 +135,7 @@ func (c *Client) refreshToken(ctx context.Context, rejected string) error {
 	return nil
 }
 
+// ensureToken ensures a bearer token is present, logging in when the cache is empty.
 func (c *Client) ensureToken(ctx context.Context) error {
 	if c.currentToken() != "" {
 		return nil
@@ -142,6 +143,7 @@ func (c *Client) ensureToken(ctx context.Context) error {
 	return c.refreshToken(ctx, "")
 }
 
+// get performs an authenticated GET with one retry after 401, coalescing re-login through refreshToken.
 func (c *Client) get(ctx context.Context, path string, dst any) error {
 	if err := c.ensureToken(ctx); err != nil {
 		return err
