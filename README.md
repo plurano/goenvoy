@@ -11,10 +11,7 @@
   <!-- 1 release/version -->
   [![Release](https://img.shields.io/badge/Release-Releases-3b82f6?style=for-the-badge&labelColor=111a35)](https://github.com/plurano/goenvoy/releases)
   [![Go](https://img.shields.io/badge/Go-1.26+-06b6d4?style=for-the-badge&logo=go&logoColor=white&labelColor=111a35)](https://go.dev)
-  <!-- 2 CI/build -->
-  [![CI](https://img.shields.io/github/actions/workflow/status/plurano/goenvoy/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/plurano/goenvoy/actions/workflows/ci.yml)
   <!-- 3 security/scorecard -->
-  [![Security](https://img.shields.io/github/actions/workflow/status/plurano/goenvoy/security-scan.yml?branch=main&style=for-the-badge&label=Security)](https://github.com/plurano/goenvoy/actions/workflows/security-scan.yml)
   [![OpenSSF Scorecard](https://img.shields.io/badge/OpenSSF-Scorecard-06b6d4?style=for-the-badge&labelColor=111a35)](https://scorecard.dev/viewer/?uri=github.com/plurano/goenvoy)
   [![OpenSSF Best Practices](https://img.shields.io/badge/OpenSSF-Best_Practices-06b6d4?style=for-the-badge&labelColor=111a35)](https://www.bestpractices.dev/projects/15901)
   [![Codacy](https://img.shields.io/badge/Codacy-dashboard-06b6d4?style=for-the-badge&labelColor=111a35&logo=codacy&logoColor=white)](https://app.codacy.com/gh/plurano/goenvoy/dashboard)

@@ -10,11 +10,96 @@ SUT=(bash "$HERE/readme-module-count.sh")
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+if [ "${1:-}" = "--fixture" ]; then
+  cd "$2"
+  git init -q
+  # Why: ensure Git tracks the fixture rather than a redirected repository.
+  git_dir="$(git rev-parse --absolute-git-dir)"
+  if [ "$git_dir" != "$(pwd -P)/.git" ]; then
+    printf 'FAIL tracked fixture: git resolves to %s, not the fixture; an exported GIT_DIR or GIT_WORK_TREE redirected it\n' "$git_dir" >&2
+    exit 1
+  fi
+  mkdir -p docs assets sub
+  printf '{"one":"1","two":"1"}\n' > .release-please-manifest.json
+  printf '2 modules\n' > README.md
+  printf '2 modules\n' > docs/index.md
+  printf 'banner\n1 modules\n' > assets/banner.svg
+  git add .release-please-manifest.json README.md docs/index.md assets/banner.svg
+  expect_refusal 'tracked stale banner' 'assets/banner.svg:2' "${SUT[@]}"
+  printf '2 modules\n' > assets/banner.svg
+  printf 'Includes **3** modules.\n' > other.md
+  git add other.md
+  expect_refusal 'bold stale count' 'says 3 modules, manifest has 2' "${SUT[@]}"
+  printf 'Includes **2** modules.\n' > other.md
+  printf '1 modules\n' > CHANGELOG.md
+  printf '1 modules\n' > sub/CHANGELOG.md
+  git add CHANGELOG.md sub/CHANGELOG.md
+  expect_pass 'historical counts exempt' "${SUT[@]}"
+  printf '1 modules\n' > untracked.md
+  expect_pass 'untracked count ignored' "${SUT[@]}"
+  printf 'no count\n' > README.md
+  expect_refusal 'required readme count' 'README.md: no module count found' "${SUT[@]}"
+  exit 0
+fi
+
+python3 - "$BASH" "$HERE/readme-module-count_test.sh" "$WORK" <<'PYENV'
+import os
+import sys
+
+environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+environment["GIT_CONFIG_GLOBAL"] = os.devnull
+import subprocess
+
+subprocess.run([sys.argv[1], sys.argv[2], "--fixture", sys.argv[3]], env=environment, check=True, timeout=120)
+os.mkdir(os.path.join(sys.argv[3], "physical"))
+os.symlink(os.path.join(sys.argv[3], "physical"), os.path.join(sys.argv[3], "link"))
+os.mkdir(os.path.join(sys.argv[3], "physical", "fixture"))
+subprocess.run([sys.argv[1], sys.argv[2], "--fixture", os.path.join(sys.argv[3], "link", "fixture")], env=environment, check=True, timeout=120)
+PYENV
+
 printf '{"one":"1.0.0","two":"1.0.0"}\n' > "$WORK/manifest.json"
 printf '2 modules\n' > "$WORK/matching.md"
 printf 'heading\n1 modules and 2 modules\n' > "$WORK/stale.md"
 printf 'no count\n' > "$WORK/empty.md"
 printf '{"one":"1","one":"2"}\n' > "$WORK/duplicate.json"
+printf '1,002 modules\n' > "$WORK/comma.md"
+printf '1.002 modules\n' > "$WORK/dot.md"
+printf '1 002 modules\n' > "$WORK/space.md"
+printf 'x1 002 modules\n' > "$WORK/prefixed-space.md"
+printf '1\xe2\x80\x87002 modules\n' > "$WORK/figure.md"
+printf '**2** modules\n' > "$WORK/bold.md"
+printf '\1402\140 modules\n' > "$WORK/code.md"
+printf '__2__ modules\n' > "$WORK/underscore-bold.md"
+printf '1 **002** modules\n' > "$WORK/run.md"
+printf 'x_2 modules\n' > "$WORK/prefixed-underscore.md"
+printf '1_002 modules\n' > "$WORK/underscore.md"
+printf '3-4 modules\n' > "$WORK/range.md"
+printf '1. 2 modules\n' > "$WORK/numbered.md"
+printf '1\xe2\x80\xaf002 modules\n' > "$WORK/narrow.md"
+printf 'Since 2024, 2 modules\n' > "$WORK/prose.md"
+python3 - "$WORK/large-manifest.json" <<'PYMANIFEST'
+import json
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({str(i): "1" for i in range(1002)}), encoding="utf-8")
+PYMANIFEST
+expect_refusal 'run inside count' 'no module count found' "${SUT[@]}" "$WORK/manifest.json" "$WORK/run.md"
+expect_refusal 'x_2 count' 'no module count found' "${SUT[@]}" "$WORK/manifest.json" "$WORK/prefixed-underscore.md"
+expect_pass 'bold count match' "${SUT[@]}" "$WORK/manifest.json" "$WORK/bold.md"
+expect_pass 'code count match' "${SUT[@]}" "$WORK/manifest.json" "$WORK/code.md"
+expect_pass 'underscore bold count match' "${SUT[@]}" "$WORK/manifest.json" "$WORK/underscore-bold.md"
+expect_refusal 'comma count tail' '1,002' "${SUT[@]}" "$WORK/manifest.json" "$WORK/comma.md"
+expect_refusal 'space separator' 'module count 1 002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/space.md"
+expect_refusal 'prefixed space separator' 'no module count found' "${SUT[@]}" "$WORK/manifest.json" "$WORK/prefixed-space.md"
+expect_refusal 'figure space separator' 'module count 1 002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/figure.md"
+expect_refusal 'underscore separator' 'module count 1_002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/underscore.md"
+expect_refusal 'range count' 'module count 3-4 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/range.md"
+expect_pass 'numbered list count' "${SUT[@]}" "$WORK/manifest.json" "$WORK/numbered.md"
+expect_refusal 'dot separator' 'module count 1.002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/dot.md"
+expect_refusal 'narrow space separator' 'module count 1 002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/narrow.md"
+expect_pass 'comma count match' "${SUT[@]}" "$WORK/large-manifest.json" "$WORK/comma.md"
+expect_pass 'plain count after comma prose' "${SUT[@]}" "$WORK/manifest.json" "$WORK/prose.md"
 expect_pass 'matching count' "${SUT[@]}" "$WORK/manifest.json" "$WORK/matching.md"
 expect_refusal 'stale count' "$WORK/stale.md:2: says 1 modules, manifest has 2" "${SUT[@]}" "$WORK/manifest.json" "$WORK/stale.md"
 expect_refusal 'missing count' "$WORK/empty.md" "${SUT[@]}" "$WORK/manifest.json" "$WORK/empty.md"
