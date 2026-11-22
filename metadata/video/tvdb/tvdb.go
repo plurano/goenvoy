@@ -30,8 +30,8 @@ type Client struct {
 
 	mu    sync.Mutex
 	token string
-	// loginMu serializes re-logins so concurrent callers share one login.
-	loginMu sync.Mutex
+	// loginGate is a one-slot gate that serializes re-logins; waiters give up when their context ends.
+	loginGate chan struct{}
 }
 
 // New creates a TheTVDB [Client] using the given API key.
@@ -42,7 +42,7 @@ func New(apiKey string, opts ...metadata.Option) *Client {
 // NewWithPIN creates a TheTVDB [Client] with an API key and subscriber PIN.
 func NewWithPIN(apiKey, pin string, opts ...metadata.Option) *Client {
 	bc := metadata.NewBaseClient(defaultBaseURL, "tvdb", opts...)
-	c := &Client{BaseClient: bc, apiKey: apiKey, pin: pin}
+	c := &Client{BaseClient: bc, apiKey: apiKey, pin: pin, loginGate: make(chan struct{}, 1)}
 	c.SetAuth(func(req *http.Request) {
 		c.mu.Lock()
 		token := c.token
@@ -117,11 +117,15 @@ func (c *Client) currentToken() string {
 	return c.token
 }
 
-// refreshToken re-authenticates when the cached token matches rejected.
+// refreshToken re-authenticates unless another caller already cached a nonempty token other than rejected.
 func (c *Client) refreshToken(ctx context.Context, rejected string) error {
-	c.loginMu.Lock()
-	defer c.loginMu.Unlock()
-	if c.currentToken() != rejected {
+	select {
+	case c.loginGate <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("tvdb: wait for login: %w", ctx.Err())
+	}
+	defer func() { <-c.loginGate }()
+	if cur := c.currentToken(); cur != "" && cur != rejected {
 		return nil
 	}
 	if err := c.Login(ctx); err != nil {
