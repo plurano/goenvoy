@@ -121,4 +121,118 @@ case "$out" in
     ;;
 esac
 
+# bash4_constructs FILE: print Bash-4-only construct lines; return 0 if none, 1 if any, 2 if FILE is too large or unreadable.
+bash4_constructs() {
+  local file="$1" line_count code hits rc
+  line_count=$(wc -l <"$file")
+  line_count=${line_count// /}
+  if [ "$line_count" -gt 4000 ]; then
+    echo "bash4_constructs: file has $line_count lines (max 4000): $file" >&2
+    return 2
+  fi
+  rc=0
+  code=$(grep -n -v -E '^[[:space:]]*#' "$file") || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "bash4_constructs: grep failed (exit $rc): $file" >&2
+    return 2
+  fi
+  if [ "$rc" -eq 1 ]; then
+    return 0
+  fi
+  rc=0
+  hits=$(printf '%s\n' "$code" | grep -E \
+    'mapfile|readarray|declare -[An]|local -[An]|typeset -A|coproc|\$\{[^}]*,,|\$\{[^}]*\^\^|\$\{[^}]*,\}|\$\{[^}]*\^[^}]*\}|\|&|&>>') || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "bash4_constructs: grep failed (exit $rc): $file" >&2
+    return 2
+  fi
+  if [ "$rc" -eq 1 ]; then
+    return 0
+  fi
+  printf '%s\n' "$hits"
+  return 1
+}
+
+# check_bash32_file FILE: exits 1 naming FILE when it holds a Bash 4 construct, else prints ok.
+check_bash32_file() {
+  local file="$1" base out ec
+  base=$(basename "$file")
+  out=$(bash4_constructs "$file") && ec=0 || ec=$?
+  if [ "$ec" -eq 0 ]; then
+    echo "ok   bash 3.2: $base uses no Bash 4 construct"
+    return 0
+  fi
+  if [ "$ec" -eq 2 ]; then
+    exit 1
+  fi
+  printf 'FAIL bash 3.2: %s\n%s\n' "$base" "$out" >&2
+  exit 1
+}
+
+check_bash32_file "$HERE/golangci-modules.sh"
+check_bash32_file "$HERE/module-dirs.sh"
+
+# expect_bash4_hit NAME FILE: exits 1 unless bash4_constructs finds a construct in FILE.
+expect_bash4_hit() {
+  local name="$1" file="$2" out ec
+  out=$(bash4_constructs "$file") && ec=0 || ec=$?
+  if [ "$ec" -ne 1 ]; then
+    printf 'FAIL planted bash 4 construct refused: %s (want hits, ec=%s)\n' "$name" "$ec" >&2
+    exit 1
+  fi
+  echo "ok   planted bash 4 construct refused: $name"
+}
+
+# expect_bash4_clear NAME FILE: exits 1 unless bash4_constructs finds nothing in FILE.
+expect_bash4_clear() {
+  local name="$1" file="$2" out ec
+  out=$(bash4_constructs "$file") && ec=0 || ec=$?
+  if [ "$ec" -ne 0 ]; then
+    printf 'FAIL planted clean file passes: %s (want clear, ec=%s)\n%s\n' "$name" "$ec" "$out" >&2
+    exit 1
+  fi
+  echo "ok   planted clean file passes: $name"
+}
+
+cat >"$WORK/planted-mapfile.sh" <<'EOF'
+mapfile -t x <<<"$y"
+EOF
+printf '%s\n' 'declare -A m=()' >"$WORK/planted-declare-a.sh"
+cat >"$WORK/planted-comment-only.sh" <<'EOF'
+# mapfile in a comment
+x=("$@")
+EOF
+
+expect_bash4_hit 'mapfile line' "$WORK/planted-mapfile.sh"
+expect_bash4_hit 'declare -A' "$WORK/planted-declare-a.sh"
+expect_bash4_clear 'comment and $@ only' "$WORK/planted-comment-only.sh"
+
+MANY_FIXTURE="$WORK/many-modules"
+mkdir -p "$MANY_FIXTURE/tools"
+cp "$HERE/golangci-modules.sh" "$MANY_FIXTURE/tools/"
+chmod +x "$MANY_FIXTURE/tools/golangci-modules.sh"
+cat >"$MANY_FIXTURE/tools/module-dirs.sh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+i=1
+while [ "$i" -le 513 ]; do
+  echo "m$i"
+  i=$((i + 1))
+done
+STUB
+chmod +x "$MANY_FIXTURE/tools/module-dirs.sh"
+
+: >"$LOG"
+# run_many_fixture: runs the copied golangci-modules.sh --all inside the 513-module fixture with the stub linter.
+run_many_fixture() {
+  (cd "$MANY_FIXTURE" && PATH="$STUB_BIN:$PATH" GOLANGCI_STUB_LOG="$LOG" bash tools/golangci-modules.sh --all)
+}
+
+expect_refusal '513 modules from --all' 'too many modules (max 512)' run_many_fixture
+if [ -s "$LOG" ]; then
+  printf 'FAIL 513 modules: stub golangci-lint was called\n' >&2
+  exit 1
+fi
+echo "ok   513 modules: stub not called"
+
 echo "golangci-modules_test: all planted cases pass"

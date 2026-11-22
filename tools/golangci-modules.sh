@@ -23,17 +23,18 @@ else
 fi
 modules=()
 if [ -n "$listed" ]; then
-  mapfile -t modules <<<"$listed"
+  while IFS= read -r line; do
+    if [ "${#modules[@]}" -ge "$MAX_MODULES" ]; then
+      echo "golangci-modules: too many modules (max $MAX_MODULES)" >&2
+      exit 2
+    fi
+    modules+=("$line")
+  done <<<"$listed"
 fi
 
 if [ "${#modules[@]}" -eq 0 ]; then
   echo "no Go module selected"
   exit 0
-fi
-
-if [ "${#modules[@]}" -gt "$MAX_MODULES" ]; then
-  echo "golangci-modules: too many modules (max $MAX_MODULES)" >&2
-  exit 2
 fi
 
 failed=()
