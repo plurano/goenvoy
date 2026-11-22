@@ -2,7 +2,8 @@
 # Detect privileged in-place writes; privileged install must stage to .new
 # or create directories. Only allow listed commands without redirects.
 # Path-qualified sudo/doas, a redirect before the launcher, and separators
-# inside $( ) or backticks still count as one simple command.
+# inside $( ) or backticks still count as one simple command. $( and a
+# backtick open a new quoting level, also inside double quotes.
 # Single-line quoted YAML run values and &> / &>> redirects are read.
 # A quoted or backslash-escaped ; | & does not end a command.
 # Bash splits words on space and tab only.
@@ -101,31 +102,46 @@ while IFS= read -r -d '' file; do
           lchar = substr(lead, lp, 1)
           if (in_squote) {
             if (lchar == "\047") in_squote = 0
-          } else if (in_dquote) {
-            if (lchar == "\\" && lp < length(lead)) lp++
-            else if (lchar == "\"") in_dquote = 0
           } else if (lchar == "\\" && lp < length(lead)) {
             lp++
-          } else if (lchar == "\047") {
-            in_squote = 1
-          } else if (lchar == "\"") {
-            in_dquote = 1
           } else if (lchar == "`") {
+            # Why: a backtick opens a new quoting level, also inside double quotes; the outer quote resumes at its end.
             if (lead_backtick == 0) {
               lsaved_bt = lead_redirect
+              lbt_dquote = in_dquote
+              in_dquote = 0
               lead_redirect = 0
               lead_backtick = 1
             } else {
               lead_redirect = lsaved_bt
+              in_dquote = lbt_dquote
               lead_backtick = 0
             }
             lprev = lchar
+          } else if (lchar == "$" && lp < length(lead) && substr(lead, lp + 1, 1) == "(") {
+            # Why: $( opens a new quoting level, also inside double quotes; the outer quote resumes at its ).
+            lsaved[ldepth] = lead_redirect
+            lqsaved[ldepth++] = in_dquote
+            in_dquote = 0
+            lead_redirect = 0
+            lprev = "("
+            lp++
+          } else if (in_dquote) {
+            if (lchar == "\"") in_dquote = 0
+          } else if (lchar == "\047") {
+            in_squote = 1
+          } else if (lchar == "\"") {
+            in_dquote = 1
           } else if (lchar == "(") {
-            lsaved[ldepth++] = lead_redirect
+            lsaved[ldepth] = lead_redirect
+            lqsaved[ldepth++] = 0
             lead_redirect = 0
             lprev = lchar
           } else if (lchar == ")") {
-            if (ldepth > 0) lead_redirect = lsaved[--ldepth]
+            if (ldepth > 0) {
+              lead_redirect = lsaved[--ldepth]
+              in_dquote = lqsaved[ldepth]
+            }
             lprev = lchar
           } else if (lchar == ">") {
             lead_redirect = 1
@@ -150,28 +166,36 @@ while IFS= read -r -d '' file; do
           char = substr(rest, p, 1)
           if (in_squote) {
             if (char == "\047") in_squote = 0
-          } else if (in_dquote) {
-            if (char == "\\" && p < length(rest)) p++
-            else if (char == "\"") in_dquote = 0
           } else if (char == "\\" && p < length(rest)) {
             p++
-          } else if (char == "\047") {
-            in_squote = 1
-          } else if (char == "\"") {
-            in_dquote = 1
-          } else if (char == "$" && p < length(rest) && substr(rest, p + 1, 1) == "(") {
-            depth++
-            p++
-          } else if (char == "(" && depth > 0) {
-            depth++
-          } else if (char == ")" && depth > 0) {
-            depth--
           } else if (char == "`") {
             if (lead_backtick == 1) {
               segment_first = substr(rest, 1, p - 1)
               break
             }
+            # Why: a backtick opens a new quoting level, also inside double quotes; the outer quote resumes at its end.
+            if (in_backtick == 0) {
+              bt_dquote = in_dquote
+              in_dquote = 0
+            } else {
+              in_dquote = bt_dquote
+            }
             in_backtick = 1 - in_backtick
+          } else if (char == "$" && p < length(rest) && substr(rest, p + 1, 1) == "(") {
+            # Why: $( opens a new quoting level, also inside double quotes; the outer quote resumes at its ).
+            qsaved[depth++] = in_dquote
+            in_dquote = 0
+            p++
+          } else if (in_dquote) {
+            if (char == "\"") in_dquote = 0
+          } else if (char == "\047") {
+            in_squote = 1
+          } else if (char == "\"") {
+            in_dquote = 1
+          } else if (char == "(" && depth > 0) {
+            qsaved[depth++] = 0
+          } else if (char == ")" && depth > 0) {
+            in_dquote = qsaved[--depth]
           } else if ((char == ";" || char == "|" || char == "&") && depth == 0 && in_backtick == 0) {
             segment_first = substr(rest, 1, p - 1)
             break
