@@ -30,6 +30,8 @@ type Client struct {
 
 	mu    sync.Mutex
 	token string
+	// loginMu serializes re-logins so concurrent callers share one login.
+	loginMu sync.Mutex
 }
 
 // New creates a TheTVDB [Client] using the given API key.
@@ -108,14 +110,36 @@ func (c *Client) Login(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) ensureToken(ctx context.Context) error {
+// currentToken returns the cached bearer token.
+func (c *Client) currentToken() string {
 	c.mu.Lock()
-	hasToken := c.token != ""
-	c.mu.Unlock()
-	if hasToken {
+	defer c.mu.Unlock()
+	return c.token
+}
+
+// refreshToken re-authenticates when the cached token matches rejected.
+func (c *Client) refreshToken(ctx context.Context, rejected string) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	if c.currentToken() != rejected {
 		return nil
 	}
-	return c.Login(ctx)
+	if err := c.Login(ctx); err != nil {
+		c.mu.Lock()
+		if c.token == rejected {
+			c.token = ""
+		}
+		c.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (c *Client) ensureToken(ctx context.Context) error {
+	if c.currentToken() != "" {
+		return nil
+	}
+	return c.refreshToken(ctx, "")
 }
 
 func (c *Client) get(ctx context.Context, path string, dst any) error {
@@ -123,6 +147,7 @@ func (c *Client) get(ctx context.Context, path string, dst any) error {
 		return err
 	}
 
+	sent := c.currentToken()
 	err := c.doGet(ctx, path, dst)
 	if err == nil {
 		return nil
@@ -131,10 +156,7 @@ func (c *Client) get(ctx context.Context, path string, dst any) error {
 	// On 401 Unauthorized, re-login and retry once.
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
-		c.mu.Lock()
-		c.token = ""
-		c.mu.Unlock()
-		if loginErr := c.Login(ctx); loginErr != nil {
+		if loginErr := c.refreshToken(ctx, sent); loginErr != nil {
 			return loginErr
 		}
 		return c.doGet(ctx, path, dst)

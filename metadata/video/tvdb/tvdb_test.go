@@ -578,6 +578,131 @@ func TestLoginError(t *testing.T) {
 	}
 }
 
+// TestTokenRefreshOn401Concurrent checks concurrent 401 retries share a single re-login.
+func TestTokenRefreshOn401Concurrent(t *testing.T) {
+	t.Parallel()
+	var loginCount atomic.Int32
+	var staleArrived atomic.Int32
+	staleGate := make(chan struct{})
+	seriesOK := map[string]any{
+		"status": "success",
+		"data":   map[string]any{"id": float64(1), "name": "Test Series"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			loginCount.Add(1)
+			token := "stale"
+			if loginCount.Load() > 1 {
+				token = "fresh"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"status": "success",
+				"data":   map[string]any{"token": token},
+			})
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		switch {
+		case auth == "Bearer stale":
+			if staleArrived.Add(1) == 8 {
+				close(staleGate)
+			}
+			select {
+			case <-staleGate:
+			case <-time.After(5 * time.Second):
+				t.Error("stale requests did not reach gate within 5s")
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"message": "token expired"})
+		case auth == "Bearer fresh":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(seriesOK)
+		default:
+			t.Errorf("unexpected Authorization %q", auth)
+			http.Error(w, "bad auth", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	c := tvdb.New("test-key", metadata.WithBaseURL(srv.URL))
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := c.Login(ctx); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	initial := loginCount.Load()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			series, err := c.GetSeries(ctx, 1)
+			if err != nil {
+				t.Errorf("GetSeries: %v", err)
+				return
+			}
+			if series.Name != "Test Series" {
+				t.Errorf("Name = %q, want %q", series.Name, "Test Series")
+			}
+		})
+	}
+	wg.Wait()
+
+	if got, want := loginCount.Load()-initial, int32(1); got != want {
+		t.Errorf("re-login count after 8 concurrent 401s = %d, want %d", got, want)
+	}
+}
+
+// TestEnsureTokenConcurrent checks concurrent first requests share one login.
+func TestEnsureTokenConcurrent(t *testing.T) {
+	t.Parallel()
+	var loginCount atomic.Int32
+	seriesOK := map[string]any{
+		"status": "success",
+		"data":   map[string]any{"id": float64(1), "name": "Test Series"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			loginCount.Add(1)
+			time.Sleep(50 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"status": "success",
+				"data":   map[string]any{"token": "fresh"},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(seriesOK)
+	}))
+	defer srv.Close()
+
+	c := tvdb.New("test-key", metadata.WithBaseURL(srv.URL))
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			series, err := c.GetSeries(ctx, 1)
+			if err != nil {
+				t.Errorf("GetSeries: %v", err)
+				return
+			}
+			if series.Name != "Test Series" {
+				t.Errorf("Name = %q, want %q", series.Name, "Test Series")
+			}
+		})
+	}
+	wg.Wait()
+
+	if got, want := loginCount.Load(), int32(1); got != want {
+		t.Errorf("login count = %d, want %d", got, want)
+	}
+}
+
 // TestTokenRefreshOn401 checks that a retry sends the token from the second login.
 func TestTokenRefreshOn401(t *testing.T) {
 	t.Parallel()
