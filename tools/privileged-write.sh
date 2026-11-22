@@ -40,8 +40,8 @@ while IFS= read -r -d '' file; do
     BEGIN {
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
       variable = "\\$(" name ")|\\$\\{(" name ")\\}|\\$\\((" name ")\\)"
-      prefix = "(^|[;&|([:space:]])(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
-      make_prefix = "(^[[:punct:]]?|[;&|([:space:]])[@+-]*(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
+      prefix = "(^|[;&|\140([:space:]])(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
+      make_prefix = "(^[[:punct:]]?|[;&|\140([:space:]])[@+-]*(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
       command = prefix "[[:space:]]+[^[:space:];|&]+"
       make_command = make_prefix "[[:space:]]+[^[:space:];|&]+"
     }
