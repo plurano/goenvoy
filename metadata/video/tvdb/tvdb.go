@@ -22,6 +22,9 @@ const (
 
 var errLoginResponseTooLarge = errors.New("login response too large")
 
+// sentTokenKey carries the bearer token get captured, so the auth hook sends exactly that token.
+type sentTokenKey struct{}
+
 // Client is a TheTVDB API v4 client.
 type Client struct {
 	*metadata.BaseClient
@@ -30,6 +33,8 @@ type Client struct {
 
 	mu    sync.Mutex
 	token string
+	// loginGate is a one-slot gate that serializes re-logins; waiters give up when their context ends.
+	loginGate chan struct{}
 }
 
 // New creates a TheTVDB [Client] using the given API key.
@@ -40,11 +45,12 @@ func New(apiKey string, opts ...metadata.Option) *Client {
 // NewWithPIN creates a TheTVDB [Client] with an API key and subscriber PIN.
 func NewWithPIN(apiKey, pin string, opts ...metadata.Option) *Client {
 	bc := metadata.NewBaseClient(defaultBaseURL, "tvdb", opts...)
-	c := &Client{BaseClient: bc, apiKey: apiKey, pin: pin}
+	c := &Client{BaseClient: bc, apiKey: apiKey, pin: pin, loginGate: make(chan struct{}, 1)}
 	c.SetAuth(func(req *http.Request) {
-		c.mu.Lock()
-		token := c.token
-		c.mu.Unlock()
+		token, ok := req.Context().Value(sentTokenKey{}).(string)
+		if !ok {
+			token = c.currentToken()
+		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		if req.Method != http.MethodGet {
 			req.Header.Set("Content-Type", "application/json")
@@ -108,22 +114,51 @@ func (c *Client) Login(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) ensureToken(ctx context.Context) error {
+// currentToken returns the cached bearer token.
+func (c *Client) currentToken() string {
 	c.mu.Lock()
-	hasToken := c.token != ""
-	c.mu.Unlock()
-	if hasToken {
-		return nil
-	}
-	return c.Login(ctx)
+	defer c.mu.Unlock()
+	return c.token
 }
 
+// refreshToken re-authenticates unless another caller already cached a nonempty token other than rejected.
+func (c *Client) refreshToken(ctx context.Context, rejected string) error {
+	select {
+	case c.loginGate <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("tvdb: wait for login: %w", ctx.Err())
+	}
+	defer func() { <-c.loginGate }()
+	if cur := c.currentToken(); cur != "" && cur != rejected {
+		return nil
+	}
+	if err := c.Login(ctx); err != nil {
+		c.mu.Lock()
+		if c.token == rejected {
+			c.token = ""
+		}
+		c.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// ensureToken ensures a bearer token is present, logging in when the cache is empty.
+func (c *Client) ensureToken(ctx context.Context) error {
+	if c.currentToken() != "" {
+		return nil
+	}
+	return c.refreshToken(ctx, "")
+}
+
+// get performs an authenticated GET with one retry after 401, coalescing re-login through refreshToken.
 func (c *Client) get(ctx context.Context, path string, dst any) error {
 	if err := c.ensureToken(ctx); err != nil {
 		return err
 	}
 
-	err := c.doGet(ctx, path, dst)
+	sent := c.currentToken()
+	err := c.doGetAs(ctx, sent, path, dst)
 	if err == nil {
 		return nil
 	}
@@ -131,15 +166,17 @@ func (c *Client) get(ctx context.Context, path string, dst any) error {
 	// On 401 Unauthorized, re-login and retry once.
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
-		c.mu.Lock()
-		c.token = ""
-		c.mu.Unlock()
-		if loginErr := c.Login(ctx); loginErr != nil {
+		if loginErr := c.refreshToken(ctx, sent); loginErr != nil {
 			return loginErr
 		}
 		return c.doGet(ctx, path, dst)
 	}
 	return err
+}
+
+// doGetAs performs a GET using exactly the given bearer token on the wire.
+func (c *Client) doGetAs(ctx context.Context, token, path string, dst any) error {
+	return c.doGet(context.WithValue(ctx, sentTokenKey{}, token), path, dst)
 }
 
 func (c *Client) doGet(ctx context.Context, path string, dst any) error {
