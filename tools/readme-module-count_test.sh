@@ -27,6 +27,10 @@ if [ "${1:-}" = "--fixture" ]; then
   git add .release-please-manifest.json README.md docs/index.md assets/banner.svg
   expect_refusal 'tracked stale banner' 'assets/banner.svg:2' "${SUT[@]}"
   printf '2 modules\n' > assets/banner.svg
+  printf 'Includes **3** modules.\n' > other.md
+  git add other.md
+  expect_refusal 'bold stale count' 'says 3 modules, manifest has 2' "${SUT[@]}"
+  printf 'Includes **2** modules.\n' > other.md
   printf '1 modules\n' > CHANGELOG.md
   printf '1 modules\n' > sub/CHANGELOG.md
   git add CHANGELOG.md sub/CHANGELOG.md
@@ -63,6 +67,11 @@ printf '1.002 modules\n' > "$WORK/dot.md"
 printf '1 002 modules\n' > "$WORK/space.md"
 printf 'x1 002 modules\n' > "$WORK/prefixed-space.md"
 printf '1\xe2\x80\x87002 modules\n' > "$WORK/figure.md"
+printf '**2** modules\n' > "$WORK/bold.md"
+printf '\1402\140 modules\n' > "$WORK/code.md"
+printf '__2__ modules\n' > "$WORK/underscore-bold.md"
+printf '1 **002** modules\n' > "$WORK/run.md"
+printf 'x_2 modules\n' > "$WORK/prefixed-underscore.md"
 printf '1_002 modules\n' > "$WORK/underscore.md"
 printf '3-4 modules\n' > "$WORK/range.md"
 printf '1. 2 modules\n' > "$WORK/numbered.md"
@@ -75,6 +84,11 @@ from pathlib import Path
 
 Path(sys.argv[1]).write_text(json.dumps({str(i): "1" for i in range(1002)}), encoding="utf-8")
 PYMANIFEST
+expect_refusal 'run inside count' 'no module count found' "${SUT[@]}" "$WORK/manifest.json" "$WORK/run.md"
+expect_refusal 'x_2 count' 'no module count found' "${SUT[@]}" "$WORK/manifest.json" "$WORK/prefixed-underscore.md"
+expect_pass 'bold count match' "${SUT[@]}" "$WORK/manifest.json" "$WORK/bold.md"
+expect_pass 'code count match' "${SUT[@]}" "$WORK/manifest.json" "$WORK/code.md"
+expect_pass 'underscore bold count match' "${SUT[@]}" "$WORK/manifest.json" "$WORK/underscore-bold.md"
 expect_refusal 'comma count tail' '1,002' "${SUT[@]}" "$WORK/manifest.json" "$WORK/comma.md"
 expect_refusal 'space separator' 'module count 1 002 is not a plain number' "${SUT[@]}" "$WORK/manifest.json" "$WORK/space.md"
 expect_refusal 'prefixed space separator' 'no module count found' "${SUT[@]}" "$WORK/manifest.json" "$WORK/prefixed-space.md"

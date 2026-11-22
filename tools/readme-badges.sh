@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Allow plain static Shields badges and verify workflow links.
+# Allow plain static Shields badges with %20, %23, %25, or %2B escapes and verify workflow links.
 # Reject other Shields references everywhere and badge.svg outside governance blocks.
 # Scope: honest mistakes, read one line at a time with one delimiter set.
 # Out of scope: delimiters read differently across contexts (a quote, space
@@ -97,7 +97,7 @@ for f in "${files[@]}"; do
   for ((lnum = 1; lnum <= ${#lines[@]}; lnum++)); do
     line="${lines[lnum - 1]}"
     stripped="$line"
-    static_badge_re="https://img\.shields\.io/badge/([A-Za-z0-9_.+-]|%20)+(\?[A-Za-z0-9_.=&;:/%+-]*)?([\"')>[:space:]]|$)"
+    static_badge_re="https://img\.shields\.io/badge/([A-Za-z0-9_.+-]|%20|%23|%25|%2[Bb])+(\?[A-Za-z0-9_.=&;:/%+-]*)?([\"')>[:space:]]|$)"
     for ((strip_i = 0; strip_i < ${#line}; strip_i++)); do
       if [[ "$stripped" =~ $static_badge_re ]]; then
         matched="${BASH_REMATCH[0]}"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Check documented module counts against the release manifest.
-# Counts span any single non-alphanumeric character between digit groups and must be plain or comma-grouped.
+# Counts span any single non-alphanumeric character between digit groups, must be plain or comma-grouped, and may sit inside *, _ or backtick marks.
 set -euo pipefail
 
 mode=explicit
@@ -39,7 +39,7 @@ try:
         raise ValueError("manifest must be an object")
     count = len(manifest)
     failed = False
-    count_pattern = re.compile(r"(?<!\w)(?<![0-9](?:[^\w\n]|_))([0-9]+(?:(?:[^\w\n]|_)[0-9]+)*) modules\b")
+    count_pattern = re.compile(r"(?<!\w)(?<![*_`])(?<![0-9](?:[^\w\n]|_))[*_`]{0,3}([0-9]+(?:(?:[^\w\n]|_)[0-9]+)*)[*_`]{0,3} modules\b")
     filenames = sys.argv[3:]
     if tracked:
         filenames = ["README.md", "docs/index.md"]

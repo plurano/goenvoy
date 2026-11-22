@@ -392,6 +392,36 @@ mkdir -p "$WORK/case_ay"
 printf '%s\n' '<img src="https://img&#37;2&#x45;shields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_ay/README.md"
 expect_refusal "case_ay: HTML then uppercase percent" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_ay"
 
+# Case (bi): static badge C%2B%2B.
+mkdir -p "$WORK/case_bi"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-C%2B%2B-blue)' > "$WORK/case_bi/README.md"
+expect_output "case_bi: C%2B%2B" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bi"
+
+# Case (bj): static badge C%23.
+mkdir -p "$WORK/case_bj"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-C%23-blue)' > "$WORK/case_bj/README.md"
+expect_output "case_bj: C%23" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bj"
+
+# Case (bk): static badge 100%25.
+mkdir -p "$WORK/case_bk"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-100%25-blue)' > "$WORK/case_bk/README.md"
+expect_output "case_bk: 100%25" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bk"
+
+# Case (bl): static badge c%2b%2b.
+mkdir -p "$WORK/case_bl"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-c%2b%2b-blue)' > "$WORK/case_bl/README.md"
+expect_output "case_bl: c%2b%2b" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bl"
+
+# Case (bm): static badge ci%2Fcd.
+mkdir -p "$WORK/case_bm"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-ci%2Fcd-blue)' > "$WORK/case_bm/README.md"
+expect_refusal "case_bm: ci%2Fcd" "shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bm"
+
+# Case (bn): static badge a%2Eb.
+mkdir -p "$WORK/case_bn"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-a%2Eb-blue)' > "$WORK/case_bn/README.md"
+expect_refusal "case_bn: a%2Eb" "shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bn"
+
 # Cases (az)-(bf): normalized paths and unrecognized shields references -> 1.
 for case_name in az ba bb bc bd be bf; do
   mkdir -p "$WORK/case_$case_name/.github/workflows"
