@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Detect privileged in-place writes; privileged install must stage to .new
 # or create directories. Only allow listed commands without redirects.
+# Path-qualified sudo/doas, a redirect before the launcher, and separators
+# inside $( ) or backticks still count as one simple command.
 # Single-line quoted YAML run values and &> / &>> redirects are read.
 # A quoted or backslash-escaped ; | & does not end a command.
 # Bash splits words on space and tab only.
@@ -40,8 +42,9 @@ while IFS= read -r -d '' file; do
     BEGIN {
       name = "[a-z_][a-z0-9_]*" "(su" "do|privi" "lege)[a-z0-9_]*|" "(su" "do|privi" "lege)[a-z0-9_]*"
       variable = "\\$(" name ")|\\$\\{(" name ")\\}|\\$\\((" name ")\\)"
-      prefix = "(^|[;&|\140([:space:]])(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
-      make_prefix = "(^[[:punct:]]?|[;&|\140([:space:]])[@+-]*(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
+      path = "([^[:space:];|&\140\"\047()]*/)?"
+      prefix = "(^|[;&|\140([:space:]])" path "(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
+      make_prefix = "(^[[:punct:]]?|[;&|\140([:space:]])[@+-]*" path "(" "su" "do|do" "as|" variable "|\"(" variable ")\")"
       command = prefix "[[:space:]]+[^[:space:];|&]+"
       make_command = make_prefix "[[:space:]]+[^[:space:];|&]+"
     }
@@ -72,11 +75,40 @@ while IFS= read -r -d '' file; do
           line = substr(line, start + RLENGTH - 1)
           continue
         }
+        lead = substr(line, 1, start - 1)
+        lead_redirect = 0
+        lead_backtick = 0
+        in_squote = 0
+        in_dquote = 0
+        for (lp = 1; lp <= length(lead); lp++) {
+          lchar = substr(lead, lp, 1)
+          if (in_squote) {
+            if (lchar == "\047") in_squote = 0
+          } else if (in_dquote) {
+            if (lchar == "\\" && lp < length(lead)) lp++
+            else if (lchar == "\"") in_dquote = 0
+          } else if (lchar == "\\" && lp < length(lead)) {
+            lp++
+          } else if (lchar == "\047") {
+            in_squote = 1
+          } else if (lchar == "\"") {
+            in_dquote = 1
+          } else if (lchar == "`") {
+            lead_backtick = 1 - lead_backtick
+            lead_redirect = 0
+          } else if (lchar == ">") {
+            lead_redirect = 1
+          } else if (lchar == ";" || lchar == "|" || lchar == "&" || lchar == "(") {
+            lead_redirect = 0
+          }
+        }
         call = substr(call, RLENGTH + 1)
         gsub(/&>/, ">", rest)
         segment_first = rest
         in_squote = 0
         in_dquote = 0
+        depth = 0
+        in_backtick = 0
         for (p = 1; p <= length(rest); p++) {
           char = substr(rest, p, 1)
           if (in_squote) {
@@ -90,7 +122,20 @@ while IFS= read -r -d '' file; do
             in_squote = 1
           } else if (char == "\"") {
             in_dquote = 1
-          } else if (char == ";" || char == "|" || char == "&") {
+          } else if (char == "$" && p < length(rest) && substr(rest, p + 1, 1) == "(") {
+            depth++
+            p++
+          } else if (char == "(" && depth > 0) {
+            depth++
+          } else if (char == ")" && depth > 0) {
+            depth--
+          } else if (char == "`") {
+            if (lead_backtick == 1) {
+              segment_first = substr(rest, 1, p - 1)
+              break
+            }
+            in_backtick = 1 - in_backtick
+          } else if ((char == ";" || char == "|" || char == "&") && depth == 0 && in_backtick == 0) {
             segment_first = substr(rest, 1, p - 1)
             break
           }
@@ -168,7 +213,7 @@ while IFS= read -r -d '' file; do
           }
           if (!refused && (directory || last ~ /\.new$/)) install_ok = 1
         }
-        if (call !~ /^(install|mv|rm|chown|chmod|test|cat|systemctl)$/ || segments[1] ~ />/ || (call == "install" && !install_ok)) {
+        if (call !~ /^(install|mv|rm|chown|chmod|test|cat|systemctl)$/ || segments[1] ~ />/ || lead_redirect || (call == "install" && !install_ok)) {
           print ENVIRON["PRIVWRITE_FILE"] ":" FNR
           failed = 1
         }
