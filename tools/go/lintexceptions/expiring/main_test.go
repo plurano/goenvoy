@@ -2,12 +2,15 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"go.yaml.in/yaml/v4"
 )
 
 const fixtureYAML = "exceptions:\n" +
@@ -121,6 +124,105 @@ func TestExecuteRejectsBadDate(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "-today") {
 		t.Fatalf("execute = %v; want date error", err)
 	}
+}
+
+const (
+	listingCommand     = "go run ./lintexceptions/expiring -root ../.."
+	lintExceptionsStep = "make lint-exceptions"
+)
+
+// TestRepositoryWiring fails when the listing is unwired from the lint-exceptions target or the CI step.
+func TestRepositoryWiring(t *testing.T) {
+	t.Parallel()
+	makefileData, err := os.ReadFile("../../../../Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflowData, err := os.ReadFile("../../../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makefile, workflow := string(makefileData), string(workflowData)
+	const exitLine = `exit "$$check_status"; \`
+	withoutListing := strings.Replace(makefile, "\t\t"+listingCommand+" && "+exitLine, "\t\t"+exitLine, 1)
+	withoutStep := strings.Replace(workflow, "run: "+lintExceptionsStep, "run: make lint", 1)
+	if withoutListing == makefile {
+		t.Error("Makefile mutation did not remove the listing command")
+	}
+	if withoutStep == workflow {
+		t.Error("CI workflow mutation did not remove the lint-exceptions step")
+	}
+
+	cases := [4]struct {
+		name, makefile, workflow, wantError string
+	}{
+		{"repository", makefile, workflow, ""},
+		{"listing removed", withoutListing, workflow, listingCommand},
+		{"CI step removed", makefile, withoutStep, lintExceptionsStep},
+		{"target missing", "other-target:\n\t" + listingCommand + "\n", workflow, "missing lint-exceptions target"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			assertWiringError(t, checkWiring(c.makefile, c.workflow), c.wantError)
+		})
+	}
+}
+
+func assertWiringError(t *testing.T, err error, want string) {
+	t.Helper()
+	if want == "" {
+		if err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("checkWiring = %v, want error containing %q", err, want)
+	}
+}
+
+func checkWiring(makefile, workflow string) error {
+	if err := checkListingRecipe(makefile); err != nil {
+		return err
+	}
+	var ci struct {
+		Jobs map[string]struct {
+			Steps []struct{ Name, Run string }
+		}
+	}
+	if err := yaml.Unmarshal([]byte(workflow), &ci); err != nil {
+		return fmt.Errorf("decode CI workflow: %w", err)
+	}
+	for _, step := range ci.Jobs["lint-exceptions"].Steps {
+		if strings.TrimSpace(step.Run) == lintExceptionsStep {
+			return nil
+		}
+	}
+	return fmt.Errorf("CI lint-exceptions job is missing the %q step", lintExceptionsStep)
+}
+
+func checkListingRecipe(makefile string) error {
+	var foundTarget bool
+	for _, line := range strings.Split(makefile, "\n") {
+		if !foundTarget {
+			foundTarget = strings.HasPrefix(line, "lint-exceptions:")
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "\t") {
+			break
+		}
+		if strings.Contains(line, listingCommand) {
+			return nil
+		}
+	}
+	if !foundTarget {
+		return errors.New("Makefile is missing lint-exceptions target")
+	}
+	return fmt.Errorf("Makefile lint-exceptions recipe is missing the listing command %q", listingCommand)
 }
 
 func writeFixture(t *testing.T, path, contents string) {
