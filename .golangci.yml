@@ -244,27 +244,7 @@ linters:
       - path: ^arr/jackett/jackett_test\.go$
         linters:
           - gocognit
-        text: func `TestGetCapabilities`
-      # baseline #141
-      - path: ^arr/jackett/jackett_test\.go$
-        linters:
-          - gocognit
-        text: func `TestSearch`
-      # baseline #141
-      - path: ^arr/jackett/jackett_test\.go$
-        linters:
-          - gocognit
         text: func `TestTVSearch`
-      # baseline #141
-      - path: ^arr/jackett/jackett_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestGetCapabilities`
-      # baseline #141
-      - path: ^arr/jackett/jackett_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestSearch`
       # baseline #141
       - path: ^arr/lidarr/queue_options_test\.go$
         linters:
@@ -379,37 +359,7 @@ linters:
       - path: ^metadata/anime/anidb/anidb_test\.go$
         linters:
           - funlen
-        text: Function 'TestSearchByTitle'
-      # baseline #141
-      - path: ^metadata/anime/anidb/anidb_test\.go$
-        linters:
-          - funlen
         text: Function 'getTestAnime'
-      # baseline #141
-      - path: ^metadata/anime/anidb/anidb_test\.go$
-        linters:
-          - gocognit
-        text: func `TestSearchByTitle`
-      # baseline #141
-      - path: ^metadata/anime/anidb/anidb_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestSearchByTitle`
-      # baseline #141
-      - path: ^metadata/anime/mal/mal_test\.go$
-        linters:
-          - gocognit
-        text: func `TestExchangeCode`
-      # baseline #141
-      - path: ^metadata/anime/mal/mal_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestExchangeCode`
-      # baseline #141
-      - path: ^metadata/anime/mal/mal_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestGetAnimeSubtypes`
       # baseline #141
       - path: ^metadata/client_test\.go$
         linters:
@@ -426,50 +376,10 @@ linters:
           - gocognit
         text: func `TestDoRaw`
       # baseline #141
-      - path: ^metadata/game/hasheous/hasheous_test\.go$
-        linters:
-          - funlen
-        text: Function 'TestLookupByHash'
-      # baseline #141
-      - path: ^metadata/game/hasheous/hasheous_test\.go$
-        linters:
-          - gocognit
-        text: func `TestLookupByHash`
-      # baseline #141
-      - path: ^metadata/game/hasheous/hasheous_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestLookupByHash`
-      # baseline #141
       - path: ^metadata/game/launchbox/launchbox_test\.go$
         linters:
           - funlen
         text: Function 'makeTestZip'
-      # baseline #141
-      - path: ^metadata/game/screenscraper/screenscraper_test\.go$
-        linters:
-          - funlen
-        text: Function 'TestGetGameInfo'
-      # baseline #141
-      - path: ^metadata/game/screenscraper/screenscraper_test\.go$
-        linters:
-          - gocognit
-        text: func `TestGetGameInfo`
-      # baseline #141
-      - path: ^metadata/game/screenscraper/screenscraper_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestGetGameInfo`
-      # baseline #141
-      - path: ^metadata/tracking/letterboxd/letterboxd_test\.go$
-        linters:
-          - gocognit
-        text: func `TestNewWithClientCredentials`
-      # baseline #141
-      - path: ^metadata/tracking/letterboxd/letterboxd_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestNewWithClientCredentials`
       # baseline #141
       - path: ^metadata/tracking/listenbrainz/listenbrainz_test\.go$
         linters:
@@ -485,11 +395,6 @@ linters:
         linters:
           - gocognit
         text: func `newTestServer`
-      # baseline #141
-      - path: ^tools/go/upstreamspec/manifest_test\.go$
-        linters:
-          - gocyclo
-        text: func `TestReadManifest`
       # praetor:generated-exceptions end
 
 formatters:
