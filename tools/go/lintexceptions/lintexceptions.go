@@ -7,9 +7,10 @@
 // funlen, gocyclo or gocognit through a "text:" line; the engine ratchet only lets it shrink.
 // A complexity linter outside that block fails, so no file tier comes back.
 //
-// This check is itself an exception to one mechanism per behavior (HISS-19; category C,
-// entered 2026-11-12, expires 2026-11-22, #141): the engine audit judges the same block in the
-// local hooks, and this check keeps a CI barrier until the CI runs that audit.
+// This check is itself an exception to one mechanism per behavior (HISS-19; category D,
+// entered 2026-11-23, expires 2027-03-23, #141): the engine audit judges the same block in
+// the local hooks, but CI runs no server-side praetorctl audit by adoption, so this check is
+// the second barrier for the block. Revisit when CI runs praetorctl audit.
 // Adapted from tekmora/epitrop tools/lintexceptions (same author).
 package lintexceptions
 
@@ -22,7 +23,7 @@ import (
 )
 
 // selfExpiry is the date this package's own exception runs out.
-const selfExpiry = "2026-11-22"
+const selfExpiry = "2027-03-23"
 
 // maxLines bounds the configuration lines one check reads.
 const maxLines = 100000
