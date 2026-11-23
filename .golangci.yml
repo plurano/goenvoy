@@ -240,10 +240,6 @@ linters:
         linters:
           - gocognit
         text: func `TestBaseClient_Head`
-      # category C, entered 2026-11-12, expires 2026-11-22, #141
-      - path: ^arr/jackett/jackett_test\.go$
-        linters:
-          - cyclop
       # baseline #141
       - path: ^arr/jackett/jackett_test\.go$
         linters:
@@ -379,10 +375,6 @@ linters:
         linters:
           - gocognit
         text: func `TestSetTorrentSpeedLimits`
-      # category C, entered 2026-11-12, expires 2026-11-22, #141
-      - path: ^metadata/anime/anidb/anidb_test\.go$
-        linters:
-          - cyclop
       # baseline #141
       - path: ^metadata/anime/anidb/anidb_test\.go$
         linters:
@@ -403,10 +395,6 @@ linters:
         linters:
           - gocyclo
         text: func `TestSearchByTitle`
-      # category C, entered 2026-11-12, expires 2026-11-22, #141
-      - path: ^metadata/anime/mal/mal_test\.go$
-        linters:
-          - cyclop
       # baseline #141
       - path: ^metadata/anime/mal/mal_test\.go$
         linters:
@@ -437,10 +425,6 @@ linters:
         linters:
           - gocognit
         text: func `TestDoRaw`
-      # category C, entered 2026-11-12, expires 2026-11-22, #141
-      - path: ^metadata/game/hasheous/hasheous_test\.go$
-        linters:
-          - cyclop
       # baseline #141
       - path: ^metadata/game/hasheous/hasheous_test\.go$
         linters:
@@ -461,10 +445,6 @@ linters:
         linters:
           - funlen
         text: Function 'makeTestZip'
-      # category C, entered 2026-11-12, expires 2026-11-22, #141
-      - path: ^metadata/game/screenscraper/screenscraper_test\.go$
-        linters:
-          - cyclop
       # baseline #141
       - path: ^metadata/game/screenscraper/screenscraper_test\.go$
         linters:
@@ -480,10 +460,6 @@ linters:
         linters:
           - gocyclo
         text: func `TestGetGameInfo`
-      # category C, entered 2026-11-12, expires 2026-11-22, #141
-      - path: ^metadata/tracking/letterboxd/letterboxd_test\.go$
-        linters:
-          - cyclop
       # baseline #141
       - path: ^metadata/tracking/letterboxd/letterboxd_test\.go$
         linters:
@@ -509,10 +485,6 @@ linters:
         linters:
           - gocognit
         text: func `newTestServer`
-      # category C, entered 2026-11-12, expires 2026-11-22, #141
-      - path: ^tools/go/upstreamspec/manifest_test\.go$
-        linters:
-          - cyclop
       # baseline #141
       - path: ^tools/go/upstreamspec/manifest_test\.go$
         linters:

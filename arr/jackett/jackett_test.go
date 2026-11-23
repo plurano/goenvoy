@@ -114,40 +114,27 @@ func newJSONServer(t *testing.T, wantPath string, response any) *jackett.Client 
 	return c
 }
 
-func TestSearch(t *testing.T) {
-	t.Parallel()
+// checkSearchRequest validates query and path for a torznab search request.
+func checkSearchRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	q := r.URL.Query()
+	if got := q.Get("t"); got != "search" {
+		t.Errorf("t = %q, want search", got)
+	}
+	if got := q.Get("q"); got != "ubuntu" {
+		t.Errorf("q = %q, want ubuntu", got)
+	}
+	if got := q.Get("cat"); got != "4000,5000" {
+		t.Errorf("cat = %q, want 4000,5000", got)
+	}
+	if !strings.HasPrefix(r.URL.Path, "/api/v2.0/indexers/all/results/torznab") {
+		t.Errorf("path = %q, want torznab path", r.URL.Path)
+	}
+}
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		if got := q.Get("t"); got != "search" {
-			t.Errorf("t = %q, want search", got)
-		}
-		if got := q.Get("q"); got != "ubuntu" {
-			t.Errorf("q = %q, want ubuntu", got)
-		}
-		if got := q.Get("cat"); got != "4000,5000" {
-			t.Errorf("cat = %q, want 4000,5000", got)
-		}
-		if !strings.HasPrefix(r.URL.Path, "/api/v2.0/indexers/all/results/torznab") {
-			t.Errorf("path = %q, want torznab path", r.URL.Path)
-		}
-		w.Header().Set("Content-Type", "application/xml")
-		_, _ = w.Write([]byte(torznabXML))
-	}))
-	defer ts.Close()
-
-	c, err := jackett.New(ts.URL, "test-key")
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	results, err := c.Search(context.Background(), "ubuntu", []int{4000, 5000})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 2 {
-		t.Fatalf("len(results) = %d, want 2", len(results))
-	}
-	r := results[0]
+// checkSearchFirstResult validates the first torznab item fields from TestSearch.
+func checkSearchFirstResult(t *testing.T, r jackett.SearchResult) {
+	t.Helper()
 	if r.Title != "Ubuntu 24.04" {
 		t.Errorf("Title = %q, want Ubuntu 24.04", r.Title)
 	}
@@ -175,6 +162,31 @@ func TestSearch(t *testing.T) {
 	if r.DownloadVolumeFactor != "0" {
 		t.Errorf("DownloadVolumeFactor = %q, want 0", r.DownloadVolumeFactor)
 	}
+}
+
+// TestSearch tests torznab aggregate search request parameters and the first result fields.
+func TestSearch(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checkSearchRequest(t, r)
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(torznabXML))
+	}))
+	defer ts.Close()
+
+	c, err := jackett.New(ts.URL, "test-key")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	results, err := c.Search(context.Background(), "ubuntu", []int{4000, 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
+	checkSearchFirstResult(t, results[0])
 }
 
 func TestSearchNilCategories(t *testing.T) {
@@ -357,14 +369,9 @@ func TestBookSearch(t *testing.T) {
 	}
 }
 
-func TestGetCapabilities(t *testing.T) {
-	t.Parallel()
-
-	c := newXMLServer(t, "/api/v2.0/indexers/all/results/torznab", capsXML)
-	caps, err := c.GetCapabilities(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+// checkCapabilitiesCore validates server info, limits, and search flags from TestGetCapabilities.
+func checkCapabilitiesCore(t *testing.T, caps *jackett.Capabilities) {
+	t.Helper()
 	if caps.Server.Title != "Jackett" {
 		t.Errorf("Server.Title = %q, want Jackett", caps.Server.Title)
 	}
@@ -392,21 +399,39 @@ func TestGetCapabilities(t *testing.T) {
 	if !caps.Searching.BookSearchAvailable {
 		t.Error("BookSearchAvailable = false, want true")
 	}
-	if len(caps.Categories) != 2 {
-		t.Fatalf("len(Categories) = %d, want 2", len(caps.Categories))
+}
+
+// checkCapabilitiesCategories validates the first category tree from TestGetCapabilities.
+func checkCapabilitiesCategories(t *testing.T, cats []jackett.Category) {
+	t.Helper()
+	if len(cats) != 2 {
+		t.Fatalf("len(Categories) = %d, want 2", len(cats))
 	}
-	if caps.Categories[0].ID != 2000 {
-		t.Errorf("Categories[0].ID = %d, want 2000", caps.Categories[0].ID)
+	if cats[0].ID != 2000 {
+		t.Errorf("Categories[0].ID = %d, want 2000", cats[0].ID)
 	}
-	if caps.Categories[0].Name != "Movies" {
-		t.Errorf("Categories[0].Name = %q, want Movies", caps.Categories[0].Name)
+	if cats[0].Name != "Movies" {
+		t.Errorf("Categories[0].Name = %q, want Movies", cats[0].Name)
 	}
-	if len(caps.Categories[0].SubCategories) != 2 {
-		t.Fatalf("len(SubCategories) = %d, want 2", len(caps.Categories[0].SubCategories))
+	if len(cats[0].SubCategories) != 2 {
+		t.Fatalf("len(SubCategories) = %d, want 2", len(cats[0].SubCategories))
 	}
-	if caps.Categories[0].SubCategories[0].ID != 2010 {
-		t.Errorf("SubCategories[0].ID = %d, want 2010", caps.Categories[0].SubCategories[0].ID)
+	if cats[0].SubCategories[0].ID != 2010 {
+		t.Errorf("SubCategories[0].ID = %d, want 2010", cats[0].SubCategories[0].ID)
 	}
+}
+
+// TestGetCapabilities tests indexer capabilities: server info, limits, search flags, and categories.
+func TestGetCapabilities(t *testing.T) {
+	t.Parallel()
+
+	c := newXMLServer(t, "/api/v2.0/indexers/all/results/torznab", capsXML)
+	caps, err := c.GetCapabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkCapabilitiesCore(t, caps)
+	checkCapabilitiesCategories(t, caps.Categories)
 }
 
 func TestGetIndexers(t *testing.T) {

@@ -583,6 +583,37 @@ func TestParseTitleDump(t *testing.T) {
 	}
 }
 
+// seedTestTitleEntries populates the in-memory title dump used by TestSearchByTitle.
+func seedTestTitleEntries(c *Client) {
+	c.titles.mu.Lock()
+	c.titles.entries = []TitleEntry{
+		{AID: 1, Type: "1", Lang: "x-jat", Title: "Seikai no Monshou"},
+		{AID: 1, Type: "4", Lang: "en", Title: "Crest of the Stars"},
+		{AID: 2, Type: "1", Lang: "x-jat", Title: "Tonari no Totoro"},
+		{AID: 3, Type: "1", Lang: "en", Title: "Steins;Gate"},
+		{AID: 4, Type: "1", Lang: "en", Title: "Monster"},
+	}
+	c.titles.mu.Unlock()
+}
+
+// checkTitleSearchResults validates SearchByTitle output length and optional first-match fields for one case.
+func checkTitleSearchResults(t *testing.T, name string, results []TitleMatch, wantLen int, wantFirst *TitleMatch) {
+	t.Helper()
+	if len(results) != wantLen {
+		t.Fatalf("%s: got %d results, want %d", name, len(results), wantLen)
+	}
+	if wantFirst == nil {
+		return
+	}
+	if results[0].AID != wantFirst.AID {
+		t.Errorf("%s: AID = %d, want %d", name, results[0].AID, wantFirst.AID)
+	}
+	if results[0].Score != wantFirst.Score {
+		t.Errorf("%s: Score = %f, want %f", name, results[0].Score, wantFirst.Score)
+	}
+}
+
+// TestSearchByTitle tests in-memory title search queries, limits, and match scoring after seeding the dump.
 func TestSearchByTitle(t *testing.T) {
 	t.Parallel()
 
@@ -594,78 +625,27 @@ func TestSearchByTitle(t *testing.T) {
 		t.Fatal("expected error when title dump not loaded")
 	}
 
-	// Populate entries directly for testing.
-	c.titles.mu.Lock()
-	c.titles.entries = []TitleEntry{
-		{AID: 1, Type: "1", Lang: "x-jat", Title: "Seikai no Monshou"},
-		{AID: 1, Type: "4", Lang: "en", Title: "Crest of the Stars"},
-		{AID: 2, Type: "1", Lang: "x-jat", Title: "Tonari no Totoro"},
-		{AID: 3, Type: "1", Lang: "en", Title: "Steins;Gate"},
-		{AID: 4, Type: "1", Lang: "en", Title: "Monster"},
-	}
-	c.titles.mu.Unlock()
+	seedTestTitleEntries(c)
 
-	// Exact match.
-	results, err := c.SearchByTitle("Steins;Gate", 10)
-	if err != nil {
-		t.Fatalf("SearchByTitle() error: %v", err)
+	cases := []struct {
+		name      string
+		query     string
+		limit     int
+		wantLen   int
+		wantFirst *TitleMatch
+	}{
+		{"exact title Steins;Gate", "Steins;Gate", 10, 1, &TitleMatch{AID: 3, Score: 1.0}},
+		{"partial crest", "crest", 10, 1, &TitleMatch{AID: 1, Score: 0.75}},
+		{"partial onster", "onster", 10, 1, &TitleMatch{AID: 4, Score: 0.5}},
+		{"short query no limited to one result", "no", 1, 1, nil},
+		{"no matches zzzzz", "zzzzz", 10, 0, nil},
 	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1", len(results))
-	}
-	if results[0].AID != 3 {
-		t.Errorf("AID = %d, want 3", results[0].AID)
-	}
-	if results[0].Score != 1.0 {
-		t.Errorf("Score = %f, want 1.0", results[0].Score)
-	}
-
-	// Prefix match.
-	results, err = c.SearchByTitle("crest", 10)
-	if err != nil {
-		t.Fatalf("SearchByTitle() error: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1", len(results))
-	}
-	if results[0].AID != 1 {
-		t.Errorf("AID = %d, want 1", results[0].AID)
-	}
-	if results[0].Score != 0.75 {
-		t.Errorf("Score = %f, want 0.75", results[0].Score)
-	}
-
-	// Contains match.
-	results, err = c.SearchByTitle("onster", 10)
-	if err != nil {
-		t.Fatalf("SearchByTitle() error: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1", len(results))
-	}
-	if results[0].AID != 4 {
-		t.Errorf("AID = %d, want 4", results[0].AID)
-	}
-	if results[0].Score != 0.5 {
-		t.Errorf("Score = %f, want 0.5", results[0].Score)
-	}
-
-	// Multiple matches with limit.
-	results, err = c.SearchByTitle("no", 1)
-	if err != nil {
-		t.Fatalf("SearchByTitle() error: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1 (limited)", len(results))
-	}
-
-	// No match.
-	results, err = c.SearchByTitle("zzzzz", 10)
-	if err != nil {
-		t.Fatalf("SearchByTitle() error: %v", err)
-	}
-	if len(results) != 0 {
-		t.Errorf("got %d results, want 0", len(results))
+	for _, tc := range cases {
+		results, err := c.SearchByTitle(tc.query, tc.limit)
+		if err != nil {
+			t.Fatalf("SearchByTitle() error: %v", err)
+		}
+		checkTitleSearchResults(t, tc.name, results, tc.wantLen, tc.wantFirst)
 	}
 }
 
