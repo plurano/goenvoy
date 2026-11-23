@@ -117,8 +117,12 @@ tools-tidy-check: ## tools/go go.mod and go.sum match go mod tidy: planted cases
 	bash tools/tools-tidy_test.sh
 	bash tools/tools-tidy.sh tools/go
 
-lint-exceptions: ## Dated complexity exceptions in .golangci.yml: planted cases, then the repository config
-	cd tools/go && go vet ./lintexceptions/ && go test -count=1 ./lintexceptions/
+lint-exceptions: ## Check lint exceptions and list repository exceptions expiring within 14 days
+	cd tools/go && { \
+		check_status=0; \
+		go vet ./lintexceptions/... && go test -count=1 ./lintexceptions/... || check_status=$$?; \
+		go run ./lintexceptions/expiring -root ../.. && exit "$$check_status"; \
+	}
 
 lint-exceptions-gen: ## Regenerate the dated complexity exceptions from a measured lint run (#141)
 	bash tools/lint-exceptions.sh

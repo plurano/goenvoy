@@ -7,6 +7,8 @@
 // funlen, gocyclo or gocognit through a "text:" line; the engine ratchet only lets it shrink.
 // A complexity linter outside that block fails, so no file tier comes back.
 //
+// The lead-time report lists dated exceptions across the repository, including expired ones.
+//
 // This check is itself an exception to one mechanism per behavior (HISS-19; category D,
 // entered 2026-11-23, expires 2027-03-23, #141): the engine audit judges the same block in
 // the local hooks, but CI runs no server-side praetorctl audit by adoption, so this check is
@@ -18,15 +20,27 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
 
-// selfExpiry is the date this package's own exception runs out.
-const selfExpiry = "2027-03-23"
-
 // maxLines bounds the configuration lines one check reads.
 const maxLines = 100000
+
+// SelfEntry reports the expiry of the HISS-19 exception for this package.
+func SelfEntry() Entry {
+	// Why: The declaration immediately after this call is the reported source line.
+	_, _, line, _ := runtime.Caller(0)
+	const selfExpiry = "2027-03-23"
+	return Entry{
+		Source:  "tools/go/lintexceptions/lintexceptions.go",
+		Line:    line + 1,
+		File:    "tools/go/lintexceptions",
+		Rule:    "HISS-19",
+		Expires: selfExpiry,
+	}
+}
 
 const (
 	beginMarker = "      # praetor:generated-exceptions begin (praetorctl linters exceptions; never edit by hand)"
@@ -39,7 +53,7 @@ var (
 	baselineLinter = regexp.MustCompile(`^          - (?:funlen|gocyclo|gocognit)$`)
 	textLine       = regexp.MustCompile(`^        text: (?:func ` + "`" + `\w+` + "`" + `|Function '\w+')$`)
 	commentLine    = regexp.MustCompile(`^      # category [A-D], (?:entered \d{4}-\d{2}-\d{2}, )?expires (\d{4}-\d{2}-\d{2}), #\d+$`)
-	pathLine       = regexp.MustCompile(`^      - path: \^\S+_test\\\.go\$$`)
+	pathLine       = regexp.MustCompile(`^      - path: (\^\S+_test\\\.go\$)$`)
 	linterLine     = regexp.MustCompile(`^          - (?:funlen|gocyclo|gocognit|cyclop)$`)
 	complexityName = regexp.MustCompile(`\b(?:funlen|gocyclo|gocognit|cyclop)\b`)
 )
@@ -56,41 +70,50 @@ const (
 
 // scan holds the reader state across the lines of the rules block.
 type scan struct {
-	today     time.Time
-	generated bool
-	seenBlock bool
-	expiry    string
-	pending   int  // kind named by the last comment, not yet consumed by a path
-	rule      int  // kind of the rule being read
-	hasKey    bool // the rule has its linters: key
-	hasLinter bool
-	hasText   bool
-	rules     int
+	today         time.Time
+	rejectExpired bool
+	source        string
+	generated     bool
+	seenBlock     bool
+	pending       int  // kind named by the last comment, not yet consumed by a path
+	rule          int  // kind of the rule being read
+	hasKey        bool // the rule has its linters: key
+	hasText       bool
+	rules         int
+	entry         Entry
+	linters       []string
+	entries       []Entry
 }
 
 // Check reads the configuration text and returns the number of generated rules it found, or
 // an error naming the first line that breaks the contract in the package comment.
 func Check(config string, today time.Time) (int, error) {
+	s := &scan{today: today, rejectExpired: true}
+	err := s.read(config)
+	return s.rules, err
+}
+
+// read scans the configuration with the selected expiry policy.
+func (s *scan) read(config string) error {
 	// A Windows checkout ends lines with CRLF; the rules read LF lines.
 	lines := strings.Split(strings.ReplaceAll(config, "\r\n", "\n"), "\n")
 	start, err := rulesStart(lines)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	s := &scan{today: today}
 	for i := start; i < len(lines) && i < maxLines; i++ {
 		line := lines[i]
 		if line != "" && !strings.HasPrefix(line, "      ") {
 			break
 		}
 		if err := s.line(line, i+1); err != nil {
-			return s.rules, err
+			return err
 		}
 	}
 	if s.generated {
-		return s.rules, errors.New("generated exceptions block has no end marker")
+		return errors.New("generated exceptions block has no end marker")
 	}
-	return s.rules, nil
+	return nil
 }
 
 // line judges one line of the rules block.
@@ -122,8 +145,8 @@ func (s *scan) generatedLine(line string, lineNumber int) error {
 	if baselineLine.MatchString(line) {
 		return s.comment(kindBaseline, "", lineNumber)
 	}
-	if pathLine.MatchString(line) {
-		return s.pathLine(lineNumber)
+	if match := pathLine.FindStringSubmatch(line); match != nil {
+		return s.pathLine(match[1], lineNumber)
 	}
 	if line == "" {
 		return nil
@@ -146,25 +169,27 @@ func (s *scan) comment(kind int, expiry string, lineNumber int) error {
 	if s.pending != kindNone {
 		return fmt.Errorf("line %d: exception comment without a rule below the one before it", lineNumber)
 	}
-	s.pending, s.expiry = kind, expiry
+	s.pending = kind
+	s.entry = Entry{Source: s.source, Line: lineNumber, Expires: expiry}
 	return nil
 }
 
-// pathLine opens one rule and consumes its comment: a dated rule must be current.
-func (s *scan) pathLine(lineNumber int) error {
+// pathLine opens one rule and consumes its comment.
+func (s *scan) pathLine(path string, lineNumber int) error {
 	if err := s.finish(lineNumber); err != nil {
 		return err
 	}
-	if s.pending != kindBaseline {
-		if err := checkRule(s.expiry, s.today, lineNumber); err != nil {
+	switch s.pending {
+	case kindBaseline:
+		s.rule = kindBaseline
+	default:
+		if err := s.checkRule(lineNumber); err != nil {
 			return err
 		}
+		s.rule = kindDated
+		s.entry.File = path
 	}
-	s.rule = kindDated
-	if s.pending == kindBaseline {
-		s.rule = kindBaseline
-	}
-	s.pending, s.expiry = kindNone, ""
+	s.pending = kindNone
 	s.rules++
 	return nil
 }
@@ -175,10 +200,9 @@ func (s *scan) ruleLine(line string) bool {
 		return false
 	}
 	switch {
-	case s.rule == kindDated && linterLine.MatchString(line):
-		s.hasLinter = true
-	case s.rule == kindBaseline && baselineLinter.MatchString(line):
-		s.hasLinter = true
+	case s.rule == kindDated && linterLine.MatchString(line),
+		s.rule == kindBaseline && baselineLinter.MatchString(line):
+		s.linters = append(s.linters, strings.TrimPrefix(line, "          - "))
 	case s.rule == kindBaseline && textLine.MatchString(line):
 		s.hasText = true
 	default:
@@ -190,16 +214,21 @@ func (s *scan) ruleLine(line string) bool {
 // finish refuses the rule just read when it lacks a linter, or a baseline lacks its function
 // selector: either gap widens the exclusion to every linter or every function of the file.
 func (s *scan) finish(lineNumber int) error {
-	rule, hasLinter, hasText := s.rule, s.hasLinter, s.hasText
-	s.rule, s.hasKey, s.hasLinter, s.hasText = kindNone, false, false, false
+	rule, hasText := s.rule, s.hasText
+	s.rule, s.hasKey, s.hasText = kindNone, false, false
 	switch {
 	case rule == kindNone:
 		return nil
-	case !hasLinter:
+	case len(s.linters) == 0:
 		return fmt.Errorf("line %d: rule above has no complexity linter line", lineNumber)
 	case rule == kindBaseline && !hasText:
 		return fmt.Errorf("line %d: baseline rule above has no function text selector", lineNumber)
 	}
+	if rule == kindDated {
+		s.entry.Rule = strings.Join(s.linters, ", ")
+		s.entries = append(s.entries, s.entry)
+	}
+	s.entry, s.linters = Entry{}, s.linters[:0]
 	return nil
 }
 
@@ -217,27 +246,23 @@ func rulesStart(lines []string) (int, error) {
 	return 0, errNoRules
 }
 
-// checkRule refuses a rule whose comment is missing or whose expiry is before today.
-func checkRule(expiry string, today time.Time, lineNumber int) error {
-	if expiry == "" {
+// checkRule validates the date and enforces it when the scan rejects expired rules.
+func (s *scan) checkRule(lineNumber int) error {
+	if s.entry.Expires == "" {
 		return fmt.Errorf("line %d: rule has no \"category <A-D>, entered <date>, expires <date>, #<issue>\" comment above it", lineNumber)
 	}
-	expired, err := Expired(expiry, today)
+	expired, err := Expired(s.entry.Expires, s.today)
 	if err != nil {
 		return fmt.Errorf("line %d: %w", lineNumber, err)
 	}
-	if expired {
-		return fmt.Errorf("line %d: exception expired on %s", lineNumber, expiry)
+	if expired && s.rejectExpired {
+		return fmt.Errorf("line %d: exception expired on %s", lineNumber, s.entry.Expires)
 	}
 	return nil
 }
 
 // Expired reports whether the date has passed: an exception holds through its expiry day.
 func Expired(expiry string, today time.Time) (bool, error) {
-	date, err := time.Parse(time.DateOnly, expiry)
-	if err != nil {
-		return false, fmt.Errorf("expiry %q: %w", expiry, err)
-	}
-	day := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
-	return day.After(date), nil
+	days, err := daysUntil(expiry, today)
+	return days < 0, err
 }
