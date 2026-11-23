@@ -58,6 +58,37 @@ func writeFile(t *testing.T, file, content string) {
 	}
 }
 
+// assertReadManifestCase checks one table-driven readManifest expectation from TestReadManifest.
+func assertReadManifestCase(t *testing.T, manifest, want string) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "specs.yaml")
+	writeFile(t, file, manifest)
+	pins, err := readManifest(file)
+	switch {
+	case want == "" && err != nil:
+		t.Fatalf("readManifest: %v", err)
+	case want == "" && len(pins) != 1:
+		t.Fatalf("readManifest returned %d pin(s), want 1", len(pins))
+	case want != "" && (err == nil || !strings.Contains(err.Error(), want)):
+		t.Fatalf("readManifest = %v, want an error with %q", err, want)
+	}
+}
+
+// checkReadManifestFollowUp runs supplemental manifest cases after the main table in TestReadManifest.
+func checkReadManifestFollowUp(t *testing.T) {
+	t.Helper()
+	if _, err := readManifest(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
+		t.Error("an absent manifest was accepted")
+	}
+	// Two spec files of one repository at one commit are two entries with one commit.
+	file := filepath.Join(t.TempDir(), "specs.yaml")
+	writeFile(t, file, entry(nil)+strings.TrimPrefix(entry(map[string]string{"name": "name: second", "path": "path: src/other.json"}), "specs:\n"))
+	if pins, err := readManifest(file); err != nil || len(pins) != 2 {
+		t.Errorf("readManifest of two files of one repository at one commit = %d pin(s), %v; want 2, nil", len(pins), err)
+	}
+}
+
+// TestReadManifest tests readManifest parsing, validation errors, and supplemental follow-up cases.
 func TestReadManifest(t *testing.T) {
 	t.Parallel()
 	with := func(key, line string) string { return entry(map[string]string{key: line}) }
@@ -99,28 +130,10 @@ func TestReadManifest(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			file := filepath.Join(t.TempDir(), "specs.yaml")
-			writeFile(t, file, test.manifest)
-			pins, err := readManifest(file)
-			switch {
-			case test.want == "" && err != nil:
-				t.Fatalf("readManifest: %v", err)
-			case test.want == "" && len(pins) != 1:
-				t.Fatalf("readManifest returned %d pin(s), want 1", len(pins))
-			case test.want != "" && (err == nil || !strings.Contains(err.Error(), test.want)):
-				t.Fatalf("readManifest = %v, want an error with %q", err, test.want)
-			}
+			assertReadManifestCase(t, test.manifest, test.want)
 		})
 	}
-	if _, err := readManifest(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
-		t.Error("an absent manifest was accepted")
-	}
-	// Two spec files of one repository at one commit are two entries with one commit.
-	file := filepath.Join(t.TempDir(), "specs.yaml")
-	writeFile(t, file, entry(nil)+strings.TrimPrefix(entry(map[string]string{"name": "name: second", "path": "path: src/other.json"}), "specs:\n"))
-	if pins, err := readManifest(file); err != nil || len(pins) != 2 {
-		t.Errorf("readManifest of two files of one repository at one commit = %d pin(s), %v; want 2, nil", len(pins), err)
-	}
+	checkReadManifestFollowUp(t)
 }
 
 // TestCommittedManifest binds the manifest of this repository: it must be well formed and pin

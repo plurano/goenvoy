@@ -47,7 +47,7 @@ func TestThisCheckIsItselfCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if expired {
-		t.Fatalf("tools/go/lintexceptions expired on %s: adopt the engine audit (cordanaLLM/praetor#1388) or renew with a lower count in #141", selfExpiry)
+		t.Fatalf("tools/go/lintexceptions expired on %s: once CI runs praetorctl audit, delete this package; until then renew its category D exception in #141", selfExpiry)
 	}
 }
 
@@ -147,6 +147,29 @@ func TestExpiredHoldsThroughTheExpiryDay(t *testing.T) {
 		got, err := Expired("2026-10-29", day(t, c.today))
 		if err != nil || got != c.want {
 			t.Errorf("Expired(2026-10-29, %s) = %v, %v; want %v", c.today, got, err, c.want)
+		}
+	}
+}
+
+// TestSelfExpiryHoldsThroughItsDay pins the boundary of this package's own expiry date.
+func TestSelfExpiryHoldsThroughItsDay(t *testing.T) {
+	t.Parallel()
+	expiry, err := time.Parse(time.DateOnly, selfExpiry)
+	if err != nil {
+		t.Fatalf("parse selfExpiry %q: %v", selfExpiry, err)
+	}
+	cases := []struct {
+		today time.Time
+		want  bool
+	}{
+		{expiry.AddDate(0, 0, -1), false},
+		{expiry, false},
+		{expiry.AddDate(0, 0, 1), true},
+	}
+	for _, c := range cases {
+		got, err := Expired(selfExpiry, c.today)
+		if err != nil || got != c.want {
+			t.Errorf("Expired(%s, %s) = %v, %v; want %v", selfExpiry, c.today.Format(time.DateOnly), got, err, c.want)
 		}
 	}
 }

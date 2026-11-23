@@ -63,6 +63,38 @@ func TestNew(t *testing.T) {
 	}
 }
 
+// handleNewWithClientCredentialsToken serves the OAuth token exchange in TestNewWithClientCredentials.
+func handleNewWithClientCredentialsToken(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodPost {
+		t.Errorf("method = %s, want POST", r.Method)
+	}
+	if err := r.ParseForm(); err != nil {
+		t.Errorf("ParseForm: %v", err)
+		return
+	}
+	if got := r.Form.Get("client_id"); got != "client-id" {
+		t.Errorf("client_id = %q, want client-id", got)
+	}
+	if got := r.Form.Get("client_secret"); got != "client-secret" {
+		t.Errorf("client_secret = %q, want client-secret", got)
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"access_token": "generated-token",
+		"expires_in":   3600,
+		"token_type":   "Bearer",
+	})
+}
+
+// handleNewWithClientCredentialsFilm serves the authenticated film GET in TestNewWithClientCredentials.
+func handleNewWithClientCredentialsFilm(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	if auth := r.Header.Get("Authorization"); auth != "Bearer generated-token" {
+		t.Errorf("Authorization = %q, want generated token", auth)
+	}
+	json.NewEncoder(w).Encode(letterboxd.Film{ID: "abc1", Name: "Token Film"})
+}
+
 // TestNewWithClientCredentials tests OAuth2 client credentials authentication and the token callback.
 func TestNewWithClientCredentials(t *testing.T) {
 	t.Parallel()
@@ -72,29 +104,9 @@ func TestNewWithClientCredentials(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/auth/token":
-			if r.Method != http.MethodPost {
-				t.Errorf("method = %s, want POST", r.Method)
-			}
-			if err := r.ParseForm(); err != nil {
-				t.Errorf("ParseForm: %v", err)
-				return
-			}
-			if got := r.Form.Get("client_id"); got != "client-id" {
-				t.Errorf("client_id = %q, want client-id", got)
-			}
-			if got := r.Form.Get("client_secret"); got != "client-secret" {
-				t.Errorf("client_secret = %q, want client-secret", got)
-			}
-			json.NewEncoder(w).Encode(map[string]any{
-				"access_token": "generated-token",
-				"expires_in":   3600,
-				"token_type":   "Bearer",
-			})
+			handleNewWithClientCredentialsToken(t, w, r)
 		case "/film/abc1":
-			if auth := r.Header.Get("Authorization"); auth != "Bearer generated-token" {
-				t.Errorf("Authorization = %q, want generated token", auth)
-			}
-			json.NewEncoder(w).Encode(letterboxd.Film{ID: "abc1", Name: "Token Film"})
+			handleNewWithClientCredentialsFilm(t, w, r)
 		default:
 			t.Errorf("unexpected path: %s", r.URL.Path)
 			http.NotFound(w, r)

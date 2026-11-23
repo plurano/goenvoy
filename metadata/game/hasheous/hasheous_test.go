@@ -21,34 +21,59 @@ func setup(t *testing.T, handler http.HandlerFunc) *hasheous.Client {
 	return hasheous.New(metadata.WithBaseURL(srv.URL))
 }
 
+// checkLookupByHashRequest validates the POST /Lookup/ByHash request from TestLookupByHash.
+func checkLookupByHashRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodPost {
+		t.Errorf("method = %s, want POST", r.Method)
+	}
+	if r.URL.Path != "/Lookup/ByHash" {
+		t.Errorf("path = %q, want /Lookup/ByHash", r.URL.Path)
+	}
+	if got := r.URL.Query().Get("returnAllSources"); got != "true" {
+		t.Errorf("returnAllSources = %q, want true", got)
+	}
+	if got := r.URL.Query().Get("returnFields"); got != "All" {
+		t.Errorf("returnFields = %q, want All", got)
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req hasheous.HashLookupRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Errorf("unmarshal body: %v", err)
+		return
+	}
+	if req.SHA1 != "abc123" {
+		t.Errorf("SHA1 = %q, want abc123", req.SHA1)
+	}
+}
+
+// checkLookupByHashResult validates decoded lookup output from TestLookupByHash.
+func checkLookupByHashResult(t *testing.T, result *hasheous.HashLookup) {
+	t.Helper()
+	if result.ID != 1234 {
+		t.Errorf("ID = %d, want 1234", result.ID)
+	}
+	if result.Name != "Super Mario Bros." {
+		t.Errorf("Name = %q", result.Name)
+	}
+	if result.Platform == nil || result.Platform.Name != "Nintendo Entertainment System" {
+		t.Errorf("Platform = %v", result.Platform)
+	}
+	sigs, ok := result.Signatures["NoIntros"]
+	if !ok || len(sigs) != 1 {
+		t.Fatalf("NoIntros signatures = %v", result.Signatures)
+	}
+	if sigs[0].Game.Name != "Super Mario Bros." {
+		t.Errorf("Game.Name = %q", sigs[0].Game.Name)
+	}
+}
+
 // TestLookupByHash tests querying game metadata by file hash via POST /Lookup/ByHash.
 func TestLookupByHash(t *testing.T) {
 	t.Parallel()
 
 	c := setup(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/Lookup/ByHash" {
-			t.Errorf("path = %q, want /Lookup/ByHash", r.URL.Path)
-		}
-		if got := r.URL.Query().Get("returnAllSources"); got != "true" {
-			t.Errorf("returnAllSources = %q, want true", got)
-		}
-		if got := r.URL.Query().Get("returnFields"); got != "All" {
-			t.Errorf("returnFields = %q, want All", got)
-		}
-
-		body, _ := io.ReadAll(r.Body)
-		var req hasheous.HashLookupRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Errorf("unmarshal body: %v", err)
-			return
-		}
-		if req.SHA1 != "abc123" {
-			t.Errorf("SHA1 = %q, want abc123", req.SHA1)
-		}
-
+		checkLookupByHashRequest(t, r)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"id":   1234,
@@ -71,22 +96,7 @@ func TestLookupByHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ID != 1234 {
-		t.Errorf("ID = %d, want 1234", result.ID)
-	}
-	if result.Name != "Super Mario Bros." {
-		t.Errorf("Name = %q", result.Name)
-	}
-	if result.Platform == nil || result.Platform.Name != "Nintendo Entertainment System" {
-		t.Errorf("Platform = %v", result.Platform)
-	}
-	sigs, ok := result.Signatures["NoIntros"]
-	if !ok || len(sigs) != 1 {
-		t.Fatalf("NoIntros signatures = %v", result.Signatures)
-	}
-	if sigs[0].Game.Name != "Super Mario Bros." {
-		t.Errorf("Game.Name = %q", sigs[0].Game.Name)
-	}
+	checkLookupByHashResult(t, result)
 }
 
 func TestLookupBySHA1(t *testing.T) {

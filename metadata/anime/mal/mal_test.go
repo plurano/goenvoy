@@ -142,17 +142,9 @@ func TestGetAnimeRelations(t *testing.T) {
 	}
 }
 
-func TestGetAnimeSubtypes(t *testing.T) {
-	t.Parallel()
-	c := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(animeJSON))
-	})
-
-	a, err := c.GetAnime(context.Background(), 30230, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+// checkAnimeSubtypesGenresStudios validates genres and studios from TestGetAnimeSubtypes.
+func checkAnimeSubtypesGenresStudios(t *testing.T, a *mal.Anime) {
+	t.Helper()
 	if len(a.Genres) != 2 {
 		t.Fatalf("Genres len = %d, want 2", len(a.Genres))
 	}
@@ -165,6 +157,11 @@ func TestGetAnimeSubtypes(t *testing.T) {
 	if a.Studios[0].Name != "Madhouse" {
 		t.Errorf("Studios[0].Name = %q, want %q", a.Studios[0].Name, "Madhouse")
 	}
+}
+
+// checkAnimeSubtypesSeasonStats validates season, broadcast, and statistics from TestGetAnimeSubtypes.
+func checkAnimeSubtypesSeasonStats(t *testing.T, a *mal.Anime) {
+	t.Helper()
 	if a.StartSeason == nil || a.StartSeason.Year != 2015 {
 		t.Errorf("StartSeason.Year want 2015, got %v", a.StartSeason)
 	}
@@ -174,6 +171,22 @@ func TestGetAnimeSubtypes(t *testing.T) {
 	if a.Statistics == nil || a.Statistics.NumListUsers != 55000 {
 		t.Errorf("Statistics.NumListUsers want 55000, got %v", a.Statistics)
 	}
+}
+
+// TestGetAnimeSubtypes tests nested genres, studios, season, broadcast, and statistics on anime detail.
+func TestGetAnimeSubtypes(t *testing.T) {
+	t.Parallel()
+	c := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(animeJSON))
+	})
+
+	a, err := c.GetAnime(context.Background(), 30230, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	checkAnimeSubtypesGenresStudios(t, a)
+	checkAnimeSubtypesSeasonStats(t, a)
 }
 
 func TestSearchAnime(t *testing.T) {
@@ -748,29 +761,35 @@ func TestAuthorizationURL(t *testing.T) {
 	}
 }
 
+// checkExchangeCodeRequest validates the OAuth token exchange POST from TestExchangeCode.
+func checkExchangeCodeRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.URL.Path != "/token" {
+		t.Errorf("path = %q, want /token", r.URL.Path)
+	}
+	if err := r.ParseForm(); err != nil {
+		t.Error(err)
+		return
+	}
+	if r.PostForm.Get("grant_type") != "authorization_code" {
+		t.Errorf("grant_type = %q", r.PostForm.Get("grant_type"))
+	}
+	if r.PostForm.Get("code") != "auth-code-123" {
+		t.Errorf("code = %q", r.PostForm.Get("code"))
+	}
+	if r.PostForm.Get("code_verifier") != "test-verifier" {
+		t.Errorf("code_verifier = %q", r.PostForm.Get("code_verifier"))
+	}
+	if r.PostForm.Get("client_id") != "cid" {
+		t.Errorf("client_id = %q", r.PostForm.Get("client_id"))
+	}
+}
+
 // TestExchangeCode tests exchanging an authorization code with PKCE verification.
 func TestExchangeCode(t *testing.T) {
 	t.Parallel()
 	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/token" {
-			t.Errorf("path = %q, want /token", r.URL.Path)
-		}
-		if err := r.ParseForm(); err != nil {
-			t.Error(err)
-			return
-		}
-		if r.PostForm.Get("grant_type") != "authorization_code" {
-			t.Errorf("grant_type = %q", r.PostForm.Get("grant_type"))
-		}
-		if r.PostForm.Get("code") != "auth-code-123" {
-			t.Errorf("code = %q", r.PostForm.Get("code"))
-		}
-		if r.PostForm.Get("code_verifier") != "test-verifier" {
-			t.Errorf("code_verifier = %q", r.PostForm.Get("code_verifier"))
-		}
-		if r.PostForm.Get("client_id") != "cid" {
-			t.Errorf("client_id = %q", r.PostForm.Get("client_id"))
-		}
+		checkExchangeCodeRequest(t, r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"mal-access","token_type":"Bearer","expires_in":2592000,"refresh_token":"mal-refresh"}`))
 	}))
@@ -785,14 +804,15 @@ func TestExchangeCode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tok.AccessToken != "mal-access" {
-		t.Errorf("AccessToken = %q, want %q", tok.AccessToken, "mal-access")
+	want := mal.Token{AccessToken: "mal-access", RefreshToken: "mal-refresh"}
+	if tok.AccessToken != want.AccessToken {
+		t.Errorf("AccessToken = %q, want %q", tok.AccessToken, want.AccessToken)
 	}
-	if tok.RefreshToken != "mal-refresh" {
-		t.Errorf("RefreshToken = %q, want %q", tok.RefreshToken, "mal-refresh")
+	if tok.RefreshToken != want.RefreshToken {
+		t.Errorf("RefreshToken = %q, want %q", tok.RefreshToken, want.RefreshToken)
 	}
-	if callbackToken.AccessToken != "mal-access" {
-		t.Errorf("callback AccessToken = %q, want %q", callbackToken.AccessToken, "mal-access")
+	if callbackToken.AccessToken != want.AccessToken {
+		t.Errorf("callback AccessToken = %q, want %q", callbackToken.AccessToken, want.AccessToken)
 	}
 }
 
