@@ -149,7 +149,7 @@ jobs:
     steps:
       - *checkout-no-credentials
       - uses: ./.github/actions/setup-tools-go
-      - name: Check the exceptions
+      - name: Check the exceptions and list the ones expiring within 14 days
         run: make lint-exceptions
 
   # gitleaks scans every commit, not only the tip; GitHub push protection is the

@@ -40,6 +40,7 @@ func TestRepositoryExceptionsAreDatedAndCurrent(t *testing.T) {
 	t.Logf("%d dated exception rules", rules)
 }
 
+// TestThisCheckIsItselfCurrent verifies that the lint check's own exception is current.
 func TestThisCheckIsItselfCurrent(t *testing.T) {
 	t.Parallel()
 	expired, err := Expired(selfExpiry, time.Now().UTC())
