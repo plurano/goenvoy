@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,6 +31,34 @@ type Entry struct {
 	File    string
 	Rule    string
 	Expires string
+}
+
+// Due is a dated exception with the signed number of days until it expires.
+type Due struct {
+	Entry
+	DaysLeft int64
+}
+
+var selfExpiryLine = regexp.MustCompile(`^const selfExpiry = "(\d{4}-\d{2}-\d{2})"$`)
+
+// SelfExpiryEntries reads the expiry declaration for this package's own exception.
+func SelfExpiryEntries(source string, data []byte) ([]Entry, error) {
+	lines, err := sourceLines(source, data)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(lines) && i < maxLines; i++ {
+		match := selfExpiryLine.FindStringSubmatch(strings.TrimSuffix(lines[i], "\r"))
+		if match == nil {
+			continue
+		}
+		entry := Entry{Source: source, Line: i + 1, File: "tools/go/lintexceptions", Rule: "HISS-19", Expires: match[1]}
+		if err := entry.validateDate(); err != nil {
+			return nil, err
+		}
+		return []Entry{entry}, nil
+	}
+	return nil, fmt.Errorf("%s: missing const selfExpiry declaration", source)
 }
 
 // ConfigEntries reads the dated rules from the generated lint exclusions block.
@@ -263,12 +292,12 @@ func (e Entry) validateDate() error {
 }
 
 // Expiring returns the exceptions due within days of the UTC date, including overdue entries.
-func Expiring(entries []Entry, today time.Time, days int) ([]Entry, error) {
+func Expiring(entries []Entry, today time.Time, days int) ([]Due, error) {
 	if len(entries) > maxNodes {
 		return nil, fmt.Errorf("exceptions list exceeds %d entries", maxNodes)
 	}
 	today = today.UTC()
-	result := make([]Entry, 0, len(entries))
+	result := make([]Due, 0, len(entries))
 	for i := 0; i < len(entries) && i < maxNodes; i++ {
 		entry := entries[i]
 		remaining, err := daysUntil(entry.Expires, today)
@@ -276,10 +305,10 @@ func Expiring(entries []Entry, today time.Time, days int) ([]Entry, error) {
 			return nil, fmt.Errorf("%s:%d: %w", entry.Source, entry.Line, err)
 		}
 		if remaining <= int64(days) {
-			result = append(result, entry)
+			result = append(result, Due{Entry: entry, DaysLeft: remaining})
 		}
 	}
-	slices.SortStableFunc(result, func(a, b Entry) int {
+	slices.SortStableFunc(result, func(a, b Due) int {
 		return cmp.Or(cmp.Compare(a.Expires, b.Expires), cmp.Compare(a.Source, b.Source))
 	})
 	return result, nil
@@ -297,7 +326,7 @@ func daysUntil(expiry string, today time.Time) (int64, error) {
 }
 
 // Markdown renders the entries returned by Expiring as a GitHub job summary.
-func Markdown(list []Entry, total int, today time.Time, days int) string {
+func Markdown(list []Due, total int, today time.Time, days int) string {
 	today = today.UTC()
 	text := fmt.Appendf(nil, "### Dated exceptions expiring within %d days (as of %s)\n\n", days, today.Format(time.DateOnly))
 	if len(list) == 0 {
@@ -308,17 +337,8 @@ func Markdown(list []Entry, total int, today time.Time, days int) string {
 	for i := 0; i < len(list) && i < maxNodes; i++ {
 		entry := list[i]
 		location := escape.Replace(entry.Source) + ":" + strconv.Itoa(entry.Line)
-		text = fmt.Appendf(text, "| %s | %s | %s | %s | %s |\n", escape.Replace(entry.Expires), daysLeftText(entry, today),
+		text = fmt.Appendf(text, "| %s | %d | %s | %s | %s |\n", escape.Replace(entry.Expires), entry.DaysLeft,
 			location, escape.Replace(entry.File), escape.Replace(entry.Rule))
 	}
 	return string(text)
-}
-
-// daysLeftText formats a validated expiry for the Markdown report.
-func daysLeftText(entry Entry, today time.Time) string {
-	days, err := daysUntil(entry.Expires, today)
-	if err != nil {
-		return "?"
-	}
-	return strconv.FormatInt(days, 10)
 }

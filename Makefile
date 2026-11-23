@@ -118,6 +118,7 @@ tools-tidy-check: ## tools/go go.mod and go.sum match go mod tidy: planted cases
 	bash tools/tools-tidy.sh tools/go
 
 lint-exceptions: ## Check lint exceptions and list repository exceptions expiring within 14 days
+# Why: Run the listing even when the check fails so the job summary still shows what is due, then exit with the check's status.
 	cd tools/go && { \
 		check_status=0; \
 		go vet ./lintexceptions/... && go test -count=1 ./lintexceptions/... || check_status=$$?; \

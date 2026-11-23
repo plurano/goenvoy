@@ -7,7 +7,10 @@
 // funlen, gocyclo or gocognit through a "text:" line; the engine ratchet only lets it shrink.
 // A complexity linter outside that block fails, so no file tier comes back.
 //
-// The lead-time report lists dated exceptions across the repository, including expired ones.
+// The command tools/go/lintexceptions/expiring lists every dated exception of the repository
+// that expires within LeadDays days (expired ones included) with source line, file, rule and date.
+// The make lint-exceptions target runs it after the check, and in CI it appends the list to the
+// job summary (GITHUB_STEP_SUMMARY).
 //
 // This check is itself an exception to one mechanism per behavior (HISS-19; category D,
 // entered 2026-11-23, expires 2027-03-23, #141): the engine audit judges the same block in
@@ -20,27 +23,15 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"runtime"
 	"strings"
 	"time"
 )
 
+// selfExpiry is the date this package's own exception runs out.
+const selfExpiry = "2027-03-23"
+
 // maxLines bounds the configuration lines one check reads.
 const maxLines = 100000
-
-// SelfEntry reports the expiry of the HISS-19 exception for this package.
-func SelfEntry() Entry {
-	// Why: The declaration immediately after this call is the reported source line.
-	_, _, line, _ := runtime.Caller(0)
-	const selfExpiry = "2027-03-23"
-	return Entry{
-		Source:  "tools/go/lintexceptions/lintexceptions.go",
-		Line:    line + 1,
-		File:    "tools/go/lintexceptions",
-		Rule:    "HISS-19",
-		Expires: selfExpiry,
-	}
-}
 
 const (
 	beginMarker = "      # praetor:generated-exceptions begin (praetorctl linters exceptions; never edit by hand)"
@@ -187,7 +178,7 @@ func (s *scan) pathLine(path string, lineNumber int) error {
 			return err
 		}
 		s.rule = kindDated
-		s.entry.File = path
+		s.entry.File = strings.ReplaceAll(path[1:len(path)-1], `\.`, ".")
 	}
 	s.pending = kindNone
 	s.rules++

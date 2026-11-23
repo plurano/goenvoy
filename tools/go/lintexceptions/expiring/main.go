@@ -106,7 +106,7 @@ func readEntries(ctx context.Context, dir *os.Root, files []string, today time.T
 	if len(files) > maxFiles {
 		return nil, fmt.Errorf("%s: tracked files exceed %d paths", dir.Name(), maxFiles)
 	}
-	entries := []lintexceptions.Entry{lintexceptions.SelfEntry()}
+	var entries []lintexceptions.Entry
 	for i := 0; i < len(files) && i < maxFiles; i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("scan exception sources: %w", err)
@@ -140,6 +140,8 @@ func readerFor(file string, today time.Time) entryReader {
 		}
 	case file == "tools/semgrep-filter.sh":
 		return lintexceptions.SemgrepEntries
+	case file == "tools/go/lintexceptions/lintexceptions.go":
+		return lintexceptions.SelfExpiryEntries
 	case filepath.Base(file) == "osv-scanner.toml":
 		return lintexceptions.OSVEntries
 	case filepath.Ext(file) == ".yml", filepath.Ext(file) == ".yaml":

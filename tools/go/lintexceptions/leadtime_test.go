@@ -16,7 +16,7 @@ func TestConfigEntries(t *testing.T) {
 		"        text: Function 'TestB'\n"
 	const linter = "          - funlen\n"
 	const source = ".golangci.yml"
-	want := Entry{Source: source, Line: 8, File: `^arr/a_test\.go$`, Rule: "gocognit", Expires: "2026-10-29"}
+	want := Entry{Source: source, Line: 8, File: "arr/a_test.go", Rule: "gocognit", Expires: "2026-10-29"}
 	today := day(t, "2026-11-23")
 	entries, err := ConfigEntries(source, header+begin+rule+baseline+end, today)
 	if err != nil || !slices.Equal(entries, []Entry{want}) {
@@ -117,24 +117,69 @@ func requireErrorText(t *testing.T, err error, text string) {
 	}
 }
 
-// TestSelfEntrySource checks that the report points to the expiry declaration.
-func TestSelfEntrySource(t *testing.T) {
+// TestSelfExpiryEntries verifies the declaration's location and rejects missing or invalid dates.
+func TestSelfExpiryEntries(t *testing.T) {
 	t.Parallel()
-	entry := SelfEntry()
-	if entry.File != "tools/go/lintexceptions" || entry.Rule != "HISS-19" {
-		t.Fatalf("SelfEntry = %v", entry)
+	const source = "fixture.go"
+	cases := [...]struct {
+		name, data, errText string
+		want                []Entry
+	}{
+		{
+			name: "valid declaration",
+			data: "package lintexceptions\r\n\r\nconst selfExpiry = \"2027-03-23\"\r\n",
+			want: []Entry{{Source: source, Line: 3, File: "tools/go/lintexceptions", Rule: "HISS-19", Expires: "2027-03-23"}},
+		},
+		{
+			name:    "missing declaration",
+			data:    "package lintexceptions\n// const selfExpiry = \"2027-03-23\"\n",
+			errText: "fixture.go: missing const selfExpiry declaration",
+		},
+		{
+			name:    "invalid date",
+			data:    "package lintexceptions\nconst selfExpiry = \"2027-02-30\"\n",
+			errText: `fixture.go:2: expiry "2027-02-30"`,
+		},
 	}
-	data, err := os.ReadFile("lintexceptions.go")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := SelfExpiryEntries(source, []byte(c.data))
+			if c.errText != "" {
+				requireErrorText(t, err, c.errText)
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, c.want) {
+				t.Fatalf("SelfExpiryEntries = %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestSelfExpiryEntriesSource verifies the reader points to the package constant.
+func TestSelfExpiryEntriesSource(t *testing.T) {
+	t.Parallel()
+	const source = "lintexceptions.go"
+	data, err := os.ReadFile(source)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read %s: %v", source, err)
+	}
+	entries, err := SelfExpiryEntries(source, data)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("SelfExpiryEntries = %v, %v; want one entry", entries, err)
+	}
+	entry := entries[0]
+	if entry.Expires != selfExpiry {
+		t.Errorf("SelfExpiryEntries expiry = %q; want %q", entry.Expires, selfExpiry)
 	}
 	lines := strings.Split(string(data), "\n")
 	if entry.Line <= 0 || entry.Line > len(lines) {
-		t.Fatalf("SelfEntry line %d outside source", entry.Line)
+		t.Fatalf("SelfExpiryEntries line %d outside %s", entry.Line, source)
 	}
-	want := `const selfExpiry = "` + entry.Expires + `"`
-	if strings.TrimSpace(lines[entry.Line-1]) != want || !strings.HasSuffix(entry.Source, "/lintexceptions.go") {
-		t.Fatalf("SelfEntry points to %s:%d (%q); want %q", entry.Source, entry.Line, lines[entry.Line-1], want)
+	want := `const selfExpiry = "` + selfExpiry + `"`
+	if line := strings.TrimSuffix(lines[entry.Line-1], "\r"); line != want {
+		t.Fatalf("SelfExpiryEntries points to %s:%d (%q); want %q", entry.Source, entry.Line, line, want)
 	}
 }
 
@@ -144,12 +189,13 @@ func TestExpiring(t *testing.T) {
 	today := day(t, "2026-11-23").Add(time.Hour).In(time.FixedZone("west", -2*60*60))
 	cases := []struct {
 		name, expiry string
+		daysLeft     int64
 		want         bool
 	}{
-		{"ten days", "2026-12-03", true},
-		{"fifteen days", "2026-12-08", false},
-		{"fourteen days", "2026-12-07", true},
-		{"overdue", "2026-11-22", true},
+		{"ten days", "2026-12-03", 10, true},
+		{"fifteen days", "2026-12-08", 15, false},
+		{"fourteen days", "2026-12-07", 14, true},
+		{"overdue", "2026-11-22", -1, true},
 	}
 	for i := 0; i < len(cases) && i < maxNodes; i++ {
 		c := cases[i]
@@ -157,8 +203,12 @@ func TestExpiring(t *testing.T) {
 			t.Parallel()
 			entry := Entry{Source: "waivers.yml", Expires: c.expiry}
 			got, err := Expiring([]Entry{entry}, today, LeadDays)
-			if err != nil || (len(got) == 1) != c.want {
-				t.Fatalf("Expiring = %v, %v; want listed: %t", got, err, c.want)
+			var want []Due
+			if c.want {
+				want = []Due{{Entry: entry, DaysLeft: c.daysLeft}}
+			}
+			if err != nil || !slices.Equal(got, want) {
+				t.Fatalf("Expiring = %v, %v; want %v", got, err, want)
 			}
 		})
 	}
@@ -172,7 +222,8 @@ func TestExpiringOrderAndMarkdown(t *testing.T) {
 	first := Entry{Source: "a|.yml", Line: 1, File: "x|y", Rule: "a|b", Expires: "2026-12-07"}
 	second := Entry{Source: "b.yml", Line: 2, Expires: first.Expires}
 	got, err := Expiring([]Entry{second, first, older}, today, LeadDays)
-	if err != nil || !slices.Equal(got, []Entry{older, first, second}) {
+	want := []Due{{Entry: older, DaysLeft: -1}, {Entry: first, DaysLeft: 14}, {Entry: second, DaysLeft: 14}}
+	if err != nil || !slices.Equal(got, want) {
 		t.Fatalf("Expiring order = %v, %v", got, err)
 	}
 	report := Markdown(got, 3, today, LeadDays)
