@@ -61,15 +61,32 @@ func (c *Client) scrubText(text string) string {
 	return text
 }
 
-// containsCanonicalKey reports whether decoding percent and backslash escapes reveals the raw key.
+// maxDecodePasses bounds repeated decoding of percent and backslash escapes.
+const maxDecodePasses = 4
+
+// containsCanonicalKey reports whether decoding reveals the raw key or reaches the limit while still changing text.
 func (c *Client) containsCanonicalKey(text string) bool {
 	if c.apiKey == "" {
 		return false
 	}
-	if strings.ContainsAny(text, `%\`) {
-		text = decodeEscapes(text, true)
+	if strings.Contains(text, c.apiKey) {
+		return true
 	}
-	return strings.Contains(text, c.apiKey)
+	for range maxDecodePasses {
+		if !strings.ContainsAny(text, `%\`) {
+			return false
+		}
+		decoded := decodeEscapes(text, true)
+		if strings.Contains(decoded, c.apiKey) {
+			return true
+		}
+		if decoded == text {
+			return false
+		}
+		text = decoded
+	}
+	// Why: changing text at the limit may still conceal the key.
+	return true
 }
 
 // unescapeBody decodes recognized backslash escapes while preserving all other bytes.
@@ -323,44 +340,36 @@ func (e *redactedError) Is(target error) bool {
 
 // Timeout reports whether the underlying error timed out.
 func (e *redactedError) Timeout() bool {
-	reported := false
-	e.walk(nil, func(node error) walkAction {
-		if _, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies through its cause only
-			return walkCauseOnly
-		}
-		t, ok := node.(interface{ Timeout() bool })
-		if !ok {
-			if a, hasAs := node.(interface{ As(any) bool }); hasAs {
-				ok = a.As(&t) && !isNilValue(t)
-			}
-		}
-		if ok {
-			reported = t.Timeout()
-			return walkStop
-		}
-		return walkDescend
-	})
-	return reported
+	return classifyHiddenError(e, interface{ Timeout() bool }.Timeout)
 }
 
 // Temporary reports whether the hidden error is temporary.
 func (e *redactedError) Temporary() bool {
+	return classifyHiddenError(e, interface{ Temporary() bool }.Temporary)
+}
+
+// classifyHiddenError reports the first applicable classification within the walk budget.
+func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	reported := false
 	e.walk(nil, func(node error) walkAction {
-		if _, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies through its cause only
-			return walkCauseOnly
-		}
-		t, ok := node.(interface{ Temporary() bool })
-		if !ok {
-			if a, hasAs := node.(interface{ As(any) bool }); hasAs {
-				ok = a.As(&t) && !isNilValue(t)
+		if uerr, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies its immediate cause
+			// Why: schedule the cause so nested wrappers and URL errors share the walk budget.
+			_, classifies := uerr.Err.(T)
+			_, hidden := uerr.Err.(*redactedError) //nolint:errorlint // inspect only the immediate cause
+			if classifies || hidden {
+				return walkCauseOnly
 			}
-		}
-		if ok {
-			reported = t.Temporary()
 			return walkStop
 		}
-		return walkDescend
+		classifier, ok := node.(T)
+		if !ok {
+			as, ok := node.(interface{ As(any) bool })
+			if !ok || !as.As(&classifier) || isNilValue(classifier) {
+				return walkDescend
+			}
+		}
+		reported = classify(classifier)
+		return walkStop
 	})
 	return reported
 }
@@ -576,11 +585,19 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 		}
 	}
 	for _, node := range queue {
-		if c.containsKey(node.Error()) {
+		if c.errorNodeContainsKey(node) {
 			return true, false
 		}
 	}
 	return false, false
+}
+
+// errorNodeContainsKey checks URL fields directly before checking the formatted error text.
+func (c *Client) errorNodeContainsKey(node error) bool {
+	if uerr, ok := node.(*url.Error); ok && (c.containsKey(uerr.Op) || c.containsKey(uerr.URL)) { //nolint:errorlint // inspect only this node's fields
+		return true
+	}
+	return c.containsKey(node.Error())
 }
 
 // unsafeErrorNode reports whether err or a direct child is typed nil, or the join exceeds the remaining slots.

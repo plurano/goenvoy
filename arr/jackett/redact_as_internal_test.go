@@ -104,6 +104,22 @@ func TestRedactedErrorAsOpRedaction(t *testing.T) {
 	}
 }
 
+// TestRedactedErrorAsEscapedURL checks that a joined URL error exposes a sanitized URL.
+func TestRedactedErrorAsEscapedURL(t *testing.T) {
+	t.Parallel()
+	c := &Client{apiKey: "fixture"}
+	inner := &url.Error{Op: "Get", URL: `http://h/\u0066ixture`, Err: errors.New("transport failure")}
+	got := c.redactError(errors.Join(errors.New("other failure"), inner))
+
+	var uerr *url.Error
+	if !errors.As(got, &uerr) {
+		t.Fatal("errors.As into *url.Error = false; want true")
+	}
+	if uerr == inner || uerr.URL != "REDACTED" {
+		t.Error("errors.As did not return a copy with a redacted URL")
+	}
+}
+
 // TestRedactedErrorAsKeepsOriginalKey checks delayed URL extraction after the client is replaced.
 func TestRedactedErrorAsKeepsOriginalKey(t *testing.T) {
 	t.Parallel()
@@ -702,6 +718,36 @@ func TestRedactedErrorTimeoutTemporaryURLOrder(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := &redactedError{err: tc.tree}
+			if value := got.Timeout(); value != tc.want {
+				t.Errorf("Timeout() = %v; want %v", value, tc.want)
+			}
+			if value := got.Temporary(); value != tc.want {
+				t.Errorf("Temporary() = %v; want %v", value, tc.want)
+			}
+		})
+	}
+}
+
+// TestRedactedErrorURLImmediateCause checks classification of the direct cause of a nested URL error.
+func TestRedactedErrorURLImmediateCause(t *testing.T) {
+	t.Parallel()
+	timeout := &net.DNSError{IsTimeout: true, IsTemporary: true}
+	cases := []struct {
+		name  string
+		cause error
+		want  bool
+	}{
+		{"ordinary wrapper", fmt.Errorf("fixture: %w", timeout), false},
+		{"custom As", redactAsClassifier{}, false},
+		{"direct DNS error", timeout, true},
+		{"redacted cause", &redactedError{err: timeout}, true},
+		{"URL cause", &url.Error{Err: timeout}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tree := errors.Join(errors.New("other failure"), &url.Error{Err: tc.cause}, timeout)
+			got := &redactedError{err: tree}
 			if value := got.Timeout(); value != tc.want {
 				t.Errorf("Timeout() = %v; want %v", value, tc.want)
 			}

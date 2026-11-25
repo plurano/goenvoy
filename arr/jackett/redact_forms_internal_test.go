@@ -368,6 +368,25 @@ func TestAPIErrorBodyEscapedForms(t *testing.T) {
 	}
 }
 
+// TestAPIErrorBodyEscapeLayers checks mixed escapes, fixpoint convergence, and the decode limit.
+func TestAPIErrorBodyEscapeLayers(t *testing.T) {
+	t.Parallel()
+	const key = "fixture"
+	cases := []struct{ name, body, want string }{
+		{"percent after Unicode", `{"error":"\u002566ixture"}`, "REDACTED"},
+		{"key-free mixed escapes", `{"error":"\u002566able"}`, `{"error":"\u002566able"}`},
+		{"key beyond limit", `{"error":"%2525252566ixture"}`, "REDACTED"},
+		{"still changing at limit", `{"error":"%25252561ble"}`, "REDACTED"},
+		{"stable at limit", `{"error":"%252561ble"}`, `{"error":"%252561ble"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertAPIErrorEscapedBody(t, key, tc.body, tc.want)
+		})
+	}
+}
+
 // TestAPIErrorBodyMalformedEscapes checks escaped keys and malformed response bodies.
 func TestAPIErrorBodyMalformedEscapes(t *testing.T) {
 	t.Parallel()
