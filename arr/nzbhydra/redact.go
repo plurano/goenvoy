@@ -348,13 +348,19 @@ func (e *redactedError) Is(target error) bool {
 
 // Timeout reports whether the underlying error timed out.
 func (e *redactedError) Timeout() bool {
-	return classifyHiddenError(e, interface{ Timeout() bool }.Timeout)
+	return classifyHiddenError(e, hiddenTimeoutClassifier.Timeout)
 }
 
 // Temporary reports whether the hidden error is temporary.
 func (e *redactedError) Temporary() bool {
-	return classifyHiddenError(e, interface{ Temporary() bool }.Temporary)
+	return classifyHiddenError(e, hiddenTemporaryClassifier.Temporary)
 }
+
+// Why: Go 1.26 vet's printf pass panics on inline interface method expressions. Aliases preserve As target types.
+type (
+	hiddenTimeoutClassifier   = interface{ Timeout() bool }
+	hiddenTemporaryClassifier = interface{ Temporary() bool }
+)
 
 // classifyHiddenError reports the first applicable classification within the walk budget.
 func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
