@@ -6,7 +6,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=tools/testlib.sh
+# shellcheck source=tools/testlib.sh disable=SC1091
 . "$HERE/testlib.sh"
 # Why: callers can override the script path to test copies in other directories.
 SUT=(bash "${SCRIPT_PATH:-$HERE/readme-badges.sh}")
@@ -62,7 +62,9 @@ touch "$WORK/case_a/.github/workflows/ci.yml"
 cat <<'EOF' > "$WORK/case_a/README.md"
 # Project
 
+<!-- praetor:readme-governance:start -->
 [![CI](https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg)](https://github.com/acme/widgets/actions/workflows/ci.yml)
+<!-- praetor:readme-governance:end -->
 EOF
 expect_output "case_a: badge to existing workflow" "readme-badges: 2 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_a"
 
@@ -153,7 +155,9 @@ mkdir -p "$WORK/case_j/.github/workflows"
 cat <<'EOF' > "$WORK/case_j/README.md"
 # Project
 
+<!-- praetor:readme-governance:start -->
 [![External](https://github.com/other/repo/actions/workflows/missing.yml/badge.svg)](https://example.com)
+<!-- praetor:readme-governance:end -->
 EOF
 expect_output "case_j: badge of other repo ignored" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_j"
 
@@ -204,6 +208,26 @@ cat <<'EOF' > "$WORK/case_o/README.md"
 EOF
 expect_refusal "case_o: single-quoted href full URL acme/widgets missing" "missing.yml" "${SUT[@]}" --repo acme/widgets "$WORK/case_o"
 
+# Case (p): shields workflow status with an existing workflow -> 1
+mkdir -p "$WORK/case_p/.github/workflows"
+touch "$WORK/case_p/.github/workflows/ci.yml"
+cat <<'EOF' > "$WORK/case_p/README.md"
+# Project
+[![CI](https://img.shields.io/github/actions/workflow/status/acme/widgets/ci.yml)](https://github.com/acme/widgets/actions/workflows/ci.yml)
+EOF
+expect_refusal "case_p: shields workflow status" "README.md:2: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_p"
+
+# Case (q): static shields badges -> 0
+mkdir -p "$WORK/case_q"
+printf '%s\n' '[![Go](https://img.shields.io/badge/Go-1.26-blue)](https://example.com)' > "$WORK/case_q/README.md"
+expect_output "case_q: static badge" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_q"
+
+# Case (r): shields workflow status in another top-level file -> 1
+mkdir -p "$WORK/case_r"
+printf '%s\n' '# Project' > "$WORK/case_r/README.md"
+printf '%s\n' 'https://img.shields.io/github/actions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_r/CONTRIBUTING.md"
+expect_refusal "case_r: shields in contributing" "CONTRIBUTING.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_r"
+
 # Case (u): no --repo -> exit status exactly 2 and output names --repo
 mkdir -p "$WORK/case_u"
 touch "$WORK/case_u/README.md"
@@ -214,9 +238,247 @@ mkdir -p "$WORK/case_v"
 touch "$WORK/case_v/README.md"
 expect_status "case_v: --repo with no slash" 2 "" --repo widgets "$WORK/case_v"
 
+# Case (w): native status badge outside governance -> 1.
+mkdir -p "$WORK/case_w/.github/workflows"
+touch "$WORK/case_w/.github/workflows/ci.yml"
+printf '%s\n' '# Project' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' > "$WORK/case_w/README.md"
+expect_refusal "case_w: native status badge" "README.md:2: badge.svg outside the governance block" "${SUT[@]}" --repo acme/widgets "$WORK/case_w"
+
+# Case (x): legacy shields status badge -> 1.
+mkdir -p "$WORK/case_x"
+printf '%s\n' 'https://img.shields.io/github/workflow/status/acme/widgets/CI' > "$WORK/case_x/README.md"
+expect_refusal "case_x: legacy shields status badge" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_x"
+
+# Case (y): native badge after governance closes -> 1.
+mkdir -p "$WORK/case_y/.github/workflows"
+touch "$WORK/case_y/.github/workflows/ci.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' '<!-- praetor:readme-governance:end -->' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' > "$WORK/case_y/README.md"
+expect_refusal "case_y: native badge after governance" "README.md:3: badge.svg outside the governance block" "${SUT[@]}" --repo acme/widgets "$WORK/case_y"
+
+# Case (z): current shields status badge inside governance -> 1.
+mkdir -p "$WORK/case_z"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://img.shields.io/github/actions/workflow/status/acme/widgets/ci.yml' '<!-- praetor:readme-governance:end -->' > "$WORK/case_z/README.md"
+expect_refusal "case_z: shields status inside governance" "README.md:2: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_z"
+
+# Case (aa): unclosed governance block -> 1, naming its start.
+mkdir -p "$WORK/case_aa/.github/workflows"
+touch "$WORK/case_aa/.github/workflows/ci.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' > "$WORK/case_aa/README.md"
+expect_status "case_aa: unclosed governance" 1 "README.md:1: unclosed governance block" --repo acme/widgets "$WORK/case_aa"
+
+# Case (ab): marker words in prose do not open governance -> 1.
+mkdir -p "$WORK/case_ab/.github/workflows"
+touch "$WORK/case_ab/.github/workflows/ci.yml"
+printf '%s\n' 'Discuss <!-- praetor:readme-governance:start --> here.' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' > "$WORK/case_ab/README.md"
+expect_status "case_ab: marker in prose" 1 "README.md:2: badge.svg outside the governance block" --repo acme/widgets "$WORK/case_ab"
+
+# Case (ac): stray governance end -> 1.
+mkdir -p "$WORK/case_ac"
+printf '%s\n' '<!-- praetor:readme-governance:end -->' > "$WORK/case_ac/README.md"
+expect_status "case_ac: stray governance end" 1 "README.md:1: governance end without start" --repo acme/widgets "$WORK/case_ac"
+
+# Case (ad): nested governance start -> 1.
+mkdir -p "$WORK/case_ad"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' '<!-- praetor:readme-governance:start -->' '<!-- praetor:readme-governance:end -->' > "$WORK/case_ad/README.md"
+expect_status "case_ad: nested governance start" 1 "README.md:2: governance start inside block" --repo acme/widgets "$WORK/case_ad"
+
+# Case (ae): whitespace around marker lines -> 0.
+mkdir -p "$WORK/case_ae/.github/workflows"
+touch "$WORK/case_ae/.github/workflows/ci.yml"
+printf '%s\n' '  <!-- praetor:readme-governance:start -->  ' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' '  <!-- praetor:readme-governance:end -->  ' > "$WORK/case_ae/README.md"
+expect_output "case_ae: whitespace around markers" "readme-badges: 1 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_ae"
+
+# Case (af): uppercase shields host inside governance -> 1.
+mkdir -p "$WORK/case_af"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://IMG.SHIELDS.IO/github/actions/workflow/status/acme/widgets/ci.yml' '<!-- praetor:readme-governance:end -->' > "$WORK/case_af/README.md"
+expect_refusal "case_af: uppercase shields host" "README.md:2: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_af"
+
+# Case (ag): mixed-case legacy shields host outside governance -> 1.
+mkdir -p "$WORK/case_ag"
+printf '%s\n' 'https://Img.Shields.IO/github/workflow/status/acme/widgets/CI' > "$WORK/case_ag/README.md"
+expect_refusal "case_ag: mixed-case legacy shields host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ag"
+
+# Case (ah): mixed-case native badge outside governance -> 1.
+mkdir -p "$WORK/case_ah/.github/workflows"
+touch "$WORK/case_ah/.github/workflows/ci.yml"
+printf '%s\n' 'https://GitHub.com/acme/widgets/Actions/Workflows/ci.yml/badge.svg' > "$WORK/case_ah/README.md"
+expect_refusal "case_ah: mixed-case native badge" "README.md:1: badge.svg outside the governance block" "${SUT[@]}" --repo acme/widgets "$WORK/case_ah"
+
+# Case (ai): percent-encoded shields host -> 1.
+mkdir -p "$WORK/case_ai"
+printf '%s\n' 'https://img%2eshields.io/github/actions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_ai/README.md"
+expect_refusal "case_ai: encoded host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ai"
+
+# Case (aj): bare shields host -> 1.
+mkdir -p "$WORK/case_aj"
+printf '%s\n' 'https://shields.io/github/actions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_aj/README.md"
+expect_refusal "case_aj: bare host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_aj"
+
+# Case (ak): numeric character reference in host -> 1.
+mkdir -p "$WORK/case_ak"
+printf '%s\n' '<img src="https://img.shields&#46;io/github/actions/workflow/status/acme/widgets/ci.yml">' > "$WORK/case_ak/README.md"
+expect_refusal "case_ak: numeric host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ak"
+
+# Case (al): second governance block -> 1 without exemption.
+mkdir -p "$WORK/case_al/.github/workflows"
+touch "$WORK/case_al/.github/workflows/ci.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' '<!-- praetor:readme-governance:end -->' '<!-- praetor:readme-governance:start -->' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' '<!-- praetor:readme-governance:end -->' > "$WORK/case_al/README.md"
+expect_status "case_al: second block" 1 "README.md:4: badge.svg outside the governance block" --repo acme/widgets "$WORK/case_al"
+
+# Case (am): governance block in another file -> 1 without exemption.
+mkdir -p "$WORK/case_am/.github/workflows"
+touch "$WORK/case_am/.github/workflows/ci.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://github.com/acme/widgets/actions/workflows/ci.yml/badge.svg' '<!-- praetor:readme-governance:end -->' > "$WORK/case_am/CONTRIBUTING.md"
+expect_status "case_am: other file block" 1 "CONTRIBUTING.md:2: badge.svg outside the governance block" --repo acme/widgets "$WORK/case_am"
+
+# Case (an): encoded static badge -> 0.
+mkdir -p "$WORK/case_an"
+printf '%s\n' 'https://img.shields.io/badge/hello%20world-blue' > "$WORK/case_an/README.md"
+expect_output "case_an: encoded static badge" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo acme/widgets "$WORK/case_an"
+
+# Case (ao): bare legacy shields host outside governance -> 1.
+mkdir -p "$WORK/case_ao"
+printf '%s\n' 'https://shields.io/github/workflow/status/acme/widgets/CI' > "$WORK/case_ao/README.md"
+expect_refusal "case_ao: bare legacy host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ao"
+
+# Case (ap): hex character reference in host -> 1.
+mkdir -p "$WORK/case_ap"
+printf '%s\n' '<img src="https://img.shields&#x2e;io/github/actions/workflow/status/acme/widgets/ci.yml">' > "$WORK/case_ap/README.md"
+expect_refusal "case_ap: hex host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_ap"
+
+# Case (aq): percent-encoded uppercase letter in path -> 1.
+mkdir -p "$WORK/case_aq"
+printf '%s\n' 'https://img.shields.io/github/%41ctions/workflow/status/acme/widgets/ci.yml' > "$WORK/case_aq/README.md"
+expect_refusal "case_aq: encoded uppercase path" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo acme/widgets "$WORK/case_aq"
+
+# Case (ar): decimal reference without semicolon -> 1.
+mkdir -p "$WORK/case_ar"
+printf '%s\n' '<img src="https://img.shields&#46io/github/actions/workflow/status/a/b/c">' > "$WORK/case_ar/README.md"
+expect_refusal "case_ar: decimal without semicolon" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_ar"
+
+# Case (as): HTML reference forms a percent escape -> 1.
+mkdir -p "$WORK/case_as"
+printf '%s\n' '<img src="https://img&#37;2eshields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_as/README.md"
+expect_refusal "case_as: HTML then percent" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_as"
+
+# Case (at): encoded reference remains a shields mention -> 1.
+mkdir -p "$WORK/case_at"
+printf '%s\n' 'https://img.shields%26%2346;io/github/actions/workflow/status/a/b/c' > "$WORK/case_at/README.md"
+expect_refusal "case_at: encoded reference" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_at"
+
+# Case (au): status badge in .github README -> 1.
+mkdir -p "$WORK/case_au/.github"
+printf '%s\n' 'https://img.shields.io/github/actions/workflow/status/a/b/c.yml' > "$WORK/case_au/.github/README.md"
+expect_refusal "case_au: github README" ".github/README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_au"
+
+# Case (av): docs README cannot exempt native badge -> 1.
+mkdir -p "$WORK/case_av/.github/workflows" "$WORK/case_av/docs"
+touch "$WORK/case_av/.github/workflows/c.yml"
+printf '%s\n' '<!-- praetor:readme-governance:start -->' 'https://github.com/a/b/actions/workflows/c.yml/badge.svg' '<!-- praetor:readme-governance:end -->' > "$WORK/case_av/docs/README.md"
+expect_refusal "case_av: docs governance" "docs/README.md:2: badge.svg outside the governance block" "${SUT[@]}" --repo a/b "$WORK/case_av"
+
+# Case (aw): hex reference without semicolon -> 1.
+mkdir -p "$WORK/case_aw"
+printf '%s\n' '<img src="https://img.shields&#x2eio/github/actions/workflow/status/a/b/c">' > "$WORK/case_aw/README.md"
+expect_refusal "case_aw: hex without semicolon" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_aw"
+
+# Case (ax): mixed-case docs README -> 1.
+mkdir -p "$WORK/case_ax/docs"
+printf '%s\n' 'https://img.shields.io/github/actions/workflow/status/a/b/c.yml' > "$WORK/case_ax/docs/Readme.md"
+expect_refusal "case_ax: mixed-case docs README" "docs/Readme.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_ax"
+
+# Case (ay): HTML reference forms an uppercase percent escape -> 1.
+mkdir -p "$WORK/case_ay"
+printf '%s\n' '<img src="https://img&#37;2&#x45;shields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_ay/README.md"
+expect_refusal "case_ay: HTML then uppercase percent" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_ay"
+
+# Case (bo): decimal reference inside the host word -> 1.
+mkdir -p "$WORK/case_bo"
+printf '%s\n' '<img src="https://img.&#115;hields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_bo/README.md"
+expect_refusal "case_bo: decimal reference inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bo"
+
+# Case (bp): hex reference inside the host word -> 1.
+mkdir -p "$WORK/case_bp"
+printf '%s\n' '<img src="https://img.&#x73;hields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_bp/README.md"
+expect_refusal "case_bp: hex reference inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bp"
+
+# Case (bq): percent escape inside the host word -> 1.
+mkdir -p "$WORK/case_bq"
+printf '%s\n' 'https://img.%73hields.io/github/actions/workflow/status/a/b/c' > "$WORK/case_bq/README.md"
+expect_refusal "case_bq: percent escape inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bq"
+
+# Case (br): reference that forms a percent escape inside the host word -> 1.
+mkdir -p "$WORK/case_br"
+printf '%s\n' '<img src="https://img.&#37;7&#x33;hields.io/github/actions/workflow/status/a/b/c">' > "$WORK/case_br/README.md"
+expect_refusal "case_br: HTML percent inside host" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_br"
+
+# Case (bs): native badge with an escaped dot outside governance -> 1.
+mkdir -p "$WORK/case_bs/.github/workflows"
+touch "$WORK/case_bs/.github/workflows/c.yml"
+printf '%s\n' 'https://github.com/a/b/actions/workflows/c.yml/badge%2Esvg' > "$WORK/case_bs/README.md"
+expect_refusal "case_bs: escaped dot badge" "README.md:1: badge.svg outside the governance block" "${SUT[@]}" --repo a/b "$WORK/case_bs"
+
+# Case (bi): static badge C%2B%2B.
+mkdir -p "$WORK/case_bi"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-C%2B%2B-blue)' > "$WORK/case_bi/README.md"
+expect_output "case_bi: C%2B%2B" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bi"
+
+# Case (bj): static badge C%23.
+mkdir -p "$WORK/case_bj"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-C%23-blue)' > "$WORK/case_bj/README.md"
+expect_output "case_bj: C%23" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bj"
+
+# Case (bk): static badge 100%25.
+mkdir -p "$WORK/case_bk"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-100%25-blue)' > "$WORK/case_bk/README.md"
+expect_output "case_bk: 100%25" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bk"
+
+# Case (bl): static badge c%2b%2b.
+mkdir -p "$WORK/case_bl"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-c%2b%2b-blue)' > "$WORK/case_bl/README.md"
+expect_output "case_bl: c%2b%2b" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bl"
+
+# Case (bm): static badge ci%2Fcd.
+mkdir -p "$WORK/case_bm"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-ci%2Fcd-blue)' > "$WORK/case_bm/README.md"
+expect_refusal "case_bm: ci%2Fcd" "shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bm"
+
+# Case (bn): static badge a%2Eb.
+mkdir -p "$WORK/case_bn"
+printf '%s\n' '![badge](https://img.shields.io/badge/language-a%2Eb-blue)' > "$WORK/case_bn/README.md"
+expect_refusal "case_bn: a%2Eb" "shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_bn"
+
+# Cases (az)-(bf): normalized paths and unrecognized shields references -> 1.
+for case_name in az ba bb bc bd be bf; do
+  mkdir -p "$WORK/case_$case_name/.github/workflows"
+  touch "$WORK/case_$case_name/.github/workflows/c.yml"
+done
+printf '%s\n' 'https://img.shields.io/badge/../github/actions/workflow/status/a/b/c' > "$WORK/case_az/README.md"
+printf '%s\n' 'https://img.shields.io/badge/x\..\..\github/actions/workflow/status/a/b/c' > "$WORK/case_ba/README.md"
+printf '%s\n' 'https://img.shields.io:443/github/actions/workflow/status/a/b/c' > "$WORK/case_bb/README.md"
+printf '%s\n' 'https://img.shields.io./github/actions/workflow/status/a/b/c' > "$WORK/case_bc/README.md"
+printf '%s\n' 'https://img.shields.io/badge/%2e%2e%2fgithub%2factions%2fworkflow%2fstatus%2fa%2fb%2fc' > "$WORK/case_bd/README.md"
+printf '%s\n' 'https://github.com/a/b/actions/workflows/c.yml/x/../badge.svg' > "$WORK/case_be/README.md"
+printf '%s\n' 'see shields.io for badges' > "$WORK/case_bf/README.md"
+for case_name in az ba bb bc bd bf; do
+  expect_refusal "case_$case_name: unrecognized shields reference" "README.md:1: shields reference is not a plain static badge" "${SUT[@]}" --repo a/b "$WORK/case_$case_name"
+done
+expect_refusal "case_be: normalized native badge" "README.md:1: badge.svg outside the governance block" "${SUT[@]}" --repo a/b "$WORK/case_be"
+
+# Case (bg): static badge with a URL in its query -> 0.
+mkdir -p "$WORK/case_bg"
+printf '%s\n' 'https://img.shields.io/badge/a-b-blue?link=https%3A%2F%2Fimg.shields.io%2Fgithub%2Factions%2Fworkflow%2Fstatus%2Fa%2Fb%2Fc' > "$WORK/case_bg/README.md"
+expect_output "case_bg: URL in static badge query" "readme-badges: 0 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bg"
+
+# Case (bh): two static badges and an exempt native reference -> 0.
+mkdir -p "$WORK/case_bh/.github/workflows"
+touch "$WORK/case_bh/.github/workflows/c.yml"
+printf '%s\n' '![one](https://img.shields.io/badge/one-green) ![two](https://img.shields.io/badge/two-blue)' '<!-- praetor:readme-governance:start -->' '[ci]: https://github.com/a/b/actions/workflows/c.yml/badge.svg' '<!-- praetor:readme-governance:end -->' > "$WORK/case_bh/README.md"
+expect_output "case_bh: multiple static badges and governance" "readme-badges: 1 workflow references ok" "${SUT[@]}" --repo a/b "$WORK/case_bh"
+
 # Real check on the repo root -> 0
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
-expect_pattern "repo: real check" "workflow references ok" --repo golusoris/goenvoy "$REPO_ROOT"
-(cd "$REPO_ROOT" && expect_pattern "repo: default root" "workflow references ok" --repo golusoris/goenvoy)
+expect_pattern "repo: real check" "workflow references ok" --repo plurano/goenvoy "$REPO_ROOT"
+(cd "$REPO_ROOT" && expect_pattern "repo: default root" "workflow references ok" --repo plurano/goenvoy)
 
 echo "readme-badges: all planted cases pass"

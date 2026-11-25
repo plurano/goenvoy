@@ -1,7 +1,7 @@
 -include .config/praetor/engine.mk
-.PHONY: help test-all coverage-check-all lint-all vet-all vuln-all gosec-all cover-all tidy-all build-all fmt-all golines-all ci-all list-modules clean-all tools-install doc upstream-specs lint-exceptions lint-exceptions-gen
+.PHONY: help test-all coverage-check-all lint-all vet-all vuln-all gosec-all cover-all tidy-all build-all fmt-all golines-all ci-all list-modules clean-all tools-install doc upstream-specs lint-exceptions lint-exceptions-gen module-scripts-check
 
-MODULES := $(shell find . -name 'go.mod' -not -path './.workingdir/*' -not -path './.workingdir2/*' -not -path './tools/go/*' -exec dirname {} \; | sort)
+MODULES := $(shell bash tools/module-dirs.sh --all)
 GOLANGCI_LINT_VERSION := v2.13.2
 
 help:  ## Show this help
@@ -51,10 +51,7 @@ cover-all: test-all ## Generate coverage.html per module
 	done
 
 lint-all: ## golangci-lint run, all modules
-	@for mod in $(MODULES); do \
-		echo "==> Linting $$mod"; \
-		(cd $$mod && golangci-lint run --config=$(CURDIR)/.golangci.yml ./...) || exit 1; \
-	done
+	@bash tools/golangci-modules.sh --all
 
 vet-all: ## go vet, all modules
 	@for mod in $(MODULES); do \
@@ -120,8 +117,13 @@ tools-tidy-check: ## tools/go go.mod and go.sum match go mod tidy: planted cases
 	bash tools/tools-tidy_test.sh
 	bash tools/tools-tidy.sh tools/go
 
-lint-exceptions: ## Dated complexity exceptions in .golangci.yml: planted cases, then the repository config
-	cd tools/go && go vet ./lintexceptions/ && go test -count=1 ./lintexceptions/
+lint-exceptions: ## Check lint exceptions and list repository exceptions expiring within 14 days
+# Why: Run the listing even when the check fails so the job summary still shows what is due, then exit with the check's status.
+	cd tools/go && { \
+		check_status=0; \
+		go vet ./lintexceptions/... && go test -count=1 ./lintexceptions/... || check_status=$$?; \
+		go run ./lintexceptions/expiring -root ../.. && exit "$$check_status"; \
+	}
 
 lint-exceptions-gen: ## Regenerate the dated complexity exceptions from a measured lint run (#141)
 	bash tools/lint-exceptions.sh
@@ -151,6 +153,7 @@ release-config-check: ## Release-please config matches its generator and carries
 release-scripts-check: ## Release manifest, tagging, notes, publishing and release-PR CI scripts: planted cases, then the manifest
 	bash tools/testlib_test.sh
 	bash tools/pin-literals_test.sh
+	bash tools/privileged-write_test.sh
 	bash tools/readme-module-count_test.sh
 	bash tools/release-manifest_test.sh
 	bash tools/release-manifest.sh check
@@ -158,6 +161,11 @@ release-scripts-check: ## Release manifest, tagging, notes, publishing and relea
 	bash tools/release-tag_test.sh
 	bash tools/release-notes_test.sh
 	bash tools/release-publish_test.sh
+
+.PHONY: module-scripts-check
+module-scripts-check: ## Module discovery and per-module lint scripts: planted cases, then the repository
+	bash tools/module-dirs_test.sh
+	bash tools/golangci-modules_test.sh
 
 doc: ## Local godoc server at :6060
 	@echo "Starting godoc server at http://localhost:6060"
@@ -185,6 +193,7 @@ verify-all:
 	@$(MAKE) --no-print-directory release-config-check
 	@$(MAKE) --no-print-directory release-scripts-check
 	@$(MAKE) --no-print-directory tools-tidy-check
+	@$(MAKE) --no-print-directory module-scripts-check
 	@$(MAKE) --no-print-directory ci-all
 
 compile-context:

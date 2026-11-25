@@ -24,31 +24,55 @@ func setup(t *testing.T, handler http.HandlerFunc) *screenscraper.Client {
 	)
 }
 
+// checkGetGameInfoRequest validates query parameters for jeuInfos from TestGetGameInfo.
+func checkGetGameInfoRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodGet {
+		t.Errorf("method = %s, want GET", r.Method)
+	}
+	if got := r.URL.Query().Get("devid"); got != "testdev" {
+		t.Errorf("devid = %q, want testdev", got)
+	}
+	if got := r.URL.Query().Get("devpassword"); got != "testpass" {
+		t.Errorf("devpassword = %q, want testpass", got)
+	}
+	if got := r.URL.Query().Get("softname"); got != "testapp" {
+		t.Errorf("softname = %q, want testapp", got)
+	}
+	if got := r.URL.Query().Get("ssid"); got != "user" {
+		t.Errorf("ssid = %q, want user", got)
+	}
+	if got := r.URL.Query().Get("output"); got != "json" {
+		t.Errorf("output = %q, want json", got)
+	}
+	if got := r.URL.Query().Get("crc"); got != "ABCD1234" {
+		t.Errorf("crc = %q, want ABCD1234", got)
+	}
+}
+
+// checkGetGameInfoResult validates decoded game info from TestGetGameInfo.
+func checkGetGameInfoResult(t *testing.T, result *screenscraper.GameInfoResponse) {
+	t.Helper()
+	if result.Response.Game.ID != "3" {
+		t.Errorf("ID = %q, want 3", result.Response.Game.ID)
+	}
+	if len(result.Response.Game.Names) != 2 {
+		t.Fatalf("len(Names) = %d, want 2", len(result.Response.Game.Names))
+	}
+	if result.Response.Game.Names[0].Text != "Sonic the Hedgehog" {
+		t.Errorf("Names[0].Text = %q", result.Response.Game.Names[0].Text)
+	}
+	if result.Response.Game.Publisher.Text != "Sega" {
+		t.Errorf("Publisher.Text = %q", result.Response.Game.Publisher.Text)
+	}
+}
+
+// TestGetGameInfo tests jeuInfos query parameters and decoded game metadata in the response.
 func TestGetGameInfo(t *testing.T) {
 	t.Parallel()
 
 	c := setup(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("method = %s, want GET", r.Method)
-		}
-		if got := r.URL.Query().Get("devid"); got != "testdev" {
-			t.Errorf("devid = %q, want testdev", got)
-		}
-		if got := r.URL.Query().Get("devpassword"); got != "testpass" {
-			t.Errorf("devpassword = %q, want testpass", got)
-		}
-		if got := r.URL.Query().Get("softname"); got != "testapp" {
-			t.Errorf("softname = %q, want testapp", got)
-		}
-		if got := r.URL.Query().Get("ssid"); got != "user" {
-			t.Errorf("ssid = %q, want user", got)
-		}
-		if got := r.URL.Query().Get("output"); got != "json" {
-			t.Errorf("output = %q, want json", got)
-		}
-		if got := r.URL.Query().Get("crc"); got != "ABCD1234" {
-			t.Errorf("crc = %q, want ABCD1234", got)
-		}
+		checkGetGameInfoRequest(t, r)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"header": map[string]any{
@@ -76,18 +100,7 @@ func TestGetGameInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Response.Game.ID != "3" {
-		t.Errorf("ID = %q, want 3", result.Response.Game.ID)
-	}
-	if len(result.Response.Game.Names) != 2 {
-		t.Fatalf("len(Names) = %d, want 2", len(result.Response.Game.Names))
-	}
-	if result.Response.Game.Names[0].Text != "Sonic the Hedgehog" {
-		t.Errorf("Names[0].Text = %q", result.Response.Game.Names[0].Text)
-	}
-	if result.Response.Game.Publisher.Text != "Sega" {
-		t.Errorf("Publisher.Text = %q", result.Response.Game.Publisher.Text)
-	}
+	checkGetGameInfoResult(t, result)
 }
 
 func TestGetGameInfoNilOptions(t *testing.T) {

@@ -93,6 +93,16 @@
       "groupName": "github actions"
     },
     {
+      "description": "Modules here require each other at tagged versions; one branch carries every in-repo module bump of a Renovate run instead of one pull request per module.",
+      "matchDatasources": [
+        "go"
+      ],
+      "matchPackageNames": [
+        "github.com/golusoris/goenvoy/**"
+      ],
+      "groupName": "goenvoy modules"
+    },
+    {
       "description": "Major bumps require review.",
       "matchUpdateTypes": [
         "major"
@@ -117,7 +127,9 @@
         "github.com/cordanaLLM/praetor/**",
         "github.com/cordanaLLM/praetor/cmd/standardsctl",
         "cordanaLLM/praetor",
-        "cordanaLLM/praetor/**"
+        "cordanaLLM/praetor/**",
+        "tekmora/praetor",
+        "tekmora/praetor/**"
       ],
       "enabled": false
     },

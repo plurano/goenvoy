@@ -3,7 +3,7 @@ name: Docs
 on:
   push:
     branches: [main]
-    paths:
+    paths: &docs-paths
       - docs/**
       - mkdocs.yml
       - scripts/ci/mkdocs-build.sh
@@ -15,16 +15,7 @@ on:
       - .github/workflows/docs.yml
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - docs/**
-      - mkdocs.yml
-      - scripts/ci/mkdocs-build.sh
-      - scripts/ci/docker-hub-mirror.sh
-      - scripts/ci/mkdocs-build-policy_test.sh
-      - scripts/ci/docker-hub-mirror_test.sh
-      - .github/actions/docker-hub-mirror/**
-      - tools/tool-versions.env
-      - .github/workflows/docs.yml
+    paths: *docs-paths
   workflow_dispatch:
 
 permissions:

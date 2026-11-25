@@ -578,6 +578,310 @@ func TestLoginError(t *testing.T) {
 	}
 }
 
+// serveStaleThenFreshLogin answers /login with token "stale" on the first call and "fresh" after it.
+func serveStaleThenFreshLogin(w http.ResponseWriter, loginCount *atomic.Int32) {
+	token := "stale"
+	if loginCount.Add(1) > 1 {
+		token = "fresh"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "success",
+		"data":   map[string]any{"token": token},
+	})
+}
+
+// newStaleGateServer returns a server that 401s stale bearer tokens until n concurrent requests arrive.
+func newStaleGateServer(t *testing.T, n int32, loginCount *atomic.Int32) *httptest.Server {
+	t.Helper()
+	var staleArrived atomic.Int32
+	staleGate := make(chan struct{})
+	seriesOK := map[string]any{
+		"status": "success",
+		"data":   map[string]any{"id": float64(1), "name": "Test Series"},
+	}
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			serveStaleThenFreshLogin(w, loginCount)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		switch auth {
+		case "Bearer stale":
+			if staleArrived.Add(1) == n {
+				close(staleGate)
+			}
+			select {
+			case <-staleGate:
+			case <-time.After(5 * time.Second):
+				t.Error("stale requests did not reach gate within 5s")
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"message": "token expired"})
+		case "Bearer fresh":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(seriesOK)
+		default:
+			t.Errorf("unexpected Authorization %q", auth)
+			http.Error(w, "bad auth", http.StatusBadRequest)
+		}
+	}))
+}
+
+// TestTokenRefreshOn401Concurrent checks concurrent 401 retries share a single re-login.
+func TestTokenRefreshOn401Concurrent(t *testing.T) {
+	t.Parallel()
+	var loginCount atomic.Int32
+	srv := newStaleGateServer(t, 8, &loginCount)
+	defer srv.Close()
+
+	c := tvdb.New("test-key", metadata.WithBaseURL(srv.URL))
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := c.Login(ctx); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	initial := loginCount.Load()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			series, err := c.GetSeries(ctx, 1)
+			if err != nil {
+				t.Errorf("GetSeries: %v", err)
+				return
+			}
+			if series.Name != "Test Series" {
+				t.Errorf("Name = %q, want %q", series.Name, "Test Series")
+			}
+		})
+	}
+	wg.Wait()
+
+	if got, want := loginCount.Load()-initial, int32(1); got != want {
+		t.Errorf("re-login count after 8 concurrent 401s = %d, want %d", got, want)
+	}
+}
+
+// TestEnsureTokenConcurrent checks concurrent first requests share one login.
+func TestEnsureTokenConcurrent(t *testing.T) {
+	t.Parallel()
+	var loginCount atomic.Int32
+	seriesOK := map[string]any{
+		"status": "success",
+		"data":   map[string]any{"id": float64(1), "name": "Test Series"},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			loginCount.Add(1)
+			time.Sleep(50 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"status": "success",
+				"data":   map[string]any{"token": "fresh"},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(seriesOK)
+	}))
+	defer srv.Close()
+
+	c := tvdb.New("test-key", metadata.WithBaseURL(srv.URL))
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			series, err := c.GetSeries(ctx, 1)
+			if err != nil {
+				t.Errorf("GetSeries: %v", err)
+				return
+			}
+			if series.Name != "Test Series" {
+				t.Errorf("Name = %q, want %q", series.Name, "Test Series")
+			}
+		})
+	}
+	wg.Wait()
+
+	if got, want := loginCount.Load(), int32(1); got != want {
+		t.Errorf("login count = %d, want %d", got, want)
+	}
+}
+
+// newBlockingLoginGateServer returns a server whose login blocks until release receives a signal.
+func newBlockingLoginGateServer(t *testing.T, started, release chan struct{}) *httptest.Server {
+	t.Helper()
+	seriesOK := map[string]any{
+		"status": "success",
+		"data":   map[string]any{"id": float64(1), "name": "Test Series"},
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			started <- struct{}{}
+			<-release
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"status": "success",
+				"data":   map[string]any{"token": "held-token"},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(seriesOK)
+	}))
+}
+
+// TestLoginWaitHonoursContext checks that waiting for the login gate respects caller context deadlines.
+func TestLoginWaitHonoursContext(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := newBlockingLoginGateServer(t, started, release)
+	defer srv.Close()
+	var releaseOnce sync.Once
+	releaseLogin := func() { releaseOnce.Do(func() { close(release) }) }
+	// Why: runs before srv.Close, which waits for the held login handler.
+	defer releaseLogin()
+
+	c := tvdb.New("test-key", metadata.WithBaseURL(srv.URL))
+	ctxA := context.Background()
+	doneA := make(chan struct{})
+	go func() {
+		if _, err := c.GetSeries(ctxA, 1); err != nil {
+			t.Errorf("caller A GetSeries: %v", err)
+		}
+		close(doneA)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("login handler did not start within 2s")
+	}
+
+	type getResult struct {
+		series *tvdb.SeriesBase
+		err    error
+	}
+	resultB := make(chan getResult, 1)
+	go func() {
+		ctxB, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		series, err := c.GetSeries(ctxB, 1)
+		resultB <- getResult{series, err}
+	}()
+
+	select {
+	case res := <-resultB:
+		if !errors.Is(res.err, context.DeadlineExceeded) {
+			t.Fatalf("caller B err = %v, want DeadlineExceeded", res.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller B did not return within 2s (login gate blocks past context)")
+	}
+
+	releaseLogin()
+	select {
+	case <-doneA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("caller A did not finish after login release")
+	}
+}
+
+// serveStaleFailedFreshLogin answers login 1 with "stale", login 2 with a 500 and later logins with "fresh".
+func serveStaleFailedFreshLogin(w http.ResponseWriter, loginCount *atomic.Int32) {
+	w.Header().Set("Content-Type", "application/json")
+	switch loginCount.Add(1) {
+	case 1:
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"data":   map[string]any{"token": "stale"},
+		})
+	case 2:
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"message": "login failed"})
+	default:
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"data":   map[string]any{"token": "fresh"},
+		})
+	}
+}
+
+// newFailedReloginGateServer returns a server where the second login fails and the third issues a fresh token.
+func newFailedReloginGateServer(t *testing.T, loginCount *atomic.Int32) *httptest.Server {
+	t.Helper()
+	var staleArrived atomic.Int32
+	staleGate := make(chan struct{})
+	seriesOK := map[string]any{
+		"status": "success",
+		"data":   map[string]any{"id": float64(1), "name": "Test Series"},
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" {
+			serveStaleFailedFreshLogin(w, loginCount)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer fresh" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(seriesOK)
+			return
+		}
+		if auth == "Bearer stale" {
+			if staleArrived.Add(1) == 2 {
+				close(staleGate)
+			}
+			select {
+			case <-staleGate:
+			case <-time.After(5 * time.Second):
+				t.Error("stale requests did not reach gate within 5s")
+			}
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]any{"message": "token expired"})
+	}))
+}
+
+// TestRefreshAfterFailedRelogin checks that an empty cache after failed re-login does not skip authentication.
+func TestRefreshAfterFailedRelogin(t *testing.T) {
+	t.Parallel()
+	var loginCount atomic.Int32
+	srv := newFailedReloginGateServer(t, &loginCount)
+	defer srv.Close()
+
+	c := tvdb.New("test-key", metadata.WithBaseURL(srv.URL))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Login(ctx); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var okCount atomic.Int32
+	for range 2 {
+		wg.Go(func() {
+			_, err := c.GetSeries(ctx, 1)
+			if err == nil {
+				okCount.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+
+	if got, want := loginCount.Load(), int32(3); got != want {
+		t.Errorf("login calls = %d, want %d", got, want)
+	}
+	if got, want := okCount.Load(), int32(1); got != want {
+		t.Errorf("successful GetSeries = %d, want %d", got, want)
+	}
+}
+
 // TestTokenRefreshOn401 checks that a retry sends the token from the second login.
 func TestTokenRefreshOn401(t *testing.T) {
 	t.Parallel()

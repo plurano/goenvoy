@@ -11,6 +11,9 @@ set -euo pipefail
 # Why: plan_tags and tag_state run in command substitutions; without inherit_errexit a failed read inside them would print a state instead of stopping.
 shopt -s inherit_errexit
 
+# shellcheck source=tools/repo-slug.sh
+. "$(dirname "${BASH_SOURCE[0]}")/repo-slug.sh"
+
 # usage: prints the usage line and exits 2.
 usage() {
   echo "usage: ${0##*/} tag|relabel OWNER/REPO" >&2
@@ -27,10 +30,7 @@ if [ "$MODE" != "tag" ] && [ "$MODE" != "relabel" ]; then
 fi
 
 [ -n "$REPO" ] || usage
-if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-  echo "error: invalid repository '$REPO', expected OWNER/REPO" >&2
-  exit 2
-fi
+require_repo_slug "$REPO"
 
 TIMEOUT="${RELEASE_TAG_TIMEOUT:-60}"
 if [[ ! "$TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]]; then
@@ -226,6 +226,20 @@ tag_state() {
   exit 1
 }
 
+# read_pr_entry ENTRY: sets pr_num, sha, and tags from one "NUMBER SHA" line.
+read_pr_entry() {
+  local entry="$1"
+  if [[ ! "$entry" =~ ^([1-9][0-9]*)[[:space:]]+([0-9a-f]{40})$ ]]; then
+    echo "error: invalid pull request entry: '$entry'" >&2
+    exit 1
+  fi
+  pr_num="${BASH_REMATCH[1]}"
+  sha="${BASH_REMATCH[2]}"
+  local planned
+  planned="$(plan_tags "$pr_num" "$sha")"
+  mapfile -t tags <<< "$planned"
+}
+
 # Why: gh pr list --label reads the search index, which lags behind a merge; the REST list with a head filter does not; --paginate so a pending pull request behind 100 newer closed ones is still found.
 OWNER="${REPO%%/*}"
 pr_lines="$(gh_read "list release pull requests for $REPO" api --paginate "repos/$REPO/pulls?state=closed&head=$OWNER:$RELEASE_BRANCH&per_page=100" --jq '.[] | select(.merged_at != null) | select(.base.ref == "'"$BASE_BRANCH"'") | select(.head.ref == "'"$RELEASE_BRANCH"'") | select(any(.labels[]; .name == "autorelease: pending")) | "\(.number) \(.merge_commit_sha)"')"
@@ -246,12 +260,7 @@ fi
 if [ "$MODE" = "tag" ]; then
   all_tags=()
   for pr_entry in "${prs[@]}"; do
-    [[ "$pr_entry" =~ ^([1-9][0-9]*)[[:space:]]+([0-9a-f]{40})$ ]]
-    pr_num="${BASH_REMATCH[1]}"
-    sha="${BASH_REMATCH[2]}"
-
-    planned_tags="$(plan_tags "$pr_num" "$sha")"
-    mapfile -t tags <<< "$planned_tags"
+    read_pr_entry "$pr_entry"
     for tag in "${tags[@]}"; do
       state="$(tag_state "$tag" "$sha")"
       if [ "$state" = "missing" ]; then
@@ -280,12 +289,7 @@ if [ "$MODE" = "tag" ]; then
 elif [ "$MODE" = "relabel" ]; then
   ready_prs=()
   for pr_entry in "${prs[@]}"; do
-    [[ "$pr_entry" =~ ^([1-9][0-9]*)[[:space:]]+([0-9a-f]{40})$ ]]
-    pr_num="${BASH_REMATCH[1]}"
-    sha="${BASH_REMATCH[2]}"
-
-    planned_tags="$(plan_tags "$pr_num" "$sha")"
-    mapfile -t tags <<< "$planned_tags"
+    read_pr_entry "$pr_entry"
     ready=1
     for tag in "${tags[@]}"; do
       state="$(tag_state "$tag" "$sha")"

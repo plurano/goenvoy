@@ -7,6 +7,8 @@
 #   e) stage, one asset dropped: exit 1, no edit, stderr names the asset
 #   f) stage, three arguments after the mode: exit 2, zero calls
 #   g) stage, repository bad repo: exit 2, zero calls
+#   g2) stage, repository owner: exit 2, zero calls, stderr has invalid repository
+#   g3) stage, repository own er/repo: exit 2, zero calls, stderr has invalid repository
 #   h) stage, RELEASE_PUBLISH_TIMEOUT=abc: exit 2, zero calls
 #   i) stage, missing asset file: exit 2, zero calls
 #   j) stage with STUB_VIEW_ERROR='HTTP 502: Bad Gateway' and no state file: exit 1, zero create calls, stderr has HTTP 502
@@ -235,8 +237,23 @@ echo "ok   case_f"
 # Case g: stage, repository bad repo: exit 2, zero calls
 rc=0; run_publish stage "bad repo" "v1.0.0" "title" "$NOTES_FILE" "$ASSET1" || rc=$?
 [ "$rc" -eq 2 ] || fail "case_g" "exit $rc, want 2"
+grep -q "invalid repository" "$ERR" || fail "case_g" "stderr missing invalid repository: $(cat "$ERR")"
 [ "$(wc -l < "$CALLS")" -eq 0 ] || fail "case_g" "want 0 calls"
 echo "ok   case_g"
+
+# Case g2: stage, repository owner (no slash): exit 2, zero calls, stderr has invalid repository
+rc=0; run_publish stage "owner" "v1.0.0" "title" "$NOTES_FILE" "$ASSET1" || rc=$?
+[ "$rc" -eq 2 ] || fail "case_g2" "exit $rc, want 2"
+grep -q "invalid repository" "$ERR" || fail "case_g2" "stderr missing invalid repository: $(cat "$ERR")"
+[ "$(wc -l < "$CALLS")" -eq 0 ] || fail "case_g2" "want 0 calls"
+echo "ok   case_g2"
+
+# Case g3: stage, repository own er/repo (space): exit 2, zero calls, stderr has invalid repository
+rc=0; run_publish stage "own er/repo" "v1.0.0" "title" "$NOTES_FILE" "$ASSET1" || rc=$?
+[ "$rc" -eq 2 ] || fail "case_g3" "exit $rc, want 2"
+grep -q "invalid repository" "$ERR" || fail "case_g3" "stderr missing invalid repository: $(cat "$ERR")"
+[ "$(wc -l < "$CALLS")" -eq 0 ] || fail "case_g3" "want 0 calls"
+echo "ok   case_g3"
 
 # Case h: stage, RELEASE_PUBLISH_TIMEOUT=abc: exit 2, zero calls
 rc=0

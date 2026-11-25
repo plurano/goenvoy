@@ -1,8 +1,8 @@
 name: CI
 
 # Per-module Go gates (lint, gosec, govulncheck, race test + coverage, build)
-# delegate to golusoris/golusoris's reusable ci-go.yml, one call per module in
-# the `discover` matrix (golusoris/golusoris#184). apidiff stays local: this
+# delegate to plurano/golusoris's reusable ci-go.yml, one call per module in
+# the `discover` matrix (plurano/golusoris#184). apidiff stays local: this
 # repo tags each module independently (release-please, tag-separator "/", e.g.
 # anime/shoko/v1.2.3), and ci-go.yml's apidiff job only knows a single global
 # `git describe` tag, which would compare against an unrelated module's most
@@ -102,8 +102,14 @@ jobs:
         run: bash tools/release-config_test.sh
       - name: Test fixtures stay apart from the calling repository
         run: bash tools/testlib_test.sh
+      - name: Module discovery maps paths to go.mod directories
+        run: bash tools/module-dirs_test.sh
+      - name: Per-module golangci-lint dispatch matches changed modules
+        run: bash tools/golangci-modules_test.sh
       - name: Pinned versions and digests live only in the pin file
         run: bash tools/pin-literals_test.sh
+      - name: Privileged writes stage and rename
+        run: bash tools/privileged-write_test.sh
       - name: Documented module count matches the release manifest
         run: bash tools/readme-module-count_test.sh
 
@@ -124,7 +130,8 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - &checkout-no-credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-tools-go
@@ -140,11 +147,9 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
+      - *checkout-no-credentials
       - uses: ./.github/actions/setup-tools-go
-      - name: Check the exceptions
+      - name: Check the exceptions and list the ones expiring within 14 days
         run: make lint-exceptions
 
   # gitleaks scans every commit, not only the tip; GitHub push protection is the
@@ -189,7 +194,7 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -uo pipefail
-          ALL=$(find . -name go.mod -not -path './.workingdir/*' -not -path './tools/go/*' -exec dirname {} \; | sed 's#^\./##' | sort)
+          ALL=$(bash tools/module-dirs.sh --all) || { echo "::error::module discovery failed"; exit 1; }
 
           # Diff base: PR base for pull_request, the pushed-from commit otherwise.
           if [ "$EVENT" = "pull_request" ]; then DIFF_BASE="$BASE_SHA"; else DIFF_BASE="$BEFORE_SHA"; fi
@@ -200,7 +205,7 @@ jobs:
           fi
 
           # Files whose change can affect every module's gate -> run the full matrix.
-          FORCE_FULL_RE='^(\.github/workflows/ci\.yml|\.golangci\.yml|tools/coverage-thresholds\.json)$'
+          FORCE_FULL_RE='^(\.github/workflows/ci\.yml|\.golangci\.yml|tools/coverage-thresholds\.json|tools/module-dirs\.sh)$'
           FULL=false
           if [ -z "$CHANGED" ]; then
             FULL=true   # unknown base (first push, shallow, force-push) -> be safe
@@ -212,20 +217,13 @@ jobs:
             SELECTED="$ALL"
             echo "Full matrix (shared config changed or diff base unavailable)."
           else
-            # Map each changed file to its nearest ancestor module directory.
-            SELECTED=$(while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              d=$(dirname "$f")
-              # A path has fewer than 64 directory levels.
-              depth=0
-              while [ "$depth" -lt 64 ]; do
-                depth=$((depth + 1))
-                if printf '%s\n' "$ALL" | grep -qx "$d"; then echo "$d"; break; fi
-                [ "$d" = "." ] && break
-                d=$(dirname "$d")
-              done
-            done <<< "$CHANGED" | sort -u)
-            echo "Changed modules:"; printf '%s\n' "$SELECTED" | sed 's/^/  /'
+            # A refused list (more than 4096 changed paths) selects every module, never none.
+            if SELECTED=$(printf '%s\n' "$CHANGED" | bash tools/module-dirs.sh); then
+              echo "Changed modules:"; printf '%s\n' "$SELECTED" | sed 's/^/  /'
+            else
+              SELECTED="$ALL"
+              echo "Full matrix (changed-path mapping refused)."
+            fi
           fi
 
           # Node builds the matrix: it is always present, because JavaScript
@@ -270,7 +268,7 @@ jobs:
     permissions:
       contents: read
       security-events: write   # gosec SARIF upload inside ci-go.yml (capped by this grant)
-    uses: golusoris/golusoris/.github/workflows/ci-go.yml@7c3fabe83c1bfa77120f7efa6bcef29448a9170e # v0.22.2
+    uses: plurano/golusoris/.github/workflows/ci-go.yml@eef63b5553103793eb934cc67a0ea0a75847cfaf # v0.22.3
     with:
       runs-on: ubuntu-26.04
       working-directory: ${{ matrix.module }}
@@ -296,7 +294,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: ${{ matrix.module }}/go.mod
           cache-dependency-path: ${{ matrix.module }}/go.mod
