@@ -166,6 +166,8 @@ release-scripts-check: ## Release manifest, tagging, notes, publishing and relea
 module-scripts-check: ## Module discovery and per-module lint scripts: planted cases, then the repository
 	bash tools/module-dirs_test.sh
 	bash tools/golangci-modules_test.sh
+	bash tools/redact-parity_test.sh
+	bash tools/redact-parity.sh
 
 doc: ## Local godoc server at :6060
 	@echo "Starting godoc server at http://localhost:6060"

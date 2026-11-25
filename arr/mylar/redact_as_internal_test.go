@@ -132,24 +132,17 @@ func TestRedactedErrorAsKeepsOriginalKey(t *testing.T) {
 // TestRedactedErrorAsFanoutBounded checks that errors.As on a hidden exponential tree with a key-bearing leaf returns promptly.
 func TestRedactedErrorAsFanoutBounded(t *testing.T) {
 	t.Parallel()
-	c := &Client{apiKey: "plain-key"}
-	var err error
-	err = errors.New("fixture fanout leaf plain-key")
+	const key = "plain-key"
+	tree := errors.New("fixture fanout leaf " + key)
 	for range 40 {
-		err = redactionFanout{prev: err}
+		tree = redactionFanout{prev: tree}
 	}
-	done := make(chan bool, 1)
-	go func() {
+	hidden := &redactedError{msg: "fixture fanout", err: tree, key: key}
+	if answerWithinTwoSeconds(t, "errors.As", func() bool {
 		var uerr *url.Error
-		done <- errors.As(c.redactError(err), &uerr)
-	}()
-	select {
-	case found := <-done:
-		if found {
-			t.Error("errors.As found a *url.Error in a tree that holds none")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("errors.As did not return within 2s")
+		return errors.As(hidden, &uerr)
+	}) {
+		t.Error("errors.As found a *url.Error in a tree that holds none")
 	}
 }
 
@@ -162,24 +155,27 @@ func (redactSliceErr) Error() string { return "fixture slice error" }
 // hiddenRedacted returns the redactedError that scrubError builds for err and fails the test when err is not hidden.
 func hiddenRedacted(t *testing.T, key string, err error) error {
 	t.Helper()
-	got := (&Client{apiKey: key}).scrubError(err)
+	got := answerWithinTwoSeconds(t, "scrubError", func() error {
+		return (&Client{apiKey: key}).scrubError(err)
+	})
 	if hidden, ok := got.(*redactedError); !ok || hidden == nil { //nolint:errorlint // require the wrapper itself without traversing the tree
 		t.Fatalf("scrubError(%T) = %T; want *redactedError", err, got)
 	}
 	return got
 }
 
-// answerWithinTwoSeconds runs ask and fails the test, instead of hanging, when it does not answer within 2s.
-func answerWithinTwoSeconds(t *testing.T, name string, ask func() bool) bool {
+// answerWithinTwoSeconds runs ask and fails the test if it does not answer within 2s.
+func answerWithinTwoSeconds[T any](t *testing.T, name string, ask func() T) T {
 	t.Helper()
-	done := make(chan bool, 1)
+	done := make(chan T, 1)
 	go func() { done <- ask() }()
 	select {
 	case got := <-done:
 		return got
 	case <-time.After(2 * time.Second):
 		t.Fatalf("%s did not return within 2s", name)
-		return false
+		var zero T
+		return zero
 	}
 }
 

@@ -109,10 +109,38 @@ func TestAPIErrorJSONFormRedaction(t *testing.T) {
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("expected APIError, got %v", err)
 	}
-	for _, text := range []string{apiErr.Body, apiErr.Error()} {
-		if strings.Contains(text, key) || strings.Contains(text, escaped) {
-			t.Errorf("key leaked: %s", text)
-		}
+	if want := `{"error":"REDACTED"}`; apiErr.Body != want {
+		t.Errorf("body = %q; want %q", apiErr.Body, want)
+	}
+	if text := apiErr.Error(); strings.Contains(text, key) || strings.Contains(text, escaped) {
+		t.Error("key leaked in error text")
+	}
+}
+
+// TestAPIErrorStatusCanonicalRedaction checks that only status text containing a key is scrubbed.
+func TestAPIErrorStatusCanonicalRedaction(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key"
+	cases := []struct{ name, status, want string }{
+		{name: "escaped key", status: "500 fixture%2dkey", want: "REDACTED"},
+		{name: "plain status", status: "500 Internal Server Error", want: "500 Internal Server Error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := responseTextClient(t, key, "fixture failure")
+			c.httpClient.Transport = responseStatusTransport{RoundTripper: c.httpClient.Transport, status: tc.status}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			_, err := c.GetIndex(ctx)
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("expected APIError, got %v", err)
+			}
+			if apiErr.Status != tc.want {
+				t.Errorf("status = %q; want %q", apiErr.Status, tc.want)
+			}
+		})
 	}
 }
 
@@ -218,10 +246,11 @@ func TestAPIErrorPercentVariantRedaction(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			apiErr := percentFormAPIError(t, key, tc.spelling)
-			for _, text := range []string{apiErr.Body, apiErr.Error()} {
-				if strings.Contains(text, key) || strings.Contains(text, tc.spelling) {
-					t.Errorf("key leaked: %s", text)
-				}
+			if want := "apikey=REDACTED"; apiErr.Body != want {
+				t.Errorf("body = %q; want %q", apiErr.Body, want)
+			}
+			if text := apiErr.Error(); strings.Contains(text, key) || strings.Contains(text, tc.spelling) {
+				t.Error("key leaked in error text")
 			}
 		})
 	}

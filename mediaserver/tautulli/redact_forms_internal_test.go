@@ -108,10 +108,11 @@ func TestAPIErrorJSONFormRedaction(t *testing.T) {
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("expected APIError, got %v", err)
 	}
-	for _, text := range []string{apiErr.RawBody, apiErr.Error()} {
-		if strings.Contains(text, key) || strings.Contains(text, escaped) {
-			t.Errorf("key leaked: %s", text)
-		}
+	if want := `{"error":"REDACTED"}`; apiErr.RawBody != want {
+		t.Errorf("body = %q; want %q", apiErr.RawBody, want)
+	}
+	if text := apiErr.Error(); strings.Contains(text, key) || strings.Contains(text, escaped) {
+		t.Error("key leaked in error text")
 	}
 }
 
@@ -217,10 +218,11 @@ func TestAPIErrorPercentVariantRedaction(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			apiErr := percentFormAPIError(t, key, tc.spelling)
-			for _, text := range []string{apiErr.RawBody, apiErr.Error()} {
-				if strings.Contains(text, key) || strings.Contains(text, tc.spelling) {
-					t.Errorf("key leaked: %s", text)
-				}
+			if want := "apikey=REDACTED"; apiErr.RawBody != want {
+				t.Errorf("body = %q; want %q", apiErr.RawBody, want)
+			}
+			if text := apiErr.Error(); strings.Contains(text, key) || strings.Contains(text, tc.spelling) {
+				t.Error("key leaked in error text")
 			}
 		})
 	}
