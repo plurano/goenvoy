@@ -13,8 +13,9 @@ from pathlib import Path
 
 PACKAGE = re.compile(rb"^[ \t]*package[ \t]+")
 WRAPPER = re.compile(rb"^[ \t]*type[ \t]+redactedError[ \t]+struct\b")
-PERCENT_SPAN = re.compile(rb"^func \(c \*Client\) percentSpan\(")
-SCRUB_TEXT = re.compile(rb"^func \(c \*Client\) scrubText\(")
+EXCEPTIONS = {
+    Path("downloadclient/sabnzbd/redact.go"): "Separate legacy redaction implementation.",
+}
 
 
 def read_source(path):
@@ -44,26 +45,24 @@ def compare(reference, baseline, candidate):
             raise ValueError(f"{candidate}:{number}: differs from {reference}")
 
 
-def is_shared_copy(lines):
-    """Identify the shared wrapper and exclude the separate percentSpan implementation."""
-    if not any(WRAPPER.match(line) for _, line in lines):
-        return False
-    # Why: the standalone percentSpan implementation also names its wrapper redactedError.
-    return not any(PERCENT_SPAN.match(line) for _, line in lines) or any(
-        SCRUB_TEXT.match(line) for _, line in lines
-    )
-
-
 def check_parity():
     """Discover redaction copies in the index and compare their working-tree contents."""
-    tracked = subprocess.check_output(
+    raw_paths = subprocess.check_output(
         ["git", "ls-files", "-z", "--", ":(glob)**/redact.go"], timeout=60
     ).split(b"\0")
+    tracked = [Path(os.fsdecode(raw_path)) for raw_path in raw_paths if raw_path]
+    for path in EXCEPTIONS:
+        if path not in tracked:
+            raise ValueError(f"{path}:1: stale exception (path is not tracked)")
+
     copies = {}
-    for raw_path in filter(None, tracked):
-        path = Path(os.fsdecode(raw_path))
+    for path in tracked:
         lines = read_source(path)
-        if is_shared_copy(lines):
+        declares_wrapper = any(WRAPPER.match(line) for _, line in lines)
+        if path in EXCEPTIONS:
+            if not declares_wrapper:
+                raise ValueError(f"{path}:1: stale exception (missing redactedError declaration)")
+        elif declares_wrapper:
             copies[path.parent] = lines
     if len(copies) < 2:
         raise ValueError(f"found {len(copies)} redaction copies; need at least 2")
