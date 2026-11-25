@@ -4,6 +4,8 @@
 // a Newznab-compatible search API plus statistics and history endpoints.
 // Authentication uses an API key passed as a query parameter.
 //
+// Error redaction scans up to 64 nodes each for URL-error recovery and structural inspection, and forwarding visits up to 64 joined errors and 4096 nodes.
+//
 // Usage:
 //
 //	c, err := nzbhydra.New("http://localhost:5076", "your-api-key")

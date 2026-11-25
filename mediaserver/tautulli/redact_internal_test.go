@@ -32,7 +32,7 @@ func (redactTimeout) Timeout() bool { return true }
 // TestRequestRedaction checks transport, timeout, and status error sanitization.
 func TestRequestRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "fixture-k+y/=1"
+	const key = "fixture-key42"
 	sentinel := errors.New("fixture transport failure")
 	sensitive := fmt.Errorf("raw %s escaped %s: %w", key, url.QueryEscape(key), sentinel)
 	cases := []struct {
@@ -57,11 +57,11 @@ func TestRequestRedaction(t *testing.T) {
 // TestAPIErrorResultRedaction checks key sanitization in HTTP 200 error envelopes.
 func TestAPIErrorResultRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "fixture-k+y/=1"
+	const key = "fixture-key42"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		body := fmt.Sprintf(`{"response":{"result":"error","message":"%s %s","data":null}}`, key, url.QueryEscape(key))
+		body := fmt.Sprintf(`{"response":{"result":"error","message":"upstream refused %s; try again","data":null}}`, key)
 		if _, err := io.Copy(w, strings.NewReader(body)); err != nil {
 			t.Errorf("tautulli test: write API error result response: %v", err)
 		}
@@ -82,10 +82,8 @@ func TestAPIErrorResultRedaction(t *testing.T) {
 	if apiErr.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want HTTP 200", apiErr.StatusCode)
 	}
-	for _, text := range []string{apiErr.Error(), apiErr.RawBody} {
-		if strings.Contains(text, key) || strings.Contains(text, url.QueryEscape(key)) {
-			t.Errorf("key leaked: %s", text)
-		}
+	if apiErr.RawBody != "upstream refused REDACTED; try again" {
+		t.Error("envelope body did not preserve the message around the redaction marker")
 	}
 }
 
@@ -293,15 +291,19 @@ func assertSentinel(t *testing.T, got, sentinel error) {
 // TestNewRedaction checks constructor errors with keys embedded in invalid URLs.
 func TestNewRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "placeholder+k/y=1"
+	const key = "fixture-key42"
+	const escaped = "fixture%2Dkey42"
 	for _, base := range []string{"http://%zz/", "ftp://example.invalid/", "https:///"} {
 		t.Run(base, func(t *testing.T) {
 			t.Parallel()
-			c, err := New(base+"?raw="+key+"&escaped="+url.QueryEscape(key), key)
+			c, err := New(base+"?raw="+key+"&escaped="+escaped, key)
 			if c != nil || err == nil {
 				t.Fatalf("New = %v, %v; want nil client and error", c, err)
 			}
 			assertNoKey(t, err.Error(), key)
+			if strings.Contains(err.Error(), escaped) {
+				t.Error("constructor error leaked the percent-escaped key")
+			}
 		})
 	}
 }
@@ -332,13 +334,13 @@ func TestNewRedactsForeignQueryKey(t *testing.T) {
 // TestNewDropsUserinfo checks that constructor errors return a fixed message and omit userinfo and keys.
 func TestNewDropsUserinfo(t *testing.T) {
 	t.Parallel()
-	const key = "abc:def+xyz"
+	const key = "fixture-userinfo-key"
 	cases := []struct {
 		name, baseURL, secret string
 	}{
-		{name: "password equal to key with query", baseURL: "ftp://user:abc:def+xyz@example.invalid/?apikey=abc:def+xyz", secret: key},
-		{name: "foreign password with query", baseURL: "ftp://user:foreign-pass@example.invalid/?apikey=abc:def+xyz", secret: "foreign-pass"},
-		{name: "parse failure with foreign password", baseURL: "http://user:foreign-pass@%zz/?apikey=abc:def+xyz", secret: "foreign-pass"},
+		{name: "password equal to key with query", baseURL: "ftp://user:fixture-userinfo-key@example.invalid/?apikey=fixture-userinfo-key", secret: key},
+		{name: "foreign password with query", baseURL: "ftp://user:foreign-pass@example.invalid/?apikey=fixture-userinfo-key", secret: "foreign-pass"},
+		{name: "parse failure with foreign password", baseURL: "http://user:foreign-pass@%zz/?apikey=fixture-userinfo-key", secret: "foreign-pass"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -359,7 +361,7 @@ func assertNewDropsUserinfo(t *testing.T, baseURL, key, secret string) {
 	if err.Error() != want {
 		t.Errorf("err.Error() = %q; want %q", err.Error(), want)
 	}
-	for _, sub := range []string{"user", key, secret, "abc%3Adef+xyz", "abc%3adef+xyz"} {
+	for _, sub := range []string{"user", key, secret} {
 		if strings.Contains(err.Error(), sub) {
 			t.Errorf("error leaked %q: %s", sub, err.Error())
 		}
@@ -369,7 +371,7 @@ func assertNewDropsUserinfo(t *testing.T, baseURL, key, secret string) {
 // TestNewOversizedKey checks that an oversized API key does not panic during constructor error scrubbing.
 func TestNewOversizedKey(t *testing.T) {
 	t.Parallel()
-	key := strings.Repeat("k+", 150000)
+	key := strings.Repeat("k~", 150000)
 	cases := []struct {
 		name, baseURL string
 	}{
@@ -571,5 +573,45 @@ func TestRedactErrorFanoutBounded(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("redactError did not return within 2s")
+	}
+}
+
+// TestNewAPIKeyAlphabet covers accepted and rejected API key bytes.
+func TestNewAPIKeyAlphabet(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, key string
+		wantError bool
+	}{
+		{name: "alphanumeric", key: "Fixture9key"},
+		{name: "punctuation boundary", key: "-._~"},
+		{name: "empty"},
+		{name: "space", key: "fixture key", wantError: true},
+		{name: "plus", key: "fixture+key", wantError: true},
+		{name: "percent", key: "fixture%key", wantError: true},
+		{name: "slash", key: "fixture/key", wantError: true},
+		{name: "non-ASCII", key: "fixtureäkey", wantError: true},
+		{name: "invalid UTF-8", key: "fixture\xffkey", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := New("http://localhost", tc.key)
+			if tc.wantError {
+				assertInvalidAPIKey(t, c, err)
+				return
+			}
+			if err != nil || c == nil || c.apiKey != tc.key {
+				t.Error("New did not retain an allowed key")
+			}
+		})
+	}
+}
+
+// assertInvalidAPIKey checks the fixed diagnostic without printing the rejected input.
+func assertInvalidAPIKey(t *testing.T, c *Client, err error) {
+	t.Helper()
+	const invalid = "tautulli: invalid API key: only letters, digits and - . _ ~ allowed"
+	if c != nil || err == nil || err.Error() != invalid {
+		t.Error("New did not reject the key with the fixed diagnostic")
 	}
 }

@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 PACKAGE = re.compile(rb"^[ \t]*package[ \t]+")
-WRAPPER = re.compile(rb"^[ \t]*type[ \t]+redactedError[ \t]+struct\b")
+WRAPPER = re.compile(rb"\bredactedError\b")
 EXCEPTIONS = {
     Path("downloadclient/sabnzbd/redact.go"): "Separate legacy redaction implementation.",
 }
@@ -48,7 +48,8 @@ def compare(reference, baseline, candidate):
 def check_parity():
     """Discover redaction copies in the index and compare their working-tree contents."""
     raw_paths = subprocess.check_output(
-        ["git", "ls-files", "-z", "--", ":(glob)**/redact.go"], timeout=60
+        ["git", "ls-files", "-z", "--", ":(glob)**/*.go", ":(exclude,glob)**/*_test.go"],
+        timeout=60,
     ).split(b"\0")
     tracked = [Path(os.fsdecode(raw_path)) for raw_path in raw_paths if raw_path]
     for path in EXCEPTIONS:
@@ -58,11 +59,13 @@ def check_parity():
     copies = {}
     for path in tracked:
         lines = read_source(path)
-        declares_wrapper = any(WRAPPER.match(line) for _, line in lines)
+        references_wrapper = any(WRAPPER.search(line) for _, line in lines)
         if path in EXCEPTIONS:
-            if not declares_wrapper:
-                raise ValueError(f"{path}:1: stale exception (missing redactedError declaration)")
-        elif declares_wrapper:
+            if not references_wrapper:
+                raise ValueError(f"{path}:1: stale exception (missing redactedError reference)")
+        elif references_wrapper:
+            if path.name != "redact.go":
+                raise ValueError(f"{path}:1: redactedError reference outside the parity set")
             copies[path.parent] = lines
     if len(copies) < 2:
         raise ValueError(f"found {len(copies)} redaction copies; need at least 2")

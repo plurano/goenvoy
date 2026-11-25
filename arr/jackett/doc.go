@@ -4,6 +4,8 @@
 // *arr applications to tracker site queries.
 // Authentication uses an API key passed as a query parameter.
 //
+// Error redaction scans up to 64 nodes each for URL-error recovery and structural inspection, and forwarding visits up to 64 joined errors and 4096 nodes.
+//
 // Usage:
 //
 //	c, err := jackett.New("http://localhost:9117", "your-api-key")

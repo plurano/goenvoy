@@ -88,8 +88,8 @@ func TestScrubJSONForm(t *testing.T) {
 // TestAPIErrorJSONFormRedaction checks that a status body holding the JSON-escaped key is scrubbed.
 func TestAPIErrorJSONFormRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "fixture<key"
-	const escaped = `fixture\u003ckey`
+	const key = "fixture-key"
+	const escaped = `fixture\u002dkey`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		if _, err := io.Copy(w, strings.NewReader(`{"error":"`+escaped+`"}`)); err != nil {
@@ -109,7 +109,7 @@ func TestAPIErrorJSONFormRedaction(t *testing.T) {
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("expected APIError, got %v", err)
 	}
-	if want := `{"error":"REDACTED"}`; apiErr.Body != want {
+	if want := "REDACTED"; apiErr.Body != want {
 		t.Errorf("body = %q; want %q", apiErr.Body, want)
 	}
 	if text := apiErr.Error(); strings.Contains(text, key) || strings.Contains(text, escaped) {
@@ -236,17 +236,17 @@ func TestKeyFormsDistinct(t *testing.T) {
 // TestAPIErrorPercentVariantRedaction checks that a status body holding a lower-, upper-, or mixed-case percent-hex key is scrubbed.
 func TestAPIErrorPercentVariantRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "fixture+k/y=1"
+	const key = "fixture-key~1"
 	cases := []struct{ name, spelling string }{
-		{name: "lower-case hex", spelling: "fixture%2bk%2fy%3d1"},
-		{name: "upper-case hex", spelling: "fixture%2Bk%2Fy%3D1"},
-		{name: "mixed-case hex", spelling: "fixture%2Bk%2fy%3D1"},
+		{name: "lower-case hex", spelling: "fixture%2dkey%7e1"},
+		{name: "upper-case hex", spelling: "fixture%2Dkey%7E1"},
+		{name: "mixed-case hex", spelling: "fixture%2Dkey%7e1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			apiErr := percentFormAPIError(t, key, tc.spelling)
-			if want := "apikey=REDACTED"; apiErr.Body != want {
+			if want := "REDACTED"; apiErr.Body != want {
 				t.Errorf("body = %q; want %q", apiErr.Body, want)
 			}
 			if text := apiErr.Error(); strings.Contains(text, key) || strings.Contains(text, tc.spelling) {
@@ -345,14 +345,14 @@ func assertTemporaryRedacted(t *testing.T, c *Client, cause error, root, want bo
 // TestAPIErrorBodyEscapedForms checks JSON token and plain text redaction through the public client.
 func TestAPIErrorBodyEscapedForms(t *testing.T) {
 	t.Parallel()
-	const key = "fixture/part+token"
+	const key = "fixture-part~token"
 	cases := []struct{ name, body, want string }{
-		{"solidus", `{"error":"fixture\/part+token"}`, `{"error":"REDACTED"}`},
-		{"unicode percent query", `{"error":"apikey=fixture\u00252Fpart\u00252Btoken"}`, "REDACTED"},
-		{"unicode value", `{"error":"fixture\u002fpart+token"}`, "REDACTED"},
-		{"unicode object key", `{"fixture\u002fpart+token":"error"}`, "REDACTED"},
+		{"raw JSON value", `{"error":"fixture-part~token"}`, `{"error":"REDACTED"}`},
+		{"mixed percent and unicode", `{"error":"apikey=fixture%2Dpart\u007etoken"}`, "REDACTED"},
+		{"unicode value", `{"error":"fixture\u002dpart~token"}`, "REDACTED"},
+		{"unicode object key", `{"fixture\u002dpart~token":"error"}`, "REDACTED"},
 		{"unrelated JSON", `{"error":"other"}`, `{"error":"other"}`},
-		{"plain text", "before fixture/part+token after", "before REDACTED after"},
+		{"plain text", "before fixture-part~token after", "before REDACTED after"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -366,9 +366,9 @@ func TestAPIErrorBodyEscapedForms(t *testing.T) {
 func TestAPIErrorBodyMalformedEscapes(t *testing.T) {
 	t.Parallel()
 	cases := []struct{ name, key, body, want string }{
-		{"large number", "fixture/part+token", `{"n":1e1000,"error":"fixture\u002fpart+token"}`, "REDACTED"},
+		{"large number", "fixture-part~token", `{"n":1e1000,"error":"fixture\u002dpart~token"}`, "REDACTED"},
 		{"scrub breaks escape", "b123456", `{"noise":"\b123456","error":"\u0062123456"}`, "REDACTED"},
-		{"large number control", "fixture/part+token", `{"n":1e1000,"error":"none"}`, `{"n":1e1000,"error":"none"}`},
+		{"large number control", "fixture-part~token", `{"n":1e1000,"error":"none"}`, `{"n":1e1000,"error":"none"}`},
 		{"non JSON escaped key", "b123456", `oops \u0062123456`, "REDACTED"},
 		{"surrogate pair", "fixture-key", `{"error":"\ud83d\ude00"}`, `{"error":"\ud83d\ude00"}`},
 		{"lone surrogate", "fixture-key", `{"error":"\ud800"}`, `{"error":"\ud800"}`},
@@ -437,8 +437,8 @@ func assertAPIErrorEscapedBody(t *testing.T, key, body, want string) {
 // TestTransportURLPathKeyRedaction checks URL path redaction after a transport failure.
 func TestTransportURLPathKeyRedaction(t *testing.T) {
 	t.Parallel()
-	const key = `k"y/z 1`
-	const escaped = `k%22y/z%201`
+	const key = "fixture-key"
+	const escaped = "fixture%2dkey"
 	cases := []struct{ name, path string }{
 		{"raw path", key},
 		{"escaped path", escaped},

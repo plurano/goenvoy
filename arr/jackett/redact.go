@@ -12,6 +12,12 @@ import (
 	"unicode/utf16"
 )
 
+// validAPIKey reports whether every byte belongs to the URL-unreserved set.
+func validAPIKey(key string) bool {
+	const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+	return strings.Trim(key, unreserved) == ""
+}
+
 // scrub replaces the raw, query-escaped, path-escaped, Go-quoted, and JSON-escaped API key in s with REDACTED, with hex-digit case of percent escapes ignored.
 func (c *Client) scrub(s string) string {
 	for _, form := range c.keyForms() {
@@ -307,27 +313,18 @@ func (e *redactedError) Error() string { return e.msg }
 
 // Is matches the hidden error without exposing it.
 func (e *redactedError) Is(target error) bool {
-	// Why: a comparable type may contain a dynamically uncomparable value.
-	canCompare := reflect.ValueOf(target).Comparable()
-	found := false
-	e.walk(func(node error) walkAction {
-		if canCompare && node == target {
-			found = true
-		} else if m, ok := node.(interface{ Is(error) bool }); ok && m.Is(target) {
-			found = true
-		}
-		if found {
+	return e.walk(target, func(node error) walkAction {
+		if m, ok := node.(interface{ Is(error) bool }); ok && m.Is(target) {
 			return walkStop
 		}
 		return walkDescend
 	})
-	return found
 }
 
 // Timeout reports whether the underlying error timed out.
 func (e *redactedError) Timeout() bool {
 	reported := false
-	e.walk(func(node error) walkAction {
+	e.walk(nil, func(node error) walkAction {
 		if _, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies through its cause only
 			return walkCauseOnly
 		}
@@ -349,7 +346,7 @@ func (e *redactedError) Timeout() bool {
 // Temporary reports whether the hidden error is temporary.
 func (e *redactedError) Temporary() bool {
 	reported := false
-	e.walk(func(node error) walkAction {
+	e.walk(nil, func(node error) walkAction {
 		if _, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies through its cause only
 			return walkCauseOnly
 		}
@@ -377,9 +374,13 @@ const (
 )
 
 // walk visits the hidden tree depth-first in errors.Is order, with shared limits on steps and joins.
-func (e *redactedError) walk(visit func(error) walkAction) {
+func (e *redactedError) walk(target error, visit func(error) walkAction) bool {
 	if isNilError(e.err) {
-		return
+		return false
+	}
+	// Why: a comparable type may contain a dynamically uncomparable value.
+	if !reflect.ValueOf(target).Comparable() {
+		target = nil
 	}
 	stack := [][]error{{e.err}}
 	for steps, joins := 0, 0; steps < maxWalkSteps && len(stack) > 0; steps++ {
@@ -388,19 +389,20 @@ func (e *redactedError) walk(visit func(error) walkAction) {
 		joined, isJoin := node.(interface{ Unwrap() []error })
 		if isJoin {
 			if joins == maxErrNodes {
-				return
+				return false
 			}
 			joins++
 		}
-		switch visitWalkNode(node, visit) {
+		switch visitWalkNode(node, target, visit) {
 		case walkStop:
-			return
+			return true
 		case walkCauseOnly:
 			stack = stack[:0]
 		case walkDescend:
 		}
 		stack = appendWalkChildren(stack, node, joined, maxWalkSteps-steps-1)
 	}
+	return false
 }
 
 // appendWalkChildren schedules children and drops siblings beyond a clipped join.
@@ -416,8 +418,11 @@ func appendWalkChildren(stack [][]error, node error, joined interface{ Unwrap() 
 	return stack
 }
 
-// visitWalkNode descends through a nested redacted error without starting a second walk.
-func visitWalkNode(node error, visit func(error) walkAction) walkAction {
+// visitWalkNode checks identity before skipping method calls on nested redacted errors.
+func visitWalkNode(node, target error, visit func(error) walkAction) walkAction {
+	if target != nil && node == target { //nolint:errorlint // compare this node without starting another traversal
+		return walkStop
+	}
 	if _, hidden := node.(*redactedError); hidden { //nolint:errorlint // only this node is tested
 		return walkDescend
 	}
@@ -650,7 +655,7 @@ func (c *Client) redactError(err error) error {
 		// Why: a copy never mutates an error value net/http or a custom transport may share.
 		cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(c.scrub(uerr.URL)))
 		if cleanOp != uerr.Op || cleanURL != uerr.URL || (uerr.Err != nil && c.carriesKey(uerr.Err)) {
-			err = &url.Error{Op: cleanOp, URL: cleanURL, Err: c.scrubError(uerr.Err)}
+			err = &url.Error{Op: cleanOp, URL: cleanURL, Err: c.hideCause(uerr.Err)}
 		}
 	}
 	return c.scrubError(err)

@@ -9,7 +9,8 @@ SUT=(bash "${1:-$HERE/redact-parity.sh}")
 for name in "${!GIT_@}"; do
   unset "$name"
 done
-# shellcheck source=tools/testlib.sh
+# Why: this script resolves the checked-in helper relative to its own path at runtime.
+# shellcheck source=tools/testlib.sh disable=SC1091
 . "$HERE/testlib.sh"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
@@ -62,6 +63,16 @@ expect_refusal 'test drift at the final newline' 'second/redact_as_internal_test
 printf 'package beta\n\n// Traversal tests.\n' >second/redact_as_internal_test.go
 printf 'package standalone\n\ntype redactedError struct{}\n' >"$exception"
 expect_output 'tracked exception excluded by path' 'redact-parity: 3 redaction copies match' "${SUT[@]}"
+
+printf 'package gamma\n\ntype (\n  redactedError struct{}\n)\n' >third/redact.go
+grouped_rc=0
+grouped_output="$("${SUT[@]}" 2>&1)" || grouped_rc=$?
+if [[ $grouped_rc -ne 1 || $grouped_output != *'third/redact.go:3: differs'* ]]; then
+  printf 'FAIL grouped declaration drift: checker rc=%d\n%s\n' "$grouped_rc" "$grouped_output" >&2
+  exit 1
+fi
+echo "ok   grouped declaration drift: refused (checker rc=$grouped_rc)"
+printf 'package gamma\n\n%s\n' "$shared_source" >third/redact.go
 
 printf 'package standalone\n' >"$exception"
 expect_refusal 'exception without wrapper' "$exception:1: stale exception" "${SUT[@]}"

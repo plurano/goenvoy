@@ -46,6 +46,7 @@ type Client struct {
 
 // New creates a Tautulli [Client] for the instance at baseURL with the given API key.
 // It returns an error if baseURL is not a valid HTTP/HTTPS URL.
+// API keys may be empty or use only ASCII letters, digits, and - . _ ~.
 func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 
@@ -55,6 +56,11 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("tautulli: invalid base URL: must be http(s) with a host")
+	}
+
+	// Why: URL key spellings reduce to literal or percent-escaped unreserved bytes that the redactor already covers.
+	if !validAPIKey(apiKey) {
+		return nil, errors.New("tautulli: invalid API key: only letters, digits and - . _ ~ allowed")
 	}
 
 	c := &Client{

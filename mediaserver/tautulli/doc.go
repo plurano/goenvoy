@@ -9,6 +9,8 @@
 // All requests require an API key, which can be found in
 // Tautulli Settings → Web Interface → API key.
 //
+// Error redaction scans up to 64 nodes each for URL-error recovery and structural inspection, and forwarding visits up to 64 joined errors and 4096 nodes.
+//
 // # Usage
 //
 //	client, err := tautulli.New("http://localhost:8181", "your-api-key")

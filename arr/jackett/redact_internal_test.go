@@ -90,7 +90,7 @@ func TestRedactURLUnparseable(t *testing.T) {
 func TestDoRequestCreateRequestRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
-	const key = `s3cr3t+key/=&x`
+	const key = "fixture-key42"
 	c, err := New("http://127.0.0.1:9117", key)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -269,11 +269,11 @@ func TestRedactURLErrorNonURLError(t *testing.T) {
 // TestNewDropsUserinfo checks that constructor errors return a fixed message and omit userinfo and keys.
 func TestNewDropsUserinfo(t *testing.T) {
 	t.Parallel()
-	const key = "abc:def+xyz"
+	const key = "fixture-userinfo-key"
 	cases := []struct {
 		name, baseURL, secret string
 	}{
-		{name: "password equal to key", baseURL: "ftp://user:abc:def+xyz@example.invalid", secret: key},
+		{name: "password equal to key", baseURL: "ftp://user:fixture-userinfo-key@example.invalid", secret: key},
 		{name: "foreign password", baseURL: "ftp://user:foreign-pass@example.invalid", secret: "foreign-pass"},
 		{name: "parse failure with foreign password", baseURL: "http://user:foreign-pass@%zz/", secret: "foreign-pass"},
 	}
@@ -296,7 +296,7 @@ func assertNewDropsUserinfo(t *testing.T, baseURL, key, secret string) {
 	if err.Error() != want {
 		t.Errorf("err.Error() = %q; want %q", err.Error(), want)
 	}
-	for _, sub := range []string{"user", key, secret, "abc%3Adef+xyz", "abc%3adef+xyz"} {
+	for _, sub := range []string{"user", key, secret} {
 		if strings.Contains(err.Error(), sub) {
 			t.Errorf("error leaked %q: %s", sub, err.Error())
 		}
@@ -306,7 +306,7 @@ func assertNewDropsUserinfo(t *testing.T, baseURL, key, secret string) {
 // TestNewOversizedKey checks that an oversized API key does not panic during constructor error scrubbing.
 func TestNewOversizedKey(t *testing.T) {
 	t.Parallel()
-	key := strings.Repeat("k+", 150000)
+	key := strings.Repeat("k~", 150000)
 	cases := []struct {
 		name, baseURL string
 	}{
@@ -507,5 +507,45 @@ func TestRedactErrorFanoutBounded(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("redactError did not return within 2s")
+	}
+}
+
+// TestNewAPIKeyAlphabet covers accepted and rejected API key bytes.
+func TestNewAPIKeyAlphabet(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, key string
+		wantError bool
+	}{
+		{name: "alphanumeric", key: "Fixture9key"},
+		{name: "punctuation boundary", key: "-._~"},
+		{name: "empty"},
+		{name: "space", key: "fixture key", wantError: true},
+		{name: "plus", key: "fixture+key", wantError: true},
+		{name: "percent", key: "fixture%key", wantError: true},
+		{name: "slash", key: "fixture/key", wantError: true},
+		{name: "non-ASCII", key: "fixtureäkey", wantError: true},
+		{name: "invalid UTF-8", key: "fixture\xffkey", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := New("http://localhost", tc.key)
+			if tc.wantError {
+				assertInvalidAPIKey(t, c, err)
+				return
+			}
+			if err != nil || c == nil || c.apiKey != tc.key {
+				t.Error("New did not retain an allowed key")
+			}
+		})
+	}
+}
+
+// assertInvalidAPIKey checks the fixed diagnostic without printing the rejected input.
+func assertInvalidAPIKey(t *testing.T, c *Client, err error) {
+	t.Helper()
+	const invalid = "jackett: invalid API key: only letters, digits and - . _ ~ allowed"
+	if c != nil || err == nil || err.Error() != invalid {
+		t.Error("New did not reject the key with the fixed diagnostic")
 	}
 }

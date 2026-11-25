@@ -406,7 +406,7 @@ func TestRedactedErrorWalkJoinBudget(t *testing.T) {
 			}
 			var visits int
 			var last error
-			(&redactedError{err: tree}).walk(func(node error) walkAction {
+			(&redactedError{err: tree}).walk(nil, func(node error) walkAction {
 				visits++
 				last = node
 				return walkDescend
@@ -806,5 +806,88 @@ func TestRedactedErrorWalkQueueOverflow(t *testing.T) {
 	got := (&Client{}).scrubError(errors.Join(children...))
 	if got.Error() != redactedTreeMsg {
 		t.Errorf("scrubError = %q; want %q", got.Error(), redactedTreeMsg)
+	}
+}
+
+// rootURLFieldError keeps fixture data in a field separate from its message.
+type rootURLFieldError struct{ Key string }
+
+// Error returns a message independent of the fixture data.
+func (*rootURLFieldError) Error() string { return "fixture transport failure" }
+
+// TestRedactErrorRootURLHidesCause checks that a copied URL error exposes only an opaque cause.
+func TestRedactErrorRootURLHidesCause(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key"
+	cause := &rootURLFieldError{Key: key}
+	root := &url.Error{Op: "Get", URL: "http://h/?apikey=" + key, Err: cause}
+	c := &Client{apiKey: key}
+
+	err := c.redactError(root)
+	var copied *url.Error
+	if !errors.As(err, &copied) || any(err) != any(copied) || copied == root {
+		t.Fatal("redactError did not return a sanitized root URL error copy")
+	}
+	var leaked *rootURLFieldError
+	if errors.As(err, &leaked) {
+		t.Error("errors.As exposed the original cause type")
+	}
+	if !errors.Is(err, cause) {
+		t.Error("errors.Is did not match the hidden cause")
+	}
+}
+
+// TestRedactErrorRootURLNilCause checks that nil causes stay nil in a URL error copy.
+func TestRedactErrorRootURLNilCause(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key"
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "nil"},
+		{name: "typed nil", err: (*rootURLFieldError)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := &url.Error{Op: "Get", URL: "http://h/?apikey=" + key, Err: tc.err}
+			var copied *url.Error
+			if !errors.As((&Client{apiKey: key}).redactError(root), &copied) || copied == root {
+				t.Fatal("redactError did not return a sanitized URL error copy")
+			}
+			if copied.Err != nil {
+				t.Errorf("copied cause = %T, want nil", copied.Err)
+			}
+		})
+	}
+}
+
+// TestRedactedErrorIsNestedWrapper checks identity at the walk boundary.
+func TestRedactedErrorIsNestedWrapper(t *testing.T) {
+	t.Parallel()
+	target := &redactedError{msg: "fixture nested wrapper", err: errors.New("fixture cause")}
+	other := &redactedError{msg: target.msg, err: target.err}
+	for _, tc := range []struct {
+		name  string
+		depth int
+		want  bool
+	}{
+		{name: "last visited node", depth: maxWalkSteps - 1, want: true},
+		{name: "first node past budget", depth: maxWalkSteps},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var node error = target
+			for range tc.depth {
+				node = &redactCycleErr{next: node}
+			}
+			tree := &redactedError{err: node}
+			if got := errors.Is(tree, target); got != tc.want {
+				t.Errorf("errors.Is with nested wrapper = %v, want %v", got, tc.want)
+			}
+			if errors.Is(tree, other) {
+				t.Error("errors.Is matched a different wrapper with the same contents")
+			}
+		})
 	}
 }
