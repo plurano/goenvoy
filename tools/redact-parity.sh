@@ -13,6 +13,15 @@ from pathlib import Path
 
 PACKAGE = re.compile(rb"^[ \t]*package[ \t]+")
 WRAPPER = re.compile(rb"\bredactedError\b")
+GO_NON_CODE = re.compile(
+    rb"""//[^\n]*|/\*.*?\*/|`[^`]*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'""",
+    re.DOTALL,
+)
+WRAPPER_NAME = rb"redactedError(?![A-Za-z_0-9\x80-\xff])"
+WRAPPER_TYPE = re.compile(rb"^[ \t]*type[ \t]+" + WRAPPER_NAME)
+TYPE_GROUP = re.compile(rb"^[ \t]*type[ \t]*\(")
+GROUPED_WRAPPER = re.compile(rb"^[ \t]*" + WRAPPER_NAME + rb"(?=[ \t]*[^ \t);])")
+DELIMITER = re.compile(rb"[(){}\[\]]")
 EXCEPTIONS = {
     Path("downloadclient/sabnzbd/redact.go"): "Separate legacy redaction implementation.",
 }
@@ -45,6 +54,26 @@ def compare(reference, baseline, candidate):
             raise ValueError(f"{candidate}:{number}: differs from {reference}")
 
 
+def declares_wrapper(lines):
+    """Find the wrapper's type spec after masking comments and literals."""
+    source = b"".join(line for _, line in lines)
+    source = GO_NON_CODE.sub(lambda match: re.sub(rb"[^\n]", b" ", match[0]), source)
+    depth = 0
+    for line in source.splitlines():
+        if depth == 0:
+            if WRAPPER_TYPE.match(line):
+                return True
+            group = TYPE_GROUP.match(line)
+            if group is None:
+                continue
+            depth = 1
+            line = line[group.end():]
+        if depth == 1 and GROUPED_WRAPPER.match(line):
+            return True
+        depth += sum(1 if token in b"([{" else -1 for token in DELIMITER.findall(line))
+    return False
+
+
 def check_parity():
     """Discover redaction copies in the index and compare their working-tree contents."""
     raw_paths = subprocess.check_output(
@@ -59,11 +88,10 @@ def check_parity():
     copies = {}
     for path in tracked:
         lines = read_source(path)
-        references_wrapper = any(WRAPPER.search(line) for _, line in lines)
         if path in EXCEPTIONS:
-            if not references_wrapper:
-                raise ValueError(f"{path}:1: stale exception (missing redactedError reference)")
-        elif references_wrapper:
+            if not declares_wrapper(lines):
+                raise ValueError(f"{path}:1: stale exception (missing redactedError declaration)")
+        elif any(WRAPPER.search(line) for _, line in lines):
             if path.name != "redact.go":
                 raise ValueError(f"{path}:1: redactedError reference outside the parity set")
             copies[path.parent] = lines

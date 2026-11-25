@@ -549,3 +549,13 @@ func assertInvalidAPIKey(t *testing.T, c *Client, err error) {
 		t.Error("New did not reject the key with the fixed diagnostic")
 	}
 }
+
+// TestResponseReadHidesCustomFormatter checks the error returned to callers when reading the body fails.
+func TestResponseReadHidesCustomFormatter(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	sentinel := errors.New("fixture read failure")
+	c := newFormatterResponseClient(t, key, sentinel)
+	_, err := c.GetIndexers(t.Context())
+	assertFormatterRedacted(t, err, sentinel, key)
+}

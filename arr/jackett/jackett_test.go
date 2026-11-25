@@ -1142,14 +1142,8 @@ func TestAPIErrorBodyRedactsAPIKey(t *testing.T) {
 	if apiErr.StatusCode != http.StatusInternalServerError {
 		t.Errorf("StatusCode = %d, want 500", apiErr.StatusCode)
 	}
-	if !strings.Contains(apiErr.Body, "REDACTED") {
-		t.Errorf("apiErr.Body missing REDACTED: %q", apiErr.Body)
-	}
-	if strings.Contains(apiErr.Body, secretKey) {
-		t.Errorf("apiErr.Body leaked raw key: %q", apiErr.Body)
-	}
-	if strings.Contains(apiErr.Body, url.QueryEscape(secretKey)) {
-		t.Errorf("apiErr.Body leaked escaped key: %q", apiErr.Body)
+	if want := "bad request /api/v2.0/indexers?apikey=REDACTED&configured=true key=REDACTED"; apiErr.Body != want {
+		t.Errorf("apiErr.Body = %q, want %q", apiErr.Body, want)
 	}
 	errMsg := err.Error()
 	if strings.Contains(errMsg, secretKey) {

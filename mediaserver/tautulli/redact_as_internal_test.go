@@ -3,7 +3,9 @@ package tautulli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
@@ -11,6 +13,194 @@ import (
 	"testing"
 	"time"
 )
+
+type redactFixtureFormatter struct {
+	cause error
+	text  string
+}
+
+// Error returns key-free text.
+func (e *redactFixtureFormatter) Error() string { return e.cause.Error() }
+
+// Unwrap returns the fixture cause.
+func (e *redactFixtureFormatter) Unwrap() error { return e.cause }
+
+// Format prints the fixture's separate formatting text for %v and %+v.
+func (e *redactFixtureFormatter) Format(f fmt.State, verb rune) {
+	text := e.Error()
+	if verb == 'v' {
+		text = e.text
+	}
+	if _, err := io.WriteString(f, text); err != nil {
+		return
+	}
+}
+
+type redactFormatterBody struct{ cause error }
+
+// Read returns the fixture formatting error.
+func (b redactFormatterBody) Read([]byte) (int, error) { return 0, b.cause }
+
+// Close closes the fixture body.
+func (redactFormatterBody) Close() error { return nil }
+
+// RoundTrip returns a response with a failing body without sending a request.
+func (b redactFormatterBody) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: b, Request: req}, nil
+}
+
+// newFormatterResponseClient creates a client whose response body returns a custom formatter error.
+func newFormatterResponseClient(t *testing.T, key string, cause error) *Client {
+	t.Helper()
+	transport := redactFormatterBody{cause: &redactFixtureFormatter{cause: cause, text: key}}
+	c, err := New("http://127.0.0.1", key, WithHTTPClient(&http.Client{Transport: transport}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return c
+}
+
+// assertFormatterRedacted checks formatting, sentinel identity, and formatter opacity.
+func assertFormatterRedacted(t *testing.T, got, sentinel error, key string) {
+	t.Helper()
+	if got == nil {
+		t.Fatal("expected a sanitized error")
+	}
+	assertNoKeyForms(t, fmt.Sprintf("%v", got), key)
+	assertNoKeyForms(t, fmt.Sprintf("%+v", got), key)
+	if !errors.Is(got, sentinel) {
+		t.Error("errors.Is did not reach the sentinel")
+	}
+	var exposed *redactFixtureFormatter
+	if errors.As(got, &exposed) {
+		t.Error("errors.As exposed the original formatter")
+	}
+}
+
+// TestScrubErrorHidesCustomFormatter checks root and nested formatters even when Error omits the key.
+func TestScrubErrorHidesCustomFormatter(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key+42/"
+	c := &Client{apiKey: key}
+	sentinel := errors.New("fixture read failure")
+	unsafeFormatter := &redactFixtureFormatter{cause: sentinel, text: url.QueryEscape(key)}
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"root formatter", unsafeFormatter},
+		{"nested formatter", errors.Join(errors.New("fixture sibling"), unsafeFormatter)},
+		{"key-free formatter", &redactFixtureFormatter{cause: sentinel, text: "fixture plain formatting"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertFormatterRedacted(t, c.scrubError(tc.err), sentinel, key)
+		})
+	}
+}
+
+type redactFixtureCause struct{ error }
+
+// Unwrap returns the fixture sentinel.
+func (e redactFixtureCause) Unwrap() error { return e.error }
+
+type redactTimeoutCause struct{ redactFixtureCause }
+
+// Timeout reports whether this fixture is non-nil.
+func (e *redactTimeoutCause) Timeout() bool { return e != nil }
+
+type redactTemporaryCause struct{ redactFixtureCause }
+
+// Temporary reports that the fixture is temporary.
+func (redactTemporaryCause) Temporary() bool { return true }
+
+// TestSanitizedURLCopyClassifiesImmediateCause compares both URL-copy paths with the original URL error.
+func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	sentinel := errors.New("fixture DNS failure")
+	timeout := &net.DNSError{UnwrapErr: sentinel, IsTimeout: true, IsTemporary: true}
+	c := &Client{apiKey: key}
+	cases := []struct {
+		name  string
+		cause error
+	}{
+		{"ordinary wrapper", fmt.Errorf("fixture wrapper: %w", timeout)},
+		{"DNS error", timeout},
+		{"timeout only", &redactTimeoutCause{redactFixtureCause{sentinel}}},
+		{"temporary only", redactTemporaryCause{redactFixtureCause{sentinel}}},
+		{"nil", nil},
+		{"typed nil", (*redactTimeoutCause)(nil)},
+		{"redacted cause", &redactedError{err: timeout, msg: "fixture hidden cause"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			original := &url.Error{Op: "Get", URL: "http://fixture.invalid/" + key, Err: tc.cause}
+			t.Run("As", func(t *testing.T) {
+				t.Parallel()
+				assertURLCopyClassifies(t, c.scrubError(errors.Join(original)), original, sentinel)
+			})
+			t.Run("redactError", func(t *testing.T) {
+				t.Parallel()
+				assertURLCopyClassifies(t, c.redactError(original), original, sentinel)
+			})
+		})
+	}
+}
+
+// assertURLCopyClassifies checks classification and sentinel identity through a sanitized copy.
+func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, sentinel error) {
+	t.Helper()
+	var copyErr *url.Error
+	if !errors.As(got, &copyErr) || copyErr == original {
+		t.Fatalf("expected a sanitized URL error copy, got %T", got)
+	}
+	if isNilError(original.Err) {
+		if copyErr.Err != nil {
+			t.Error("copy retained a nil or typed-nil cause")
+		}
+	} else if !errors.Is(copyErr, sentinel) {
+		t.Error("errors.Is through the copy did not reach the sentinel")
+	}
+	fallback := &net.DNSError{IsTimeout: true, IsTemporary: true}
+	nested := &redactedError{err: errors.Join(copyErr, fallback)}
+	if want := original.Timeout(); copyErr.Timeout() != want || nested.Timeout() != want {
+		t.Errorf("Timeout: copy=%v nested=%v original=%v", copyErr.Timeout(), nested.Timeout(), want)
+	}
+	if want := original.Temporary(); copyErr.Temporary() != want || nested.Temporary() != want {
+		t.Errorf("Temporary: copy=%v nested=%v original=%v", copyErr.Temporary(), nested.Temporary(), want)
+	}
+}
+
+// TestAcceptedKeyForms checks that an accepted API key only needs literal matching.
+func TestAcceptedKeyForms(t *testing.T) {
+	t.Parallel()
+	const key = "Fixture-0._~"
+	c, err := New("http://127.0.0.1", key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := c.keyForms(); !slices.Equal(got, []string{key}) {
+		t.Errorf("keyForms returned %d forms; want exactly the original key", len(got))
+	}
+	if got := len(c.percentForms()); got != 0 {
+		t.Errorf("percentForms returned %d forms; want 0", got)
+	}
+}
+
+// TestAcceptedKeyScrubAllocations bounds the cost of scrubbing key-free text.
+func TestAcceptedKeyScrubAllocations(t *testing.T) { //nolint:paralleltest // AllocsPerRun requires serial execution.
+	const text = "fixture text without a match"
+	short := &Client{apiKey: strings.Repeat("Z", 8)}
+	long := &Client{apiKey: strings.Repeat("Z", 256)}
+	shortAllocs := testing.AllocsPerRun(100, func() { _ = short.scrub(text) })
+	longAllocs := testing.AllocsPerRun(100, func() { _ = long.scrub(text) })
+	if shortAllocs > 1 || longAllocs > shortAllocs {
+		t.Errorf("scrub allocations: 8-byte key=%g, 256-byte key=%g; want at most 1 with no growth", shortAllocs, longAllocs)
+	}
+}
 
 // redactAsProbe is a second error type in the tree, used to prove As answers only a URL error target.
 type redactAsProbe struct{ text string }

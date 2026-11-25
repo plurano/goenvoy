@@ -4,6 +4,9 @@
 // Authentication uses an API key passed as a query parameter.
 //
 // Error redaction scans up to 64 nodes each for URL-error recovery and structural inspection, and forwarding visits up to 64 joined errors and 4096 nodes.
+// Error trees with custom formatters expose only their sanitized message.
+// Sanitized URL error copies classify timeouts and temporary failures using the original immediate cause's methods.
+// Nil and typed-nil URL causes become nil in the copy.
 //
 // Usage:
 //

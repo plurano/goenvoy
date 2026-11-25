@@ -76,3 +76,9 @@ printf 'package gamma\n\n%s\n' "$shared_source" >third/redact.go
 
 printf 'package standalone\n' >"$exception"
 expect_refusal 'exception without wrapper' "$exception:1: stale exception" "${SUT[@]}"
+
+printf 'package standalone\n\n// redactedError was here\n' >"$exception"
+expect_refusal 'exception with only a wrapper comment' "$exception:1: stale exception" "${SUT[@]}"
+
+printf 'package standalone\n\ntype (\n  redactedError struct{}\n)\n' >"$exception"
+expect_output 'grouped declaration keeps the exception' 'redact-parity: 3 redaction copies match' "${SUT[@]}"

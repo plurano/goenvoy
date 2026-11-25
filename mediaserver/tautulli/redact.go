@@ -179,6 +179,10 @@ func (c *Client) keyForms() []string {
 	if c.apiKey == "" {
 		return nil
 	}
+	// Why: every escaped spelling of an unreserved key is the literal key.
+	if validAPIKey(c.apiKey) {
+		return []string{c.apiKey}
+	}
 	quoted := strconv.Quote(c.apiKey)
 	query, path := url.QueryEscape(c.apiKey), url.PathEscape(c.apiKey)
 	candidates := []string{c.apiKey, query, path, (&url.URL{Path: c.apiKey}).EscapedPath(), quoted[1 : len(quoted)-1]}
@@ -201,7 +205,7 @@ func (c *Client) keyForms() []string {
 
 // percentForms prepares the distinct query, path, and URL-path spellings in matching order.
 func (c *Client) percentForms() []percentForm {
-	if c.apiKey == "" {
+	if validAPIKey(c.apiKey) {
 		return nil
 	}
 	candidates := []string{url.QueryEscape(c.apiKey), url.PathEscape(c.apiKey), (&url.URL{Path: c.apiKey}).EscapedPath()}
@@ -331,6 +335,10 @@ func (e *redactedError) Error() string { return e.msg }
 // Is matches the hidden error without exposing it.
 func (e *redactedError) Is(target error) bool {
 	return e.walk(target, func(node error) walkAction {
+		// Why: visit nested wrappers within this walk's budget.
+		if hiddenRedaction(node) != nil {
+			return walkDescend
+		}
 		if m, ok := node.(interface{ Is(error) bool }); ok && m.Is(target) {
 			return walkStop
 		}
@@ -458,9 +466,11 @@ func walkChildren(node error, joined interface{ Unwrap() []error }, remaining in
 		children, clipped := boundedJoinChildren(joined, remaining)
 		return trimNilErrors(children), clipped
 	}
-	child := errors.Unwrap(node)
-	if hidden, ok := node.(*redactedError); ok { //nolint:errorlint // inspect this wrapper's cause directly
+	var child error
+	if hidden := hiddenRedaction(node); hidden != nil {
 		child = hidden.err
+	} else {
+		child = errors.Unwrap(node)
 	}
 	if isNilError(child) {
 		return nil, false
@@ -529,6 +539,48 @@ func (e *redactedError) Format(f fmt.State, verb rune) {
 	}
 }
 
+type opaqueURLCause struct{ hidden *redactedError }
+
+// Error returns the sanitized cause message.
+func (e *opaqueURLCause) Error() string { return e.hidden.Error() }
+
+// Is matches the hidden cause.
+func (e *opaqueURLCause) Is(target error) bool { return e.hidden.Is(target) }
+
+// As recovers a sanitized copy of a hidden URL error.
+func (e *opaqueURLCause) As(target any) bool { return e.hidden.As(target) }
+
+// Format prints only the sanitized cause message.
+func (e *opaqueURLCause) Format(f fmt.State, verb rune) { e.hidden.Format(f, verb) }
+
+type classifiedURLCause struct{ opaqueURLCause }
+
+// Timeout delegates to the original immediate cause's Timeout method.
+func (e *classifiedURLCause) Timeout() bool {
+	t, ok := e.hidden.err.(interface{ Timeout() bool })
+	return ok && t.Timeout()
+}
+
+// Temporary delegates to the original immediate cause's Temporary method.
+func (e *classifiedURLCause) Temporary() bool {
+	t, ok := e.hidden.err.(interface{ Temporary() bool })
+	return ok && t.Temporary()
+}
+
+// hiddenRedaction returns the package-owned wrapper behind node, if any.
+func hiddenRedaction(node error) *redactedError {
+	switch e := node.(type) { //nolint:errorlint // inspect only this node's type
+	case *redactedError:
+		return e
+	case *opaqueURLCause:
+		return e.hidden
+	case *classifiedURLCause:
+		return e.hidden
+	default:
+		return nil
+	}
+}
+
 // maxErrNodes bounds the error tree walk in carriesKey and the joined-error budget in walk.
 const maxErrNodes = 64
 
@@ -538,7 +590,7 @@ const maxWalkSteps = 4096
 // redactedTreeMsg is the replacement message when an error tree exceeds maxErrNodes.
 const redactedTreeMsg = "error tree too large: details redacted"
 
-// scrubError hides error trees that carry the API key or exceed the traversal limit.
+// scrubError hides error trees that carry the API key, contain custom formatters, or exceed the traversal limit.
 func (c *Client) scrubError(err error) error {
 	carry, tooLarge := c.checkErrorTree(err)
 	if !carry {
@@ -550,24 +602,31 @@ func (c *Client) scrubError(err error) error {
 	return &redactedError{msg: c.scrubText(err.Error()), err: err, key: c.apiKey}
 }
 
-// hideCause wraps a recovered URL error cause in an opaque error with no Unwrap method.
+// hideCause wraps a URL error's immediate cause and preserves its classification results.
 func (c *Client) hideCause(err error) error {
 	if isNilError(err) {
 		return nil
 	}
-	if _, tooLarge := c.checkErrorTree(err); tooLarge {
-		return &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
+	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
+	if _, tooLarge := c.checkErrorTree(err); !tooLarge {
+		hidden.msg = c.scrubText(err.Error())
 	}
-	return &redactedError{msg: c.scrubText(err.Error()), err: err, key: c.apiKey}
+	cause := opaqueURLCause{hidden: hidden}
+	_, timesOut := err.(interface{ Timeout() bool })
+	_, temporary := err.(interface{ Temporary() bool })
+	if timesOut || temporary {
+		return &classifiedURLCause{opaqueURLCause: cause}
+	}
+	return &cause
 }
 
-// carriesKey reports whether an error tree contains the API key or exceeds the node limit.
+// carriesKey reports whether an error tree needs redaction.
 func (c *Client) carriesKey(err error) bool {
 	carry, _ := c.checkErrorTree(err)
 	return carry
 }
 
-// checkErrorTree reports whether err carries the API key, a typed-nil node, or exceeds maxErrNodes, and whether its Error method is unsafe to call.
+// checkErrorTree reports whether err needs redaction and whether its Error method is unsafe to call.
 func (c *Client) checkErrorTree(err error) (bool, bool) {
 	if err == nil {
 		return false, false
@@ -585,15 +644,19 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 		}
 	}
 	for _, node := range queue {
-		if c.errorNodeContainsKey(node) {
+		if c.errorNodeNeedsRedaction(node) {
 			return true, false
 		}
 	}
 	return false, false
 }
 
-// errorNodeContainsKey checks URL fields directly before checking the formatted error text.
-func (c *Client) errorNodeContainsKey(node error) bool {
+// errorNodeNeedsRedaction checks custom formatting, URL fields, and error text.
+func (c *Client) errorNodeNeedsRedaction(node error) bool {
+	// Why: custom formatters can print text beyond Error's result.
+	if _, formats := node.(fmt.Formatter); formats && hiddenRedaction(node) == nil {
+		return true
+	}
 	if uerr, ok := node.(*url.Error); ok && (c.containsKey(uerr.Op) || c.containsKey(uerr.URL)) { //nolint:errorlint // inspect only this node's fields
 		return true
 	}
