@@ -1,7 +1,6 @@
 package jackett
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -18,95 +17,100 @@ func validAPIKey(key string) bool {
 	return strings.Trim(key, unreserved) == ""
 }
 
-// scrub replaces the raw, query-escaped, path-escaped, Go-quoted, and JSON-escaped API key in s with REDACTED, with hex-digit case of percent escapes ignored.
+// scrub replaces the literal API key in s with REDACTED.
 func (c *Client) scrub(s string) string {
-	for _, form := range c.keyForms() {
-		s = strings.ReplaceAll(s, form, "REDACTED")
-	}
-	forms := c.percentForms()
-	start, end := nextPercentKey(s, 0, forms)
-	if start < 0 {
+	if c.apiKey == "" {
 		return s
 	}
-	var b strings.Builder
-	// Why: reserve space up front to avoid repeated growth across matches.
-	b.Grow(len(s))
-	offset := 0
-	for steps := 0; steps < len(s) && start >= 0; steps++ {
-		b.WriteString(s[offset:start])
-		b.WriteString("REDACTED")
-		offset = end
-		start, end = nextPercentKey(s, offset, forms)
-	}
-	b.WriteString(s[offset:])
-	return b.String()
+	return strings.ReplaceAll(s, c.apiKey, "REDACTED")
 }
 
-// scrubBody redacts key forms and hides bodies containing an escaped key.
+// scrubBody applies inline and canonical key redaction to a response body.
 func (c *Client) scrubBody(text string) string {
-	text = c.scrubText(text)
-	// Why: retain detection of key forms with the percent sign itself escaped as JSON.
-	if c.apiKey != "" && strings.Contains(text, `\`) && c.containsKeyForms(unescapeBody(text)) {
-		return "REDACTED"
-	}
-	return text
+	return c.scrubText(text)
 }
 
 // scrubText applies inline redaction and hides text if decoding still reveals the key.
 func (c *Client) scrubText(text string) string {
 	text = c.scrub(text)
-	if c.containsCanonicalKey(text) {
+	if c.containsKey(text) {
 		return "REDACTED"
 	}
 	return text
 }
 
-// maxDecodePasses bounds repeated decoding of percent and backslash escapes.
+// maxDecodePasses bounds the layers of escape decoding.
 const maxDecodePasses = 4
 
-// containsCanonicalKey reports whether decoding reveals the raw key or reaches the limit while still changing text.
-func (c *Client) containsCanonicalKey(text string) bool {
+// maxDecodeProjections bounds the distinct new texts at each layer.
+const maxDecodeProjections = 16
+
+type escapeKinds uint8
+
+const (
+	percentEscapes escapeKinds = 1 << iota
+	backslashEscapes
+)
+
+// containsKey reports whether text contains the key or escape decoding reaches a bound.
+func (c *Client) containsKey(text string) bool {
 	if c.apiKey == "" {
 		return false
 	}
 	if strings.Contains(text, c.apiKey) {
 		return true
 	}
-	for range maxDecodePasses {
-		if !strings.ContainsAny(text, `%\`) {
-			return false
-		}
-		decoded := decodeEscapes(text, true)
-		if strings.Contains(decoded, c.apiKey) {
+	if !strings.ContainsAny(text, `%\`) {
+		return false
+	}
+	frontier := []string{text}
+	seen := map[string]struct{}{text: {}}
+	for pass := 0; pass < maxDecodePasses && len(frontier) != 0; pass++ {
+		next, redact := c.decodeLayer(frontier, seen)
+		if redact {
 			return true
 		}
-		if decoded == text {
-			return false
-		}
-		text = decoded
+		frontier = next
 	}
-	// Why: changing text at the limit may still conceal the key.
-	return true
+	// Why: a new projection at the depth limit may still conceal the key.
+	return len(frontier) != 0
 }
 
-// unescapeBody decodes recognized backslash escapes while preserving all other bytes.
-func unescapeBody(text string) string {
-	return decodeEscapes(text, false)
+// decodeLayer collects unseen projections and reports a key match or projection overflow.
+func (c *Client) decodeLayer(frontier []string, seen map[string]struct{}) ([]string, bool) {
+	next := make([]string, 0, maxDecodeProjections)
+	for _, text := range frontier {
+		for _, kinds := range [...]escapeKinds{percentEscapes, backslashEscapes, percentEscapes | backslashEscapes} {
+			decoded := decodeEscapes(text, kinds)
+			// Why: the input is already seen, so this also skips unchanged projections.
+			if _, visited := seen[decoded]; visited {
+				continue
+			}
+			if strings.Contains(decoded, c.apiKey) || len(next) == maxDecodeProjections {
+				return nil, true
+			}
+			seen[decoded] = struct{}{}
+			next = append(next, decoded)
+		}
+	}
+	return next, false
 }
 
 // decodeEscapes consumes each recognized escape once and copies all other bytes.
-func decodeEscapes(text string, decodePercent bool) string {
+func decodeEscapes(text string, kinds escapeKinds) string {
 	var out strings.Builder
 	out.Grow(len(text))
 	for i := 0; i < len(text); {
 		var size int
 		switch text[i] {
 		case '%':
-			if decodePercent {
+			if kinds&percentEscapes != 0 {
 				size = writePercentEscape(&out, text[i:])
 			}
 		case '\\':
-			size = writeBackslashEscape(&out, text[i:])
+			if kinds&backslashEscapes != 0 {
+				size = writeBackslashEscape(&out, text[i:])
+			}
 		}
 		if size == 0 {
 			out.WriteByte(text[i])
@@ -173,154 +177,6 @@ func bodyHex4(text string) (rune, bool) {
 	return rune(value), err == nil
 }
 
-// keyForms returns the distinct raw, query-escaped, path-escaped, Go-quoted, and JSON-escaped forms of the API key, or nil when the key is empty; hex-digit case of percent escapes is matched by nextPercentKey.
-func (c *Client) keyForms() []string {
-	// Why: ReplaceAll with an empty old inserts at every rune and Contains with an empty key matches every string.
-	if c.apiKey == "" {
-		return nil
-	}
-	// Why: every escaped spelling of an unreserved key is the literal key.
-	if validAPIKey(c.apiKey) {
-		return []string{c.apiKey}
-	}
-	quoted := strconv.Quote(c.apiKey)
-	query, path := url.QueryEscape(c.apiKey), url.PathEscape(c.apiKey)
-	candidates := []string{c.apiKey, query, path, (&url.URL{Path: c.apiKey}).EscapedPath(), quoted[1 : len(quoted)-1]}
-	// Why: encoding/json writes <, >, &, U+2028 and U+2029 as \uXXXX escapes that no other form matches.
-	if b, err := json.Marshal(c.apiKey); err == nil {
-		encoded := string(b[1 : len(b)-1])
-		candidates = append(candidates, encoded)
-		if strings.Contains(c.apiKey, "/") {
-			candidates = append(candidates, strings.ReplaceAll(encoded, "/", `\/`))
-		}
-	}
-	forms := make([]string, 0, len(candidates))
-	for _, form := range candidates {
-		if !slices.Contains(forms, form) {
-			forms = append(forms, form)
-		}
-	}
-	return forms
-}
-
-// percentForms prepares the distinct query, path, and URL-path spellings in matching order.
-func (c *Client) percentForms() []percentForm {
-	if validAPIKey(c.apiKey) {
-		return nil
-	}
-	candidates := []string{url.QueryEscape(c.apiKey), url.PathEscape(c.apiKey), (&url.URL{Path: c.apiKey}).EscapedPath()}
-	forms := make([]percentForm, 0, len(candidates))
-	for i, candidate := range candidates {
-		if !slices.Contains(candidates[:i], candidate) {
-			forms = append(forms, newPercentForm(candidate))
-		}
-	}
-	return forms
-}
-
-// nextPercentKey finds the earliest escaped-key span at or after offset, or -1, -1.
-func nextPercentKey(text string, offset int, forms []percentForm) (int, int) {
-	start, end := -1, -1
-	for i := range forms {
-		begin, stop := forms[i].findAfter(text, offset)
-		if begin >= 0 && (start < 0 || begin < start) {
-			start, end = begin, stop
-		}
-	}
-	return start, end
-}
-
-type percentForm struct {
-	prefix   string
-	pattern  string
-	fallback []int
-	start    int
-	end      int
-}
-
-// newPercentForm builds a Knuth-Morris-Pratt prefix table for the pattern starting at its first percent escape.
-func newPercentForm(form string) percentForm {
-	prefix, pattern := "", form
-	if i := strings.IndexByte(form, '%'); i >= 0 {
-		prefix, pattern = form[:i], form[i:]
-	}
-	f := percentForm{prefix: prefix, pattern: pattern, fallback: make([]int, len(pattern))}
-	for i := 1; i < len(pattern); i++ {
-		f.fallback[i] = f.advance(f.fallback[i-1], pattern[i])
-	}
-	return f
-}
-
-// advance extends the current pattern match by one byte or falls back to its longest viable prefix.
-func (f *percentForm) advance(matched int, b byte) int {
-	for steps := 0; steps < len(f.pattern) && matched > 0 && f.pattern[matched] != b; steps++ {
-		matched = f.fallback[matched-1]
-	}
-	if f.pattern[matched] == b {
-		matched++
-	}
-	return matched
-}
-
-// findAfter reuses a pending match or exhausted search across successive replacements.
-func (f *percentForm) findAfter(text string, offset int) (int, int) {
-	if f.end != 0 && (f.start >= offset || f.start < 0) {
-		return f.start, f.end
-	}
-	// Why: an invalidated match read at most one pattern length beyond the new offset.
-	start, end := f.find(text[offset:])
-	if start < 0 {
-		f.start, f.end = -1, -1
-	} else {
-		f.start, f.end = offset+start, offset+end
-	}
-	return f.start, f.end
-}
-
-// find returns the first matching span in text, or -1, -1.
-func (f *percentForm) find(text string) (int, int) {
-	matched := 0
-	foldHex := f.pattern[0] == '%'
-	for i := len(f.prefix); i < len(text); i++ {
-		b := text[i]
-		if foldHex {
-			b = percentByte(text, i)
-		}
-		matched = f.advance(matched, b)
-		if matched == len(f.pattern) {
-			start := i + 1 - matched - len(f.prefix)
-			if f.matchesPrefix(text, start) {
-				return start, i + 1
-			}
-			matched = f.fallback[matched-1]
-		}
-	}
-	return -1, -1
-}
-
-// matchesPrefix checks the literal prefix without folding, even when it starts inside an earlier escape.
-func (f *percentForm) matchesPrefix(text string, start int) bool {
-	// Why: compare backwards so a prior percent sign stops a failed check before it can recheck that candidate's prefix.
-	for i := len(f.prefix) - 1; i >= 0; i-- {
-		if text[start+i] != f.prefix[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// percentByte folds lowercase hex only in the two positions after a percent sign.
-func percentByte(text string, i int) byte {
-	b := text[i]
-	if b < 'a' || b > 'f' {
-		return b
-	}
-	if (i >= 1 && text[i-1] == '%') || (i >= 2 && text[i-2] == '%') {
-		return b - ('a' - 'A')
-	}
-	return b
-}
-
 type redactedError struct {
 	msg string
 	// Why: no Unwrap method, so callers cannot reach text that holds the key.
@@ -366,26 +222,31 @@ type (
 func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	reported := false
 	e.walk(nil, func(node error) walkAction {
-		if uerr, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies its immediate cause
-			// Why: schedule the cause so nested wrappers and URL errors share the walk budget.
-			_, classifies := uerr.Err.(T)
-			_, hidden := uerr.Err.(*redactedError) //nolint:errorlint // inspect only the immediate cause
-			if classifies || hidden {
-				return walkCauseOnly
-			}
-			return walkStop
-		}
-		classifier, ok := node.(T)
-		if !ok {
-			as, ok := node.(interface{ As(any) bool })
-			if !ok || !as.As(&classifier) || isNilValue(classifier) {
-				return walkDescend
-			}
-		}
-		reported = classify(classifier)
-		return walkStop
+		var action walkAction
+		action, reported = classifyNode(node, classify)
+		return action
 	})
 	return reported
+}
+
+// classifyNode returns the traversal action and classification for a single node.
+func classifyNode[T any](node error, classify func(T) bool) (walkAction, bool) {
+	if uerr, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies its immediate cause
+		// Why: schedule the immediate cause so nested URL errors share the walk budget.
+		_, classifies := uerr.Err.(T)
+		if classifies {
+			return walkCauseOnly, false
+		}
+		return walkStop, false
+	}
+	classifier, ok := node.(T)
+	if !ok {
+		as, hasAs := node.(interface{ As(any) bool })
+		if !hasAs || !as.As(&classifier) || isNilValue(classifier) {
+			return walkDescend, false
+		}
+	}
+	return walkStop, classify(classifier)
 }
 
 type walkAction uint8
@@ -517,7 +378,9 @@ func isNilValue(value any) bool {
 	return false
 }
 
-// As sets target to a sanitized copy, with an opaque cause, of the first *url.Error among the first 64 breadth-first queued nodes; deeper URL errors are not found. The structural key scan examines 64 breadth-first nodes, while Is, Timeout, and Temporary visit at most 4096 nodes and 64 joined errors.
+// As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
+// The copy preserves nil and typed-nil causes and hides other causes.
+// Classifications for an opaque cause are captured in one walk of up to 4096 nodes and 64 joined errors.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
 	if !ok {
@@ -529,7 +392,7 @@ func (e *redactedError) As(target any) bool {
 		if uerr, ok := queue[i].(*url.Error); ok && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
 			// Why: hand out a scrubbed copy, never the original that holds the key.
 			c := Client{apiKey: e.key}
-			*dst = &url.Error{Op: c.scrubText(uerr.Op), URL: c.scrubText(redactURL(c.scrub(uerr.URL))), Err: c.hideCause(uerr.Err)}
+			*dst = &url.Error{Op: c.scrubText(uerr.Op), URL: c.scrubText(redactURL(uerr.URL)), Err: c.hideCause(uerr.Err)}
 			return true
 		}
 		queue = appendWrapped(queue, queue[i])
@@ -559,18 +422,43 @@ func (e *opaqueURLCause) As(target any) bool { return e.hidden.As(target) }
 // Format prints only the sanitized cause message.
 func (e *opaqueURLCause) Format(f fmt.State, verb rune) { e.hidden.Format(f, verb) }
 
-type classifiedURLCause struct{ opaqueURLCause }
-
-// Timeout delegates to the original immediate cause's Timeout method.
-func (e *classifiedURLCause) Timeout() bool {
-	t, ok := e.hidden.err.(interface{ Timeout() bool })
-	return ok && t.Timeout()
+type classifiedURLCause struct {
+	opaqueURLCause
+	timeout   bool
+	temporary bool
 }
 
-// Temporary delegates to the original immediate cause's Temporary method.
-func (e *classifiedURLCause) Temporary() bool {
-	t, ok := e.hidden.err.(interface{ Temporary() bool })
-	return ok && t.Temporary()
+// Timeout reports whether the cause timed out when copied.
+func (e *classifiedURLCause) Timeout() bool { return e.timeout }
+
+// Temporary reports whether the cause was temporary when copied.
+func (e *classifiedURLCause) Temporary() bool { return e.temporary }
+
+// newClassifiedURLCause captures both classifications in one URL-aware walk.
+func newClassifiedURLCause(cause opaqueURLCause) *classifiedURLCause {
+	copyCause := &classifiedURLCause{opaqueURLCause: cause}
+	probe := &redactedError{err: &url.Error{Err: cause.hidden.err}}
+	timeoutDone, temporaryDone := false, false
+	probe.walk(nil, func(node error) walkAction {
+		timeoutAction, temporaryAction := walkDescend, walkDescend
+		if !timeoutDone {
+			timeoutAction, copyCause.timeout = classifyNode(node, hiddenTimeoutClassifier.Timeout)
+			timeoutDone = timeoutAction == walkStop
+		}
+		if !temporaryDone {
+			temporaryAction, copyCause.temporary = classifyNode(node, hiddenTemporaryClassifier.Temporary)
+			temporaryDone = temporaryAction == walkStop
+		}
+		switch {
+		case timeoutDone && temporaryDone:
+			return walkStop
+		case timeoutAction == walkCauseOnly || temporaryAction == walkCauseOnly:
+			return walkCauseOnly
+		default:
+			return walkDescend
+		}
+	})
+	return copyCause
 }
 
 // hiddenRedaction returns the package-owned wrapper behind node, if any.
@@ -611,17 +499,17 @@ func (c *Client) scrubError(err error) error {
 // hideCause wraps a URL error's immediate cause and preserves its classification results.
 func (c *Client) hideCause(err error) error {
 	if isNilError(err) {
-		return nil
+		return err
 	}
 	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
 	if _, tooLarge := c.checkErrorTree(err); !tooLarge {
 		hidden.msg = c.scrubText(err.Error())
 	}
 	cause := opaqueURLCause{hidden: hidden}
-	_, timesOut := err.(interface{ Timeout() bool })
-	_, temporary := err.(interface{ Temporary() bool })
+	_, timesOut := err.(hiddenTimeoutClassifier)
+	_, temporary := err.(hiddenTemporaryClassifier)
 	if timesOut || temporary {
-		return &classifiedURLCause{opaqueURLCause: cause}
+		return newClassifiedURLCause(cause)
 	}
 	return &cause
 }
@@ -649,6 +537,9 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 			return true, true
 		}
 	}
+	if slices.ContainsFunc(queue, hasCustomErrorFormatting) {
+		return true, false
+	}
 	for _, node := range queue {
 		if c.errorNodeNeedsRedaction(node) {
 			return true, false
@@ -657,16 +548,23 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 	return false, false
 }
 
-// errorNodeNeedsRedaction checks custom formatting, URL fields, and error text.
-func (c *Client) errorNodeNeedsRedaction(node error) bool {
-	// Why: custom formatters can print text beyond Error's result.
-	if _, formats := node.(fmt.Formatter); formats && hiddenRedaction(node) == nil {
-		return true
+// hasCustomErrorFormatting reports whether a caller controls the formatted error.
+func hasCustomErrorFormatting(node error) bool {
+	// Why: fmt's operand rules use Formatter or GoStringer for Go syntax and prefer Error to String for error text.
+	if hiddenRedaction(node) != nil {
+		return false
 	}
+	_, formats := node.(fmt.Formatter)
+	_, goStrings := node.(fmt.GoStringer)
+	return formats || goStrings
+}
+
+// errorNodeNeedsRedaction checks URL fields, error text, and Go-syntax output.
+func (c *Client) errorNodeNeedsRedaction(node error) bool {
 	if uerr, ok := node.(*url.Error); ok && (c.containsKey(uerr.Op) || c.containsKey(uerr.URL)) { //nolint:errorlint // inspect only this node's fields
 		return true
 	}
-	return c.containsKey(node.Error())
+	return c.containsKey(node.Error()) || c.containsKey(fmt.Sprintf("%#v", node))
 }
 
 // unsafeErrorNode reports whether err or a direct child is typed nil, or the join exceeds the remaining slots.
@@ -691,20 +589,6 @@ func unsafeErrorNode(err error, remaining int) bool {
 		}
 	}
 	return false
-}
-
-// containsKey reports whether s holds the raw key or an encoded form of it.
-func (c *Client) containsKey(s string) bool {
-	return c.containsKeyForms(s) || c.containsCanonicalKey(s)
-}
-
-// containsKeyForms checks the fixed key forms, ignoring the hex case of percent escapes.
-func (c *Client) containsKeyForms(s string) bool {
-	if slices.ContainsFunc(c.keyForms(), func(form string) bool { return strings.Contains(s, form) }) {
-		return true
-	}
-	start, _ := nextPercentKey(s, 0, c.percentForms())
-	return start >= 0
 }
 
 // appendWrapped appends non-nil wrapped errors while bounding queue growth.
@@ -739,7 +623,7 @@ func (c *Client) redactError(err error) error {
 	if uerr, ok := err.(*url.Error); ok && uerr != nil { //nolint:errorlint // root identity wanted; tree search is the defect
 		// Why: copy only when sanitizing changed the URL text or hid the cause; an untouched root keeps its identity for errors.Is.
 		// Why: a copy never mutates an error value net/http or a custom transport may share.
-		cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(c.scrub(uerr.URL)))
+		cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(uerr.URL))
 		if cleanOp != uerr.Op || cleanURL != uerr.URL || (uerr.Err != nil && c.carriesKey(uerr.Err)) {
 			err = &url.Error{Op: cleanOp, URL: cleanURL, Err: c.hideCause(uerr.Err)}
 		}

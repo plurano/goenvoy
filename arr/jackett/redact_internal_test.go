@@ -116,40 +116,30 @@ func TestDoRequestCreateRequestRedactsAPIKey(t *testing.T) {
 	}
 }
 
-// TestScrub verifies scrubbing and detection of raw, query-escaped, and quoted keys, absent text, and empty keys.
+// TestScrub verifies literal replacement, encoded-key detection, and empty or absent keys.
 func TestScrub(t *testing.T) {
 	t.Parallel()
-
-	const special = `k"y\z`
-	const control = "key\n\tvalue"
-	quoted := strconv.Quote("plain-key")
+	const key = "fixture-key42"
 	cases := []struct {
 		name, key, input, want string
 		contains               bool
 	}{
-		{"plain raw", "plain-key", "before plain-key after", "before REDACTED after", true},
-		{"plain query", "plain-key", "before " + url.QueryEscape("plain-key") + " after", "before REDACTED after", true},
-		{"plain quoted", "plain-key", "before " + quoted[1:len(quoted)-1] + " after", "before REDACTED after", true},
-		{"special raw", special, "before " + special + " after", "before REDACTED after", true},
-		{"special query", special, "before " + url.QueryEscape(special) + " after", "before REDACTED after", true},
-		{"special quoted", special, `before k\"y\\z after`, "before REDACTED after", true},
-		{"control raw", control, "before " + control + " after", "before REDACTED after", true},
-		{"control query", control, "before " + url.QueryEscape(control) + " after", "before REDACTED after", true},
-		{"control quoted", control, `before key\n\tvalue after`, "before REDACTED after", true},
-		{"absent", special, "plain error message", "plain error message", false},
-		{"empty input", control, "", "", false},
+		{"literal", key, "before " + key + " after", "before REDACTED after", true},
+		{"percent encoded", key, "fixture%2Dkey42", "fixture%2Dkey42", true},
+		{"Unicode escaped", key, `fixture\u002dkey42`, `fixture\u002dkey42`, true},
+		{"absent", key, "plain error message", "plain error message", false},
+		{"empty input", key, "", "", false},
 		{"empty key", "", "plain error message", "plain error message", false},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: tc.key}
-			if got := c.scrub(tc.input); got != tc.want {
-				t.Errorf("scrub(%q) = %q, want %q", tc.input, got, tc.want)
+			if c.scrub(tc.input) != tc.want {
+				t.Error("unexpected literal replacement")
 			}
-			if got := c.containsKey(tc.input); got != tc.contains {
-				t.Errorf("containsKey(%q) = %v, want %v", tc.input, got, tc.contains)
+			if c.containsKey(tc.input) != tc.contains {
+				t.Error("unexpected key detection")
 			}
 		})
 	}
@@ -159,7 +149,7 @@ func TestScrub(t *testing.T) {
 func TestRedactErrorWrappers(t *testing.T) {
 	t.Parallel()
 
-	for _, key := range []string{"plain-key", `k"y\z`, "key\n\tvalue"} {
+	for _, key := range []string{"plain-key", "Fixture-0._~"} {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()
 			checkRedactErrorWrappers(t, key)
@@ -218,7 +208,7 @@ func checkRedactedKeyForms(t *testing.T, text, key string) {
 func TestRedactErrorRootURL(t *testing.T) {
 	t.Parallel()
 
-	for _, key := range []string{"plain-key", `k"y\z`, "key\n\tvalue"} {
+	for _, key := range []string{"plain-key", "Fixture-0._~"} {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()
 			checkRedactErrorRootURL(t, key)
@@ -488,7 +478,7 @@ func (e redactionFanout) Unwrap() []error { return []error{e.prev, e.prev} }
 // TestRedactErrorFanoutBounded checks that a keyless exponential error tree returns promptly.
 func TestRedactErrorFanoutBounded(t *testing.T) {
 	t.Parallel()
-	c := &Client{apiKey: "placeholder+k/y=1"}
+	c := &Client{apiKey: "fixture-key42"}
 	var err error
 	err = errors.New("fixture fanout leaf")
 	for range 40 {

@@ -80,10 +80,10 @@ func assertFormatterRedacted(t *testing.T, got, sentinel error, key string) {
 // TestScrubErrorHidesCustomFormatter checks root and nested formatters even when Error omits the key.
 func TestScrubErrorHidesCustomFormatter(t *testing.T) {
 	t.Parallel()
-	const key = "fixture-key+42/"
+	const key = "fixture-key42"
 	c := &Client{apiKey: key}
 	sentinel := errors.New("fixture read failure")
-	unsafeFormatter := &redactFixtureFormatter{cause: sentinel, text: url.QueryEscape(key)}
+	unsafeFormatter := &redactFixtureFormatter{cause: sentinel, text: "fixture%2Dkey42"}
 	cases := []struct {
 		name string
 		err  error
@@ -102,6 +102,141 @@ func TestScrubErrorHidesCustomFormatter(t *testing.T) {
 
 type redactFixtureCause struct{ error }
 
+type redactFixtureGoStringer struct {
+	text   string
+	called *bool
+}
+
+// Error returns a message without the fixture text.
+func (redactFixtureGoStringer) Error() string { return "fixture formatting failure" }
+
+// GoString records the call and returns the fixture text.
+func (e redactFixtureGoStringer) GoString() string {
+	*e.called = true
+	return e.text
+}
+
+type redactFixtureReflectedError struct{ text string }
+
+// Error returns a message without the fixture text.
+func (redactFixtureReflectedError) Error() string { return "fixture reflection failure" }
+
+// TestScrubErrorHidesGoSyntax checks both ways that Go-syntax output can expose the key.
+func TestScrubErrorHidesGoSyntax(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	c, err := New("http://127.0.0.1", key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var called bool
+	custom := redactFixtureGoStringer{text: key, called: &called}
+	for _, original := range []error{custom, errors.Join(custom), redactFixtureReflectedError{text: key}} {
+		got := c.scrubError(original)
+		if _, wrapped := got.(*redactedError); !wrapped { //nolint:errorlint // check the wrapper itself
+			t.Errorf("scrubError(%T) = %T; want redacted wrapper", original, got)
+		}
+		if strings.Contains(fmt.Sprintf("%#v", got), key) {
+			t.Errorf("Go-syntax output exposes the key from %T", original)
+		}
+	}
+	if called {
+		t.Error("Go-syntax formatting invoked the original GoString method")
+	}
+	plain := errors.New("fixture plain failure")
+	if got := c.scrubError(plain); any(got) != any(plain) {
+		t.Errorf("scrubError changed the identity of %T", plain)
+	}
+}
+
+// TestCanonicalKeyProjection checks escaped input across decoding projections and bounds.
+func TestCanonicalKeyProjection(t *testing.T) {
+	t.Parallel()
+	key := "ab" + "12"
+	c, err := New("http://127.0.0.1", key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, tc := range []struct{ name, input, want string }{
+		{"mixed pass consumes key prefix", `%ab\u0031\u0032`, "REDACTED"},
+		{"two backslash layers", `%ab\\u0031\\u0032`, "REDACTED"},
+		{"decode projection limit", `\u0025255c %255c%5cu0030 \\u00255c %25255c`, "REDACTED"},
+		{"unrelated escapes", `%ab\u0031\u0033`, `%ab\u0031\u0033`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := c.scrubText(tc.input); got != tc.want {
+				t.Error("unexpected text redaction")
+			}
+			if got := c.scrubBody(tc.input); got != tc.want {
+				t.Error("unexpected body redaction")
+			}
+		})
+	}
+}
+
+// TestDecodeLayerProjectionLimit isolates the projection cap so the depth limit cannot mask its removal.
+func TestDecodeLayerProjectionLimit(t *testing.T) {
+	t.Parallel()
+	const key = "ab" + "12"
+	c, err := New("http://127.0.0.1", key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Why: each mixed input yields three distinct projections by decoding either escape or both.
+	mixed := []string{`%61\u0062`, `%63\u0064`, `%65\u0066`, `%67\u0068`, `%69\u006a`, `%6b\u006c`}
+	cases := []struct {
+		name       string
+		frontier   []string
+		wantCount  int
+		wantRedact bool
+	}{
+		{"exactly 16 projections", append(slices.Clone(mixed[:5]), "%6d"), 16, false},
+		{"redact on projection 17", mixed, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			seen := make(map[string]struct{}, len(tc.frontier))
+			for _, input := range tc.frontier {
+				seen[input] = struct{}{}
+			}
+			next, redact := c.decodeLayer(tc.frontier, seen)
+			if redact != tc.wantRedact || len(next) != tc.wantCount {
+				subtest.Errorf("decodeLayer returned %d projections and redact=%t, want %d and %t", len(next), redact, tc.wantCount, tc.wantRedact)
+			}
+			if added := len(seen) - len(tc.frontier); added != 16 {
+				subtest.Errorf("decodeLayer recorded %d new projections, want 16", added)
+			}
+		})
+	}
+}
+
+// TestSanitizedURLCopyClassifiesCycle checks that classification is bounded and captured at copy time.
+func TestSanitizedURLCopyClassifiesCycle(t *testing.T) {
+	t.Parallel()
+	loop := &url.Error{}
+	loop.Err = loop
+	original := &url.Error{Err: loop}
+	copyErr := answerWithinTwoSeconds(t, "copy URL error with cyclic cause", func() *url.Error {
+		var copied *url.Error
+		(&redactedError{err: original}).As(&copied)
+		return copied
+	})
+	if copyErr == nil {
+		t.Fatal("expected a sanitized URL error copy")
+	}
+	// Why: break the original cycle after copying so a live classifier fails without exhausting the stack.
+	loop.Err = &net.DNSError{IsTimeout: true, IsTemporary: true}
+	if answerWithinTwoSeconds(t, "copied Timeout", copyErr.Timeout) {
+		t.Error("copied Timeout classified the changed cause")
+	}
+	if answerWithinTwoSeconds(t, "copied Temporary", copyErr.Temporary) {
+		t.Error("copied Temporary classified the changed cause")
+	}
+}
+
 // Unwrap returns the fixture sentinel.
 func (e redactFixtureCause) Unwrap() error { return e.error }
 
@@ -115,12 +250,45 @@ type redactTemporaryCause struct{ redactFixtureCause }
 // Temporary reports that the fixture is temporary.
 func (redactTemporaryCause) Temporary() bool { return true }
 
+type redactNilTimeoutCause struct{ redactFixtureCause }
+
+// Timeout reports a timeout for the typed-nil fixture.
+func (e *redactNilTimeoutCause) Timeout() bool { return e == nil }
+
+// TestSanitizedURLCopyPreservesTypedNil checks nil-receiver classification and safe tree formatting.
+func TestSanitizedURLCopyPreservesTypedNil(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	c, err := New("http://127.0.0.1", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cause *redactNilTimeoutCause
+	original := &url.Error{Op: "Get", URL: "http://fixture.invalid/" + key, Err: cause}
+	scrubbed := c.redactError(original)
+	if scrubbed.Error() != redactedTreeMsg {
+		t.Error("scrubError did not use the fixed message for a typed-nil cause")
+	}
+	var copied *url.Error
+	if !errors.As(scrubbed, &copied) || copied == original || copied == nil {
+		t.Fatal("expected a sanitized URL error copy")
+	}
+	if any(copied.Err) != any(cause) {
+		t.Errorf("copied cause = %T; want original typed-nil cause", copied.Err)
+	}
+	if !copied.Timeout() || copied.Timeout() != original.Timeout() || copied.Temporary() != original.Temporary() {
+		t.Error("copied classification differs from the original URL error")
+	}
+}
+
 // TestSanitizedURLCopyClassifiesImmediateCause compares both URL-copy paths with the original URL error.
 func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key42"
 	sentinel := errors.New("fixture DNS failure")
 	timeout := &net.DNSError{UnwrapErr: sentinel, IsTimeout: true, IsTemporary: true}
+	timeoutOnly := &redactTimeoutCause{redactFixtureCause{sentinel}}
+	temporaryOnly := redactTemporaryCause{redactFixtureCause{sentinel}}
 	c := &Client{apiKey: key}
 	cases := []struct {
 		name  string
@@ -128,11 +296,13 @@ func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 	}{
 		{"ordinary wrapper", fmt.Errorf("fixture wrapper: %w", timeout)},
 		{"DNS error", timeout},
-		{"timeout only", &redactTimeoutCause{redactFixtureCause{sentinel}}},
-		{"temporary only", redactTemporaryCause{redactFixtureCause{sentinel}}},
+		{"timeout only", timeoutOnly},
+		{"temporary only", temporaryOnly},
 		{"nil", nil},
 		{"typed nil", (*redactTimeoutCause)(nil)},
 		{"redacted cause", &redactedError{err: timeout, msg: "fixture hidden cause"}},
+		{"different classifier nodes", &redactedError{err: errors.Join(timeoutOnly, temporaryOnly)}},
+		{"nested URL commits to its cause", &redactedError{err: errors.Join(&url.Error{Err: timeoutOnly}, temporaryOnly)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -158,8 +328,8 @@ func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, senti
 		t.Fatalf("expected a sanitized URL error copy, got %T", got)
 	}
 	if isNilError(original.Err) {
-		if copyErr.Err != nil {
-			t.Error("copy retained a nil or typed-nil cause")
+		if any(copyErr.Err) != any(original.Err) {
+			t.Error("copy changed a nil or typed-nil cause")
 		}
 	} else if !errors.Is(copyErr, sentinel) {
 		t.Error("errors.Is through the copy did not reach the sentinel")
@@ -171,22 +341,6 @@ func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, senti
 	}
 	if want := original.Temporary(); copyErr.Temporary() != want || nested.Temporary() != want {
 		t.Errorf("Temporary: copy=%v nested=%v original=%v", copyErr.Temporary(), nested.Temporary(), want)
-	}
-}
-
-// TestAcceptedKeyForms checks that an accepted API key only needs literal matching.
-func TestAcceptedKeyForms(t *testing.T) {
-	t.Parallel()
-	const key = "Fixture-0._~"
-	c, err := New("http://127.0.0.1", key)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if got := c.keyForms(); !slices.Equal(got, []string{key}) {
-		t.Errorf("keyForms returned %d forms; want exactly the original key", len(got))
-	}
-	if got := len(c.percentForms()); got != 0 {
-		t.Errorf("percentForms returned %d forms; want 0", got)
 	}
 }
 
@@ -224,7 +378,7 @@ func TestRedactedErrorAsURLError(t *testing.T) {
 	t.Parallel()
 	cases := []struct{ name, key string }{
 		{name: "plain", key: "plain-key"},
-		{name: "query escaped and quoted", key: `plain-key+k/y="1"`},
+		{name: "unreserved punctuation", key: "Fixture-0._~"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -270,6 +424,76 @@ func checkRedactedErrorAs(t *testing.T, key string) {
 	}
 }
 
+// TestURLErrorRedactsQueryBeforeScrubbing checks URL redaction on root and nested errors.
+func TestURLErrorRedactsQueryBeforeScrubbing(t *testing.T) {
+	t.Parallel()
+	c, err := New("http://127.0.0.1", "api")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, tc := range []struct{ name, rawURL, wantURL string }{
+		{
+			name:    "foreign apikey",
+			rawURL:  "http://h/x?apikey=foreign&q=api",
+			wantURL: "http://h/x?REDACTEDkey=REDACTED&q=REDACTED",
+		},
+		{
+			name:    "path only",
+			rawURL:  "http://h/api?q=keep",
+			wantURL: "http://h/REDACTED?q=keep",
+		},
+		{
+			name:    "malformed query",
+			rawURL:  "http://h/api?q=%zz",
+			wantURL: "http://h/REDACTED",
+		},
+		{
+			name:    "unchanged",
+			rawURL:  "http://h/x?q=keep",
+			wantURL: "http://h/x?q=keep",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			original := &url.Error{Op: http.MethodGet, URL: tc.rawURL, Err: errors.New("fixture transport failure")}
+			unchanged := tc.rawURL == tc.wantURL
+			t.Run("root", func(t *testing.T) {
+				t.Parallel()
+				result := c.redactError(original)
+				if unchanged && any(result) != any(original) {
+					t.Error("redactError did not preserve the clean root error")
+				}
+				assertRedactedURLError(t, result, original, tc.wantURL, unchanged)
+			})
+			t.Run("nested", func(t *testing.T) {
+				t.Parallel()
+				result := c.redactError(errors.Join(original))
+				assertRedactedURLError(t, result, original, tc.wantURL, unchanged)
+			})
+		})
+	}
+}
+
+// assertRedactedURLError checks the URL, operation, and identity of the exposed error.
+func assertRedactedURLError(t *testing.T, result error, original *url.Error, wantURL string, wantOriginal bool) {
+	t.Helper()
+	var exposed *url.Error
+	if !errors.As(result, &exposed) || exposed == nil {
+		t.Fatal("expected errors.As to expose a non-nil URL error")
+	}
+	if (exposed == original) != wantOriginal {
+		t.Error("expected URL error identity to be preserved only for the unchanged URL")
+	}
+	if exposed.Op != http.MethodGet {
+		t.Errorf("Op = %q, want %q", exposed.Op, http.MethodGet)
+	}
+	if exposed.URL == wantURL {
+		return
+	}
+	t.Errorf("URL = %q, want %q", exposed.URL, wantURL)
+}
+
 // TestRedactedErrorAsOpRedaction checks that errors.As yields a copy whose Op and text lack the key held by a nested URL error's Op.
 func TestRedactedErrorAsOpRedaction(t *testing.T) {
 	t.Parallel()
@@ -313,7 +537,7 @@ func TestRedactedErrorAsEscapedURL(t *testing.T) {
 // TestRedactedErrorAsKeepsOriginalKey checks delayed URL extraction after the client is replaced.
 func TestRedactedErrorAsKeepsOriginalKey(t *testing.T) {
 	t.Parallel()
-	const key = "fixture-original?"
+	const key = "fixture-key42"
 	c := &Client{apiKey: key}
 	inner := &url.Error{
 		Op:  "fixture op " + key,
@@ -321,7 +545,7 @@ func TestRedactedErrorAsKeepsOriginalKey(t *testing.T) {
 		Err: errors.New("fixture cause " + key),
 	}
 	hidden := c.scrubError(fmt.Errorf("outer: %w", inner))
-	*c = Client{apiKey: "fixture-replacement?"}
+	*c = Client{apiKey: key + "-replacement"}
 
 	var got *url.Error
 	if !errors.As(hidden, &got) || got == nil || got == inner {
@@ -494,7 +718,7 @@ func TestRedactedErrorIsFindsSentinel(t *testing.T) {
 // TestRedactedErrorAsTypedNilURLError checks that errors.As skips a typed-nil *url.Error without panicking and still finds a valid *url.Error sibling.
 func TestRedactedErrorAsTypedNilURLError(t *testing.T) {
 	t.Parallel()
-	const key = "plain-key+k/y=1"
+	const key = "fixture-key42"
 	c := &Client{apiKey: key}
 	var typedNil *url.Error
 	valid := &url.Error{
@@ -556,7 +780,7 @@ func assertTypedNilURLErrorAs(t *testing.T, c *Client, tree error, valid *url.Er
 // TestRedactErrorJoinFanoutBounded checks that a 40-level errors.Join fan-out over a key-bearing leaf returns promptly with the fixed over-budget message.
 func TestRedactErrorJoinFanoutBounded(t *testing.T) {
 	t.Parallel()
-	const key = "placeholder+k/y=1"
+	const key = "fixture-key42"
 	c := &Client{apiKey: key}
 	tree := fmt.Errorf("leaf %s", key)
 	for range 40 {
@@ -709,36 +933,31 @@ func TestRedactedErrorIsNodeMethod(t *testing.T) {
 	}
 }
 
-// TestRedactErrorRootPathQuoteAndSpace checks that a root URL error whose path holds a key with quotes and spaces is scrubbed before and after URL parsing.
-func TestRedactErrorRootPathQuoteAndSpace(t *testing.T) {
+// TestRedactErrorRootPathRedaction checks literal and percent-encoded keys in a URL error's path.
+func TestRedactErrorRootPathRedaction(t *testing.T) {
 	t.Parallel()
-	for _, key := range []string{`k"y z`, `k"y/z 1`} {
-		t.Run(key, func(t *testing.T) {
+	const key = "fixture-key42"
+	for _, tc := range []struct{ name, path string }{
+		{"literal", key},
+		{"percent encoded", "fixture%2Dkey42"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			assertRootPathRedacted(t, key)
+			c := &Client{apiKey: key}
+			original := &url.Error{
+				Op:  "Get",
+				URL: "http://h/" + tc.path + "?apikey=" + key,
+				Err: errors.New("fixture transport failure"),
+			}
+			got := c.redactError(original)
+			var copied *url.Error
+			if !errors.As(got, &copied) || copied == nil || copied == original {
+				t.Fatal("expected a sanitized URL error copy")
+			}
+			if c.containsKey(got.Error()) || c.containsKey(copied.URL) {
+				t.Error("copied URL error still contains the key")
+			}
 		})
-	}
-}
-
-// assertRootPathRedacted checks that redactError scrubs raw and escaped forms of key from a root URL error's path and query.
-func assertRootPathRedacted(t *testing.T, key string) {
-	t.Helper()
-	c := &Client{apiKey: key}
-	uerr := &url.Error{
-		Op:  "Get",
-		URL: "http://h/" + key + "?apikey=" + key,
-		Err: errors.New("fixture transport failure"),
-	}
-	got := c.redactError(uerr)
-	var clean *url.Error
-	if !errors.As(got, &clean) || clean == nil {
-		t.Fatal("errors.As into *url.Error = false or nil; want non-nil")
-	}
-	for _, text := range []string{got.Error(), clean.URL} {
-		assertNoKeyForms(t, text, key)
-		if strings.Contains(text, url.PathEscape(key)) || strings.Contains(text, "k%22y") {
-			t.Errorf("escaped key leaked: %s", text)
-		}
 	}
 }
 
@@ -865,7 +1084,7 @@ func (redactClassifier) Temporary() bool { return true }
 // TestRedactedErrorClassifiers checks custom As and URL errors with nil and non-nil causes.
 func TestRedactedErrorClassifiers(t *testing.T) {
 	t.Parallel()
-	const key = "fixture/part+token"
+	const key = "fixture-key42"
 	cases := []struct {
 		name  string
 		cause error
@@ -1073,7 +1292,7 @@ func TestRedactErrorRootURLHidesCause(t *testing.T) {
 	}
 }
 
-// TestRedactErrorRootURLNilCause checks that nil causes stay nil in a URL error copy.
+// TestRedactErrorRootURLNilCause checks that nil and typed-nil causes are preserved in a URL error copy.
 func TestRedactErrorRootURLNilCause(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key"
@@ -1091,8 +1310,8 @@ func TestRedactErrorRootURLNilCause(t *testing.T) {
 			if !errors.As((&Client{apiKey: key}).redactError(root), &copied) || copied == root {
 				t.Fatal("redactError did not return a sanitized URL error copy")
 			}
-			if copied.Err != nil {
-				t.Errorf("copied cause = %T, want nil", copied.Err)
+			if any(copied.Err) != any(tc.err) {
+				t.Errorf("copied cause = %T; want %T", copied.Err, tc.err)
 			}
 		})
 	}

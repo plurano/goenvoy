@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -171,14 +170,14 @@ func assertRedactedTree(t *testing.T, err error, key string) {
 	}
 }
 
-// TestScrub checks raw, escaped, empty, and absent key text.
+// TestScrub checks repeated literal, empty, and absent key text.
 func TestScrub(t *testing.T) {
 	t.Parallel()
-	const key = "fixture-k+y/=1"
+	const key = "fixture-key42"
 	cases := []struct{ name, key, input, want string }{
 		{"empty key", "", "unchanged", "unchanged"},
 		{"absent key", key, "unchanged", "unchanged"},
-		{"raw and escaped", key, key + ":" + url.QueryEscape(key), "REDACTED:REDACTED"},
+		{"repeated literal", key, key + ":" + key, "REDACTED:REDACTED"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -200,7 +199,7 @@ func TestWideErrorTree(t *testing.T) {
 			children[i] = errors.New("fixture plain error")
 		}
 		joined := errors.Join(children...)
-		c := &Client{apiKey: "fixture-k+y/=1"}
+		c := &Client{apiKey: "fixture-key42"}
 		got := c.scrubError(joined)
 		if count == maxErrNodes-1 {
 			assertVisibleErrorTree(t, got, children[0])
@@ -234,7 +233,7 @@ func assertVisibleErrorTree(t *testing.T, got, sentinel error) {
 // TestRedactError checks root URL sanitization without discarding outer error trees.
 func TestRedactError(t *testing.T) {
 	t.Parallel()
-	const key = "placeholder+k/y=1"
+	const key = "fixture-key42"
 	c := &Client{apiKey: key}
 	inner := errors.New("fixture inner sentinel")
 	uerr := &url.Error{Op: "Get", URL: "http://example.invalid/?apikey=" + url.QueryEscape(key), Err: inner}
@@ -483,28 +482,24 @@ func TestDecodeErrorRedaction(t *testing.T) {
 	}
 }
 
-// TestRedactQuotedKey checks nested URL errors with Go-quoted keys and preserves joined causes.
+// TestRedactQuotedKey checks nested URL errors with escaped keys and preserves joined causes.
 func TestRedactQuotedKey(t *testing.T) {
 	t.Parallel()
-	cases := []struct{ name, key string }{
-		{name: "plain", key: "placeholder"},
-		{name: "quote and backslash", key: `k"y\z`},
-		{name: "control", key: "k\ny\tz"},
-	}
-	for _, tc := range cases {
+	const key = "fixture-key42"
+	for _, tc := range []struct{ name, spelling string }{
+		{"literal", key},
+		{"percent encoded", "fixture%2Dkey42"},
+		{"Unicode escaped", `fixture\u002dkey42`},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			c := &Client{apiKey: tc.key}
+			c := &Client{apiKey: key}
 			original := errors.Join(io.ErrUnexpectedEOF,
-				&url.Error{Op: "Get", URL: "http://h/?apikey=" + tc.key, Err: errors.New("x")})
+				&url.Error{Op: "Get", URL: "http://h/?apikey=" + tc.spelling, Err: errors.New("x")})
 			got := c.redactError(original)
-			quoted := strconv.Quote(tc.key)
 			text := got.Error()
-			if strings.Contains(text, tc.key) || strings.Contains(text, quoted[1:len(quoted)-1]) {
-				t.Errorf("key leaked: %s", text)
-			}
-			if !strings.Contains(text, "REDACTED") {
-				t.Error("missing REDACTED")
+			if c.containsKey(text) || !strings.Contains(text, "REDACTED") {
+				t.Error("expected redaction marker in key-free error text")
 			}
 			if !errors.Is(got, io.ErrUnexpectedEOF) {
 				t.Error("lost sentinel")
@@ -513,30 +508,29 @@ func TestRedactQuotedKey(t *testing.T) {
 	}
 }
 
-// TestScrubQuotedKey checks raw, query-escaped, Go-quoted, absent, and empty key forms.
+// TestScrubQuotedKey checks literal and escaped keys, along with absent and empty keys.
 func TestScrubQuotedKey(t *testing.T) {
 	t.Parallel()
+	const key = "fixture-key42"
 	cases := []struct {
 		name, key, input, want string
 		contains               bool
 	}{
-		{name: "empty", input: "plain", want: "plain"},
-		{name: "absent", key: `k"y\z`, input: "plain", want: "plain"},
-		{name: "plain", key: "placeholder", input: "key=placeholder", want: "key=REDACTED", contains: true},
-		{name: "raw", key: `k"y\z`, input: `key=k"y\z`, want: "key=REDACTED", contains: true},
-		{name: "query", key: `k"y\z`, input: "key=k%22y%5Cz", want: "key=REDACTED", contains: true},
-		{name: "quoted", key: `k"y\z`, input: `key=k\"y\\z`, want: "key=REDACTED", contains: true},
-		{name: "control", key: "k\ny\tz", input: `key=k\ny\tz`, want: "key=REDACTED", contains: true},
+		{"empty", "", "plain", "plain", false},
+		{"absent", key, "plain", "plain", false},
+		{"literal", key, "key=" + key, "key=REDACTED", true},
+		{"percent encoded", key, "key=" + strings.Replace(key, "-", "%2D", 1), "REDACTED", true},
+		{"Unicode escaped", key, "key=" + strings.Replace(key, "-", `\u002d`, 1), "REDACTED", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: tc.key}
-			if got := c.scrub(tc.input); got != tc.want {
-				t.Errorf("scrub = %q; want %q", got, tc.want)
+			if c.scrubText(tc.input) != tc.want {
+				t.Error("unexpected text redaction")
 			}
-			if got := c.containsKey(tc.input); got != tc.contains {
-				t.Errorf("containsKey = %v; want %v", got, tc.contains)
+			if c.containsKey(tc.input) != tc.contains {
+				t.Error("unexpected key detection")
 			}
 		})
 	}
@@ -554,7 +548,7 @@ func (e redactionFanout) Unwrap() []error { return []error{e.prev, e.prev} }
 // TestRedactErrorFanoutBounded checks that a keyless exponential error tree returns promptly.
 func TestRedactErrorFanoutBounded(t *testing.T) {
 	t.Parallel()
-	c := &Client{apiKey: "placeholder+k/y=1"}
+	c := &Client{apiKey: "fixture-key42"}
 	var err error
 	err = errors.New("fixture fanout leaf")
 	for range 40 {

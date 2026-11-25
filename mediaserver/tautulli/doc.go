@@ -9,10 +9,14 @@
 // All requests require an API key, which can be found in
 // Tautulli Settings → Web Interface → API key.
 //
-// Error redaction scans up to 64 nodes each for URL-error recovery and structural inspection, and forwarding visits up to 64 joined errors and 4096 nodes.
-// Error trees with custom formatters expose only their sanitized message.
-// Sanitized URL error copies classify timeouts and temporary failures using the original immediate cause's methods.
-// Nil and typed-nil URL causes become nil in the copy.
+// Key detection decodes percent escapes, backslash escapes, and both together.
+// It redacts on a key match, more than 16 new projections in a layer,
+// or a new projection at the fourth layer.
+// Error redaction scans up to 64 nodes for structural inspection and URL recovery.
+// Errors that control their own formatting or expose the key in Go-syntax output are wrapped.
+// Each forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
+// A sanitized URL error copy preserves nil and typed-nil causes. It hides other causes
+// and captures their timeout and temporary classification together within one such walk.
 //
 // # Usage
 //

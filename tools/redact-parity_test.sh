@@ -82,3 +82,9 @@ expect_refusal 'exception with only a wrapper comment' "$exception:1: stale exce
 
 printf 'package standalone\n\ntype (\n  redactedError struct{}\n)\n' >"$exception"
 expect_output 'grouped declaration keeps the exception' 'redact-parity: 3 redaction copies match' "${SUT[@]}"
+
+printf 'package standalone\n\ntype (Other int; redactedError struct{})\n' >"$exception"
+expect_output 'same-line grouped declaration keeps the exception' 'redact-parity: 3 redaction copies match' "${SUT[@]}"
+
+printf 'package standalone\n\ntype redactedError struct{}\nfunc broken(]\n' >"$exception"
+expect_refusal 'parse error in the exception' "$exception:4:" "${SUT[@]}"

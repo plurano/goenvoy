@@ -58,33 +58,6 @@ func assertRootIdentity(t *testing.T, c *Client, uerr *url.Error, sentinel error
 	}
 }
 
-// TestScrubJSONForm checks that the HTML-escaped JSON form of the API key is scrubbed and detected.
-func TestScrubJSONForm(t *testing.T) {
-	t.Parallel()
-	const key = "fixture<key"
-	const escaped = `fixture\u003ckey`
-	cases := []struct{ name, text string }{
-		{name: "json escaped", text: `{"error":"` + escaped + `"}`},
-		{name: "raw", text: `{"error":"` + key + `"}`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			c := &Client{apiKey: key}
-			got := c.scrub(tc.text)
-			if strings.Contains(got, key) || strings.Contains(got, escaped) {
-				t.Errorf("scrub kept the key: %s", got)
-			}
-			if !strings.Contains(got, "REDACTED") {
-				t.Errorf("scrub = %q; want REDACTED marker", got)
-			}
-			if !c.containsKey(tc.text) {
-				t.Errorf("containsKey(%q) = false; want true", tc.text)
-			}
-		})
-	}
-}
-
 // TestAPIErrorJSONFormRedaction checks that a status body holding the JSON-escaped key is scrubbed.
 func TestAPIErrorJSONFormRedaction(t *testing.T) {
 	t.Parallel()
@@ -148,95 +121,6 @@ func TestAPIErrorStatusCanonicalRedaction(t *testing.T) {
 				t.Errorf("status = %q; want %q", apiErr.Status, tc.want)
 			}
 		})
-	}
-}
-
-// TestScrubPercentVariants checks that lower-case, upper-case, and mixed-case hex and path-escaped spellings of the API key are scrubbed and detected.
-func TestScrubPercentVariants(t *testing.T) {
-	t.Parallel()
-	cases := []struct{ name, key, text, want string }{
-		{name: "lower-case hex", key: "fixture+k/y=1", text: "apikey=fixture%2bk%2fy%3d1", want: "apikey=REDACTED"},
-		{name: "upper-case hex", key: "fixture+k/y=1", text: "apikey=fixture%2Bk%2Fy%3D1", want: "apikey=REDACTED"},
-		{name: "mixed-case hex", key: "fixture+k/y=1", text: "apikey=fixture%2Bk%2fy%3D1", want: "apikey=REDACTED"},
-		{name: "path-escaped space", key: "fixture key", text: "fixture%20key", want: "REDACTED"},
-		{name: "URL path lower hex", key: `k"/z?`, text: "k%22/z%3f", want: "REDACTED"},
-		{name: "URL path mixed hex", key: `k"y/z 1`, text: "k%22y/z%201", want: "REDACTED"},
-		{name: "query-escaped space", key: "fixture key", text: "fixture+key", want: "REDACTED"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			assertScrubbed(t, &Client{apiKey: tc.key}, tc.text, tc.want)
-		})
-	}
-}
-
-// TestScrubPercentRepeatedPrefix checks a mixed-case escape after a long run of key prefixes.
-func TestScrubPercentRepeatedPrefix(t *testing.T) {
-	t.Parallel()
-	const bodySize = 1 << 20
-	keyPrefix := strings.Repeat("A", (4<<10)-1)
-	c := &Client{apiKey: keyPrefix + "?"}
-	prefix := strings.Repeat("A", bodySize-len(keyPrefix)-len("%3f"))
-	if got := c.scrubBody(prefix + keyPrefix + "%3f"); got != prefix+"REDACTED" {
-		t.Error("failed to redact the mixed-case escape at the end of the body")
-	}
-
-	edge := &Client{apiKey: "af?"}
-	if got := edge.scrubBody("before=%af%3f after"); got != "before=%REDACTED after" {
-		t.Error("failed to redact a key starting inside an earlier percent triplet")
-	}
-	const nonmatch = "before=%Af%3f after"
-	if got := edge.scrubBody(nonmatch); got != nonmatch {
-		t.Error("redacted a literal prefix with the wrong case")
-	}
-}
-
-// TestScrubPercentReusesSearch checks that repeated matches reuse the escaped-form matcher.
-func TestScrubPercentReusesSearch(t *testing.T) { //nolint:paralleltest // AllocsPerRun requires serial execution
-	const form = "fixture%3f"
-	const repeats = 64
-	c := &Client{apiKey: "fixture?"}
-	body := strings.Repeat(form, repeats)
-	want := strings.Repeat("REDACTED", repeats)
-	// Why: use more runs to dilute allocations from background goroutines.
-	one := testing.AllocsPerRun(100, func() { _ = c.scrub(form) })
-	many := testing.AllocsPerRun(100, func() { _ = c.scrub(body) })
-	// Why: allow the output builder to grow while ruling out allocation for every match.
-	if many > one+8 {
-		t.Errorf("allocations grew from %.0f to %.0f across %d matches; want at most 8 more", one, many, repeats)
-	}
-	if got := c.scrub(body); got != want {
-		t.Error("failed to redact adjacent mixed-case escapes")
-	}
-}
-
-// assertScrubbed checks the scrubbed text, the absence of every key form in it, and detection in the input.
-func assertScrubbed(t *testing.T, c *Client, text, want string) {
-	t.Helper()
-	got := c.scrub(text)
-	if got != want {
-		t.Errorf("scrub(%q) = %q; want %q", text, got, want)
-	}
-	for _, form := range c.keyForms() {
-		if strings.Contains(got, form) {
-			t.Errorf("scrub kept key form %q: %s", form, got)
-		}
-	}
-	if !c.containsKey(text) {
-		t.Errorf("containsKey(%q) = false; want true", text)
-	}
-	if c.containsKey(got) {
-		t.Errorf("containsKey(%q) = true; want false", got)
-	}
-}
-
-// TestKeyFormsDistinct checks that a key whose escaped forms all equal the raw key yields one form.
-func TestKeyFormsDistinct(t *testing.T) {
-	t.Parallel()
-	forms := (&Client{apiKey: "Plain-Key"}).keyForms()
-	if len(forms) != 1 || forms[0] != "Plain-Key" {
-		t.Errorf("keyForms() = %q; want [Plain-Key]", forms)
 	}
 }
 
@@ -408,8 +292,8 @@ func TestAPIErrorBodyMalformedEscapes(t *testing.T) {
 	}
 }
 
-// TestUnescapeBody checks tolerant escape decoding and byte preservation.
-func TestUnescapeBody(t *testing.T) {
+// TestDecodeBackslashEscapes checks tolerant escape decoding and byte preservation.
+func TestDecodeBackslashEscapes(t *testing.T) {
 	t.Parallel()
 	cases := []struct{ name, input, want string }{
 		{"simple escapes", `\"\\\/\b\f\n\r\t`, "\"\\/\b\f\n\r\t"},
@@ -423,8 +307,8 @@ func TestUnescapeBody(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := unescapeBody(tc.input); got != tc.want {
-				t.Errorf("unescapeBody(%q) = %q; want %q", tc.input, got, tc.want)
+			if got := decodeEscapes(tc.input, backslashEscapes); got != tc.want {
+				t.Errorf("decodeEscapes(%q) = %q; want %q", tc.input, got, tc.want)
 			}
 		})
 	}
@@ -533,7 +417,6 @@ type hiddenCauseCase struct {
 	name        string
 	cause       error
 	sentinel    error
-	wantNilErr  bool
 	wantTimeout bool
 }
 
@@ -547,8 +430,8 @@ func TestRedactedErrorAsHidesCause(t *testing.T) {
 		{name: "wrapped sentinel cause", cause: &tokenCause{Token: key, err: sentinel}, sentinel: sentinel},
 		{name: "direct sentinel cause", cause: sentinel, sentinel: sentinel},
 		{name: "timeout cause", cause: &tokenCause{Token: key, timeout: true}, wantTimeout: true},
-		{name: "nil cause", cause: nil, wantNilErr: true},
-		{name: "typed-nil cause", cause: (*tokenCause)(nil), wantNilErr: true},
+		{name: "nil cause", cause: nil},
+		{name: "typed-nil cause", cause: (*tokenCause)(nil)},
 		{name: "wrapped typed-nil cause", cause: fmt.Errorf("wrap: %w", (*tokenCause)(nil))},
 	}
 	for _, tc := range cases {
@@ -570,9 +453,9 @@ func assertHiddenURLCause(t *testing.T, c *Client, key string, tc hiddenCauseCas
 	if c.containsKey(uerr.Error()) || strings.Contains(uerr.Error(), key) {
 		t.Errorf("uerr.Error() leaked key: %s", uerr.Error())
 	}
-	if tc.wantNilErr {
-		if uerr.Err != nil {
-			t.Errorf("uerr.Err = %v; want nil", uerr.Err)
+	if isNilError(tc.cause) {
+		if any(uerr.Err) != any(tc.cause) {
+			t.Errorf("copied cause = %T; want %T", uerr.Err, tc.cause)
 		}
 		return
 	}

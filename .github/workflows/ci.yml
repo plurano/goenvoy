@@ -108,6 +108,7 @@ jobs:
         run: bash tools/golangci-modules_test.sh
       - name: Pinned versions and digests live only in the pin file
         run: bash tools/pin-literals_test.sh
+      - uses: ./.github/actions/setup-tools-go
       # Why: byte comparison of tracked files has no OS-specific path, so Ubuntu covers it (HISS-21 stated skip for macOS and Windows).
       - name: Redaction parity check detects planted drift
         run: bash tools/redact-parity_test.sh

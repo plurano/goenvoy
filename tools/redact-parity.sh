@@ -2,7 +2,8 @@
 # Compare tracked copies of the opaque error redaction code and its traversal tests.
 set -euo pipefail
 
-python3 - <<'PY'
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 - "$HERE/go" <<'PY'
 import os
 import re
 import subprocess
@@ -13,15 +14,6 @@ from pathlib import Path
 
 PACKAGE = re.compile(rb"^[ \t]*package[ \t]+")
 WRAPPER = re.compile(rb"\bredactedError\b")
-GO_NON_CODE = re.compile(
-    rb"""//[^\n]*|/\*.*?\*/|`[^`]*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'""",
-    re.DOTALL,
-)
-WRAPPER_NAME = rb"redactedError(?![A-Za-z_0-9\x80-\xff])"
-WRAPPER_TYPE = re.compile(rb"^[ \t]*type[ \t]+" + WRAPPER_NAME)
-TYPE_GROUP = re.compile(rb"^[ \t]*type[ \t]*\(")
-GROUPED_WRAPPER = re.compile(rb"^[ \t]*" + WRAPPER_NAME + rb"(?=[ \t]*[^ \t);])")
-DELIMITER = re.compile(rb"[(){}\[\]]")
 EXCEPTIONS = {
     Path("downloadclient/sabnzbd/redact.go"): "Separate legacy redaction implementation.",
 }
@@ -54,24 +46,22 @@ def compare(reference, baseline, candidate):
             raise ValueError(f"{candidate}:{number}: differs from {reference}")
 
 
-def declares_wrapper(lines):
-    """Find the wrapper's type spec after masking comments and literals."""
-    source = b"".join(line for _, line in lines)
-    source = GO_NON_CODE.sub(lambda match: re.sub(rb"[^\n]", b" ", match[0]), source)
-    depth = 0
-    for line in source.splitlines():
-        if depth == 0:
-            if WRAPPER_TYPE.match(line):
-                return True
-            group = TYPE_GROUP.match(line)
-            if group is None:
-                continue
-            depth = 1
-            line = line[group.end():]
-        if depth == 1 and GROUPED_WRAPPER.match(line):
-            return True
-        depth += sum(1 if token in b"([{" else -1 for token in DELIMITER.findall(line))
-    return False
+def check_exceptions(tracked):
+    """Verify that each exception is tracked and declares the wrapper."""
+    for path in EXCEPTIONS:
+        if path not in tracked:
+            raise ValueError(f"{path}:1: stale exception (path is not tracked)")
+        read_source(path)
+    result = subprocess.run(
+        ["go", "-C", sys.argv[1], "run", "-p", "4", "./redactdecl", "redactedError",
+         *(str(path.absolute()) for path in EXCEPTIONS)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(result.stderr.strip() or f"redactdecl exited {result.returncode}")
+    for path, declares in zip(EXCEPTIONS, result.stdout.splitlines(), strict=True):
+        if declares != "true":
+            raise ValueError(f"{path}:1: stale exception (missing redactedError declaration)")
 
 
 def check_parity():
@@ -81,17 +71,14 @@ def check_parity():
         timeout=60,
     ).split(b"\0")
     tracked = [Path(os.fsdecode(raw_path)) for raw_path in raw_paths if raw_path]
-    for path in EXCEPTIONS:
-        if path not in tracked:
-            raise ValueError(f"{path}:1: stale exception (path is not tracked)")
+    check_exceptions(tracked)
 
     copies = {}
     for path in tracked:
-        lines = read_source(path)
         if path in EXCEPTIONS:
-            if not declares_wrapper(lines):
-                raise ValueError(f"{path}:1: stale exception (missing redactedError declaration)")
-        elif any(WRAPPER.search(line) for _, line in lines):
+            continue
+        lines = read_source(path)
+        if any(WRAPPER.search(line) for _, line in lines):
             if path.name != "redact.go":
                 raise ValueError(f"{path}:1: redactedError reference outside the parity set")
             copies[path.parent] = lines
