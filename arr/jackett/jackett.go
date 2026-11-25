@@ -120,6 +120,8 @@ func (c *Client) scrub(s string) string {
 		return s
 	}
 	var b strings.Builder
+	// Why: reserve space up front to avoid repeated growth across matches.
+	b.Grow(len(s))
 	offset := 0
 	for steps := 0; steps < len(s) && start >= 0; steps++ {
 		b.WriteString(s[offset:start])

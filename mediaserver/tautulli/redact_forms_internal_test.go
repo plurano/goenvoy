@@ -163,8 +163,9 @@ func TestScrubPercentReusesSearch(t *testing.T) { //nolint:paralleltest // Alloc
 	c := &Client{apiKey: "fixture?"}
 	body := strings.Repeat(form, repeats)
 	want := strings.Repeat("REDACTED", repeats)
-	one := testing.AllocsPerRun(5, func() { _ = c.scrub(form) })
-	many := testing.AllocsPerRun(5, func() { _ = c.scrub(body) })
+	// Why: use more runs to dilute allocations from background goroutines.
+	one := testing.AllocsPerRun(100, func() { _ = c.scrub(form) })
+	many := testing.AllocsPerRun(100, func() { _ = c.scrub(body) })
 	// Why: allow the output builder to grow while ruling out allocation for every match.
 	if many > one+8 {
 		t.Errorf("allocations grew from %.0f to %.0f across %d matches; want at most 8 more", one, many, repeats)
@@ -402,7 +403,7 @@ func assertAPIErrorEscapedBody(t *testing.T, key, body, want string) {
 	}
 }
 
-// TestTransportURLPathKeyRedaction checks a closed server error for a key in the URL path.
+// TestTransportURLPathKeyRedaction checks URL path redaction after a transport failure.
 func TestTransportURLPathKeyRedaction(t *testing.T) {
 	t.Parallel()
 	const key = `k"y/z 1`
@@ -419,12 +420,11 @@ func TestTransportURLPathKeyRedaction(t *testing.T) {
 	}
 }
 
-// assertTransportURLPathKeyRedaction checks the error and URL from a closed server.
+// assertTransportURLPathKeyRedaction checks the error text and URL after a transport failure.
 func assertTransportURLPathKeyRedaction(t *testing.T, key, escaped, path string) {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	srv.Close()
-	c, err := New(srv.URL+"/"+path, key, WithHTTPClient(srv.Client()))
+	hc := &http.Client{Transport: redactTransport{err: errors.New("fixture transport failure")}}
+	c, err := New("http://example.invalid/"+path, key, WithHTTPClient(hc))
 	if err != nil {
 		t.Fatal(err)
 	}
