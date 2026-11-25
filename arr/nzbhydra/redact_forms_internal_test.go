@@ -135,6 +135,45 @@ func TestScrubPercentVariants(t *testing.T) {
 	}
 }
 
+// TestScrubPercentRepeatedPrefix checks a mixed-case escape after a long run of key prefixes.
+func TestScrubPercentRepeatedPrefix(t *testing.T) {
+	t.Parallel()
+	const bodySize = 1 << 20
+	keyPrefix := strings.Repeat("A", (4<<10)-1)
+	c := &Client{apiKey: keyPrefix + "?"}
+	prefix := strings.Repeat("A", bodySize-len(keyPrefix)-len("%3f"))
+	if got := c.scrubBody(prefix + keyPrefix + "%3f"); got != prefix+"REDACTED" {
+		t.Error("failed to redact the mixed-case escape at the end of the body")
+	}
+
+	edge := &Client{apiKey: "af?"}
+	if got := edge.scrubBody("before=%af%3f after"); got != "before=%REDACTED after" {
+		t.Error("failed to redact a key starting inside an earlier percent triplet")
+	}
+	const nonmatch = "before=%Af%3f after"
+	if got := edge.scrubBody(nonmatch); got != nonmatch {
+		t.Error("redacted a literal prefix with the wrong case")
+	}
+}
+
+// TestScrubPercentReusesSearch checks that repeated matches reuse the escaped-form matcher.
+func TestScrubPercentReusesSearch(t *testing.T) { //nolint:paralleltest // AllocsPerRun requires serial execution
+	const form = "fixture%3f"
+	const repeats = 64
+	c := &Client{apiKey: "fixture?"}
+	body := strings.Repeat(form, repeats)
+	want := strings.Repeat("REDACTED", repeats)
+	one := testing.AllocsPerRun(5, func() { _ = c.scrub(form) })
+	many := testing.AllocsPerRun(5, func() { _ = c.scrub(body) })
+	// Why: allow the output builder to grow while ruling out allocation for every match.
+	if many > one+8 {
+		t.Errorf("allocations grew from %.0f to %.0f across %d matches; want at most 8 more", one, many, repeats)
+	}
+	if got := c.scrub(body); got != want {
+		t.Error("failed to redact adjacent mixed-case escapes")
+	}
+}
+
 // assertScrubbed checks the scrubbed text, the absence of every key form in it, and detection in the input.
 func assertScrubbed(t *testing.T, c *Client, text, want string) {
 	t.Helper()
@@ -478,6 +517,9 @@ func assertHiddenURLCause(t *testing.T, c *Client, key string, tc hiddenCauseCas
 			t.Errorf("uerr.Err = %v; want nil", uerr.Err)
 		}
 		return
+	}
+	if uerr.Err == nil {
+		t.Fatal("sanitized URL error lost its cause")
 	}
 	assertOpaqueURLCause(t, uerr, tc)
 }

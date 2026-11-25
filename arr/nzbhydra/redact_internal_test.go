@@ -477,7 +477,7 @@ func TestStatusTextRedaction(t *testing.T) {
 			c := responseTextClient(t, key, "fixture failure")
 			c.httpClient.Transport = responseStatusTransport{
 				RoundTripper: c.httpClient.Transport,
-				status:       "500 " + key + " " + url.QueryEscape(key),
+				status:       "500 raw=" + key + " escaped=" + url.QueryEscape(key),
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
@@ -487,6 +487,9 @@ func TestStatusTextRedaction(t *testing.T) {
 				t.Fatalf("expected APIError, got %v", err)
 			}
 			assertSafeText(t, apiErr.Status, key)
+			if apiErr.Status != "500 raw=REDACTED escaped=REDACTED" {
+				t.Error("Status did not preserve the status code and both redaction markers")
+			}
 			if apiErr.StatusCode != http.StatusInternalServerError {
 				t.Errorf("status code = %d", apiErr.StatusCode)
 			}
@@ -575,8 +578,12 @@ func TestRedactErrorFanoutBounded(t *testing.T) {
 	go func() { done <- c.redactError(err) }()
 	select {
 	case got := <-done:
-		if got == nil {
-			t.Error("redactError returned nil for a non-nil error")
+		hidden, ok := got.(*redactedError) //nolint:errorlint // require the wrapper itself without traversing the tree
+		if !ok || hidden == nil {
+			t.Fatalf("redactError(%T) = %T; want *redactedError", err, got)
+		}
+		if hidden.Error() != redactedTreeMsg {
+			t.Errorf("Error() = %q; want %q", hidden.Error(), redactedTreeMsg)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("redactError did not return within 2s")

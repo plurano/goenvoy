@@ -17,18 +17,20 @@ func (c *Client) scrub(s string) string {
 	for _, form := range c.keyForms() {
 		s = strings.ReplaceAll(s, form, "REDACTED")
 	}
-	start, end := c.nextPercentKey(s)
+	forms := c.percentForms()
+	start, end := nextPercentKey(s, 0, forms)
 	if start < 0 {
 		return s
 	}
 	var b strings.Builder
-	for steps, maxSpans := 0, len(s); steps < maxSpans && start >= 0; steps++ {
-		b.WriteString(s[:start])
+	offset := 0
+	for steps := 0; steps < len(s) && start >= 0; steps++ {
+		b.WriteString(s[offset:start])
 		b.WriteString("REDACTED")
-		s = s[end:]
-		start, end = c.nextPercentKey(s)
+		offset = end
+		start, end = nextPercentKey(s, offset, forms)
 	}
-	b.WriteString(s)
+	b.WriteString(s[offset:])
 	return b.String()
 }
 
@@ -123,53 +125,130 @@ func (c *Client) keyForms() []string {
 	return forms
 }
 
-// nextPercentKey returns the byte span of the next query-escaped, path-escaped, or URL-path-escaped API key match in s with percent-escape hex case ignored, or -1, -1 when absent.
-func (c *Client) nextPercentKey(s string) (int, int) {
+// percentForms prepares the distinct query, path, and URL-path spellings in matching order.
+func (c *Client) percentForms() []percentForm {
 	if c.apiKey == "" {
-		return -1, -1
+		return nil
 	}
 	candidates := []string{url.QueryEscape(c.apiKey), url.PathEscape(c.apiKey), (&url.URL{Path: c.apiKey}).EscapedPath()}
-	forms := make([]string, 0, len(candidates))
-	for _, form := range candidates {
-		if !slices.Contains(forms, form) {
-			forms = append(forms, form)
+	forms := make([]percentForm, 0, len(candidates))
+	for i, candidate := range candidates {
+		if !slices.Contains(candidates[:i], candidate) {
+			forms = append(forms, newPercentForm(candidate))
 		}
 	}
-	for i := range len(s) {
-		for _, form := range forms {
-			if i+len(form) <= len(s) && matchPercentForm(s[i:i+len(form)], form) {
-				return i, i + len(form)
+	return forms
+}
+
+// nextPercentKey finds the earliest escaped-key span at or after offset, or -1, -1.
+func nextPercentKey(text string, offset int, forms []percentForm) (int, int) {
+	start, end := -1, -1
+	for i := range forms {
+		begin, stop := forms[i].findAfter(text, offset)
+		if begin >= 0 && (start < 0 || begin < start) {
+			start, end = begin, stop
+		}
+	}
+	return start, end
+}
+
+type percentForm struct {
+	prefix   string
+	pattern  string
+	fallback []int
+	start    int
+	end      int
+}
+
+// newPercentForm builds a Knuth-Morris-Pratt prefix table for the pattern starting at its first percent escape.
+func newPercentForm(form string) percentForm {
+	prefix, pattern := "", form
+	if i := strings.IndexByte(form, '%'); i >= 0 {
+		prefix, pattern = form[:i], form[i:]
+	}
+	f := percentForm{prefix: prefix, pattern: pattern, fallback: make([]int, len(pattern))}
+	for i := 1; i < len(pattern); i++ {
+		f.fallback[i] = f.advance(f.fallback[i-1], pattern[i])
+	}
+	return f
+}
+
+// advance extends the current pattern match by one byte or falls back to its longest viable prefix.
+func (f *percentForm) advance(matched int, b byte) int {
+	for steps := 0; steps < len(f.pattern) && matched > 0 && f.pattern[matched] != b; steps++ {
+		matched = f.fallback[matched-1]
+	}
+	if f.pattern[matched] == b {
+		matched++
+	}
+	return matched
+}
+
+// findAfter reuses a pending match or exhausted search across successive replacements.
+func (f *percentForm) findAfter(text string, offset int) (int, int) {
+	if f.end != 0 && (f.start >= offset || f.start < 0) {
+		return f.start, f.end
+	}
+	// Why: an invalidated match read at most one pattern length beyond the new offset.
+	start, end := f.find(text[offset:])
+	if start < 0 {
+		f.start, f.end = -1, -1
+	} else {
+		f.start, f.end = offset+start, offset+end
+	}
+	return f.start, f.end
+}
+
+// find returns the first matching span in text, or -1, -1.
+func (f *percentForm) find(text string) (int, int) {
+	matched := 0
+	foldHex := f.pattern[0] == '%'
+	for i := len(f.prefix); i < len(text); i++ {
+		b := text[i]
+		if foldHex {
+			b = percentByte(text, i)
+		}
+		matched = f.advance(matched, b)
+		if matched == len(f.pattern) {
+			start := i + 1 - matched - len(f.prefix)
+			if f.matchesPrefix(text, start) {
+				return start, i + 1
 			}
+			matched = f.fallback[matched-1]
 		}
 	}
 	return -1, -1
 }
 
-// matchPercentForm reports whether s (of length len(form)) equals form, ignoring hex-digit case for the two bytes after each '%' in form.
-func matchPercentForm(s, form string) bool {
-	for i, hex := 0, 0; i < len(form); i++ {
-		got, want := s[i], form[i]
-		if hex > 0 {
-			hex--
-			if got >= 'a' && got <= 'f' {
-				got -= 'a' - 'A'
-			}
-		} else if want == '%' {
-			hex = 2
-		}
-		if got != want {
+// matchesPrefix checks the literal prefix without folding, even when it starts inside an earlier escape.
+func (f *percentForm) matchesPrefix(text string, start int) bool {
+	// Why: compare backwards so a prior percent sign stops a failed check before it can recheck that candidate's prefix.
+	for i := len(f.prefix) - 1; i >= 0; i-- {
+		if text[start+i] != f.prefix[i] {
 			return false
 		}
 	}
 	return true
 }
 
+// percentByte folds lowercase hex only in the two positions after a percent sign.
+func percentByte(text string, i int) byte {
+	b := text[i]
+	if b < 'a' || b > 'f' {
+		return b
+	}
+	if (i >= 1 && text[i-1] == '%') || (i >= 2 && text[i-2] == '%') {
+		return b - ('a' - 'A')
+	}
+	return b
+}
+
 type redactedError struct {
 	msg string
 	// Why: no Unwrap method, so callers cannot reach text that holds the key.
 	err error
-	// Why: As sanitizes a copied URL error with the same key scrub as the message.
-	c *Client
+	// Why: As uses the original key even if the client is replaced.
+	key string
 }
 
 // Error returns the sanitized message.
@@ -177,8 +256,8 @@ func (e *redactedError) Error() string { return e.msg }
 
 // Is matches the hidden error without exposing it.
 func (e *redactedError) Is(target error) bool {
-	// Why: like errors.Is, compare only a comparable target, so an uncomparable one never panics.
-	canCompare := target != nil && reflect.TypeOf(target).Comparable()
+	// Why: a comparable type may contain a dynamically uncomparable value.
+	canCompare := reflect.ValueOf(target).Comparable()
 	found := false
 	e.walk(func(node error) bool {
 		if canCompare && node == target {
@@ -233,7 +312,7 @@ func (e *redactedError) Temporary() bool {
 	return reported
 }
 
-// walk visits the hidden tree depth-first, in errors.Is order, and stops when visit reports true, visited nodes exceed maxWalkSteps, or joined errors exceed maxErrNodes.
+// walk visits the hidden tree depth-first in errors.Is order, stopping at a match or a node or join budget.
 func (e *redactedError) walk(visit func(error) bool) {
 	// Why: errors.Is and errors.As visit every path, exponential on a fan-out tree; only joined errors spend the maxErrNodes budget, so a long quiet chain stays reachable.
 	// Why: cyclic single-unwrap chain must terminate; bound far above any real chain.
@@ -244,17 +323,17 @@ func (e *redactedError) walk(visit func(error) bool) {
 	for steps, branches := 0, 0; steps < maxWalkSteps && len(stack) > 0; steps++ {
 		var node error
 		stack, node = popWalkNode(stack)
+		joined, isJoin := node.(interface{ Unwrap() []error })
+		if isJoin && branches == maxErrNodes {
+			return
+		}
+		if isJoin {
+			branches++
+		}
 		if visit(node) {
 			return
 		}
-		children, joined := wrappedChildren(node)
-		if joined {
-			branches++
-		}
-		if branches > maxErrNodes {
-			return
-		}
-		if children != nil {
+		if children := walkChildren(node, joined); children != nil {
 			stack = append(stack, children)
 		}
 	}
@@ -271,19 +350,15 @@ func popWalkNode(stack [][]error) ([][]error, error) {
 	return stack[:len(stack)-1], node
 }
 
-// wrappedChildren returns the non-nil child slice err wraps directly and whether err joins several.
-func wrappedChildren(err error) ([]error, bool) {
-	if isNilError(err) {
-		return nil, false
+// walkChildren returns the children available for the depth-first walk.
+func walkChildren(node error, joined interface{ Unwrap() []error }) []error {
+	if joined != nil {
+		return trimNilErrors(joined.Unwrap())
 	}
-	if w := errors.Unwrap(err); !isNilError(w) {
-		return []error{w}, false
+	if child := errors.Unwrap(node); !isNilError(child) {
+		return []error{child}
 	}
-	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok {
-		return nil, false
-	}
-	return trimNilErrors(joined.Unwrap()), true
+	return nil
 }
 
 // trimNilErrors returns errs starting at its first non-nil element, or nil when none exists.
@@ -324,7 +399,8 @@ func (e *redactedError) As(target any) bool {
 	for i := 0; i < maxErrNodes && i < len(queue); i++ {
 		if uerr, ok := queue[i].(*url.Error); ok && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
 			// Why: hand out a scrubbed copy, never the original that holds the key.
-			*dst = &url.Error{Op: e.c.scrub(uerr.Op), URL: e.c.scrub(redactURL(e.c.scrub(uerr.URL))), Err: e.c.hideCause(uerr.Err)}
+			c := Client{apiKey: e.key}
+			*dst = &url.Error{Op: c.scrub(uerr.Op), URL: c.scrub(redactURL(c.scrub(uerr.URL))), Err: c.hideCause(uerr.Err)}
 			return true
 		}
 		queue = appendWrapped(queue, queue[i])
@@ -356,9 +432,9 @@ func (c *Client) scrubError(err error) error {
 		return err
 	}
 	if tooLarge {
-		return &redactedError{msg: redactedTreeMsg, err: err, c: c}
+		return &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
 	}
-	return &redactedError{msg: c.scrub(err.Error()), err: err, c: c}
+	return &redactedError{msg: c.scrub(err.Error()), err: err, key: c.apiKey}
 }
 
 // hideCause wraps a recovered URL error cause in an opaque error with no Unwrap method.
@@ -367,9 +443,9 @@ func (c *Client) hideCause(err error) error {
 		return nil
 	}
 	if _, tooLarge := c.checkErrorTree(err); tooLarge {
-		return &redactedError{msg: redactedTreeMsg, err: err, c: c}
+		return &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
 	}
-	return &redactedError{msg: c.scrub(err.Error()), err: err, c: c}
+	return &redactedError{msg: c.scrub(err.Error()), err: err, key: c.apiKey}
 }
 
 // carriesKey reports whether an error tree contains the API key or exceeds the node limit.
@@ -428,7 +504,7 @@ func (c *Client) containsKey(s string) bool {
 	if slices.ContainsFunc(c.keyForms(), func(form string) bool { return strings.Contains(s, form) }) {
 		return true
 	}
-	start, _ := c.nextPercentKey(s)
+	start, _ := nextPercentKey(s, 0, c.percentForms())
 	return start >= 0
 }
 

@@ -100,6 +100,9 @@ func TestAPIErrorStatusRedaction(t *testing.T) {
 		t.Fatalf("expected APIError, got %v", err)
 	}
 	assertNoKeyForms(t, apiErr.Status, key)
+	if apiErr.Status != "500 REDACTED" {
+		t.Error("Status did not preserve the status code and redaction marker")
+	}
 	assertNoKeyForms(t, apiErr.Error(), key)
 	if apiErr.StatusCode != http.StatusInternalServerError {
 		t.Errorf("StatusCode = %d; want %d", apiErr.StatusCode, http.StatusInternalServerError)

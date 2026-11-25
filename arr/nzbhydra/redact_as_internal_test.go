@@ -103,6 +103,31 @@ func TestRedactedErrorAsOpRedaction(t *testing.T) {
 	}
 }
 
+// TestRedactedErrorAsKeepsOriginalKey checks delayed URL extraction after the client is replaced.
+func TestRedactedErrorAsKeepsOriginalKey(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-original?"
+	c := &Client{apiKey: key}
+	inner := &url.Error{
+		Op:  "fixture op " + key,
+		URL: "https://example.invalid/" + url.PathEscape(key),
+		Err: errors.New("fixture cause " + key),
+	}
+	hidden := c.scrubError(fmt.Errorf("outer: %w", inner))
+	*c = Client{apiKey: "fixture-replacement?"}
+
+	var got *url.Error
+	if !errors.As(hidden, &got) || got == nil || got == inner {
+		t.Fatal("errors.As did not return a sanitized URL error copy")
+	}
+	if got.Op != "fixture op REDACTED" || got.URL != "https://example.invalid/REDACTED" {
+		t.Error("recovered URL error did not redact the original key")
+	}
+	if got.Err == nil || got.Err.Error() != "fixture cause REDACTED" {
+		t.Error("recovered URL error cause did not redact the original key")
+	}
+}
+
 // TestRedactedErrorAsFanoutBounded checks that errors.As on a hidden exponential tree with a key-bearing leaf returns promptly.
 func TestRedactedErrorAsFanoutBounded(t *testing.T) {
 	t.Parallel()
@@ -137,9 +162,8 @@ func (redactSliceErr) Error() string { return "fixture slice error" }
 func hiddenRedacted(t *testing.T, key string, err error) error {
 	t.Helper()
 	got := (&Client{apiKey: key}).scrubError(err)
-	var hidden *redactedError
-	if !errors.As(got, &hidden) {
-		t.Fatalf("scrubError(%v) did not hide the tree", err)
+	if hidden, ok := got.(*redactedError); !ok || hidden == nil { //nolint:errorlint // require the wrapper itself without traversing the tree
+		t.Fatalf("scrubError(%T) = %T; want *redactedError", err, got)
 	}
 	return got
 }
@@ -352,14 +376,50 @@ func TestRedactErrorJoinFanoutBounded(t *testing.T) {
 			}) {
 				t.Fatalf("%s returned nil", tc.name)
 			}
-			var hidden *redactedError
-			if !errors.As(got, &hidden) {
+			hidden, ok := got.(*redactedError) //nolint:errorlint // require the wrapper itself without traversing the tree
+			if !ok || hidden == nil {
 				t.Fatalf("%s(%T) = %T; want *redactedError", tc.name, tree, got)
 			}
-			if got.Error() != redactedTreeMsg {
-				t.Errorf("Error() = %q; want %q", got.Error(), redactedTreeMsg)
+			if hidden.Error() != redactedTreeMsg {
+				t.Errorf("Error() = %q; want %q", hidden.Error(), redactedTreeMsg)
 			}
-			assertNoKeyForms(t, got.Error(), key)
+			assertNoKeyForms(t, hidden.Error(), key)
+		})
+	}
+}
+
+// TestRedactedErrorWalkJoinBudget checks the last allowed join, its leaf, and the first disallowed join.
+func TestRedactedErrorWalkJoinBudget(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		joins      int
+		wantVisits int
+		wantLeaf   bool
+	}{
+		{name: "64 joins", joins: 64, wantVisits: 65, wantLeaf: true},
+		{name: "65 joins", joins: 65, wantVisits: 64, wantLeaf: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			leaf := errors.New("fixture leaf")
+			tree := leaf
+			for range tc.joins {
+				tree = errors.Join(tree)
+			}
+			var visits int
+			var last error
+			(&redactedError{err: tree}).walk(func(node error) bool {
+				visits++
+				last = node
+				return false
+			})
+			if visits != tc.wantVisits {
+				t.Errorf("visited %d nodes; want %d", visits, tc.wantVisits)
+			}
+			if sawLeaf := last == leaf; sawLeaf != tc.wantLeaf { //nolint:errorlint // require a visit to the leaf itself
+				t.Errorf("visited leaf = %v; want %v", sawLeaf, tc.wantLeaf)
+			}
 		})
 	}
 }
@@ -372,6 +432,48 @@ func TestRedactedErrorIsUncomparableTarget(t *testing.T) {
 	hidden := hiddenRedacted(t, key, fmt.Errorf("a %s: %w", key, leaf))
 	if errors.Is(hidden, redactSliceErr{"x"}) {
 		t.Error("errors.Is with an uncomparable target = true; want false")
+	}
+}
+
+// redactDynamicErr can carry a dynamically uncomparable value in a comparable struct type.
+type redactDynamicErr struct {
+	value   any
+	matches bool
+}
+
+// Error returns the fixture error text.
+func (redactDynamicErr) Error() string { return "fixture dynamic error" }
+
+// Is reports whether this fixture matches another dynamic error.
+func (e redactDynamicErr) Is(target error) bool {
+	_, ok := target.(redactDynamicErr)
+	return ok && e.matches
+}
+
+// TestRedactedErrorIsDynamicTarget checks dynamically uncomparable targets and the fallback to a custom Is.
+func TestRedactedErrorIsDynamicTarget(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key"
+	target := redactDynamicErr{value: []string{"fixture"}}
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{name: "no match", want: false},
+		{name: "custom match", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			node := redactDynamicErr{value: target.value, matches: tc.want}
+			sentinel := errors.New("fixture sentinel")
+			hidden := hiddenRedacted(t, key, fmt.Errorf("fixture %s: %w", key, errors.Join(sentinel, node)))
+			if got := errors.Is(hidden, target); got != tc.want {
+				t.Errorf("errors.Is with dynamically uncomparable target = %v; want %v", got, tc.want)
+			}
+			if !errors.Is(hidden, sentinel) {
+				t.Error("errors.Is did not match a pointer sentinel")
+			}
+		})
 	}
 }
 
@@ -489,6 +591,7 @@ func TestRedactedErrorTypedNilWalk(t *testing.T) {
 // TestIsNilError checks nil detection across untyped nil, typed-nil values, non-nil pointers, and value errors.
 func TestIsNilError(t *testing.T) {
 	t.Parallel()
+	c := &Client{apiKey: "fixture-nil-key"}
 	var typedNil *url.Error
 	var sliceNil redactSliceErr
 	cases := []struct {
@@ -506,9 +609,25 @@ func TestIsNilError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			if got := isNilError(tc.err); got != tc.want {
-				t.Errorf("isNilError(%v) = %v; want %v", tc.err, got, tc.want)
+				t.Errorf("isNilError(%T) = %v; want %v", tc.err, got, tc.want)
 			}
+			assertNilScrubResult(t, c.scrubError(tc.err), tc.err, tc.want)
 		})
+	}
+}
+
+// assertNilScrubResult checks whether scrubError preserved the input or hid a typed-nil error.
+func assertNilScrubResult(t *testing.T, got, input error, wantNil bool) {
+	t.Helper()
+	if input == nil || !wantNil {
+		if got != input { //nolint:errorlint // require the exact input to pass through
+			t.Errorf("scrubError(%T) did not preserve the input", input)
+		}
+		return
+	}
+	hidden, ok := got.(*redactedError) //nolint:errorlint // typed nil must return the concrete safe wrapper
+	if !ok || hidden == nil || hidden.Error() != redactedTreeMsg {
+		t.Errorf("scrubError(%T) did not return the fixed redaction message", input)
 	}
 }
 

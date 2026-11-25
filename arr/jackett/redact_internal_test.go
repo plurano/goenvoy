@@ -498,8 +498,12 @@ func TestRedactErrorFanoutBounded(t *testing.T) {
 	go func() { done <- c.redactError(err) }()
 	select {
 	case got := <-done:
-		if got == nil {
-			t.Error("redactError returned nil for a non-nil error")
+		hidden, ok := got.(*redactedError) //nolint:errorlint // require the wrapper itself without traversing the tree
+		if !ok || hidden == nil {
+			t.Fatalf("redactError(%T) = %T; want *redactedError", err, got)
+		}
+		if hidden.Error() != redactedTreeMsg {
+			t.Errorf("Error() = %q; want %q", hidden.Error(), redactedTreeMsg)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("redactError did not return within 2s")
