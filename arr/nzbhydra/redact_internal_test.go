@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -104,6 +106,41 @@ func assertRedacted(t *testing.T, err error, key string, wantMarker bool) {
 // redactionClient creates a client with a test server and optional transport or body errors.
 func redactionClient(t *testing.T, key string, status int, read bool, transportErr error) *Client {
 	t.Helper()
+	baseURL, hc := redactionEndpoint(t, key, status == 0 && transportErr == nil)
+	if transportErr != nil {
+		hc.Transport = redactionResponseTransport(t, status, read, transportErr)
+	}
+	c, err := New(baseURL, key, WithHTTPClient(hc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// redactionResponseTransport supplies the configured failure and closes the request body.
+func redactionResponseTransport(t *testing.T, status int, read bool, transportErr error) redactionTransport {
+	t.Helper()
+	return redactionTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Body != nil {
+			if err := r.Body.Close(); err != nil {
+				t.Errorf("nzbhydra test: close request body: %v", err)
+			}
+		}
+		if !read {
+			return nil, transportErr
+		}
+		return &http.Response{StatusCode: status, Body: redactionFailure{transportErr}, Header: make(http.Header)}, nil
+	})
+}
+
+// redactionEndpoint supplies a response server or a deterministic dial failure.
+func redactionEndpoint(t *testing.T, key string, dialFailure bool) (string, *http.Client) {
+	t.Helper()
+	if dialFailure {
+		dialErr := &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+		transport := redactionResponseTransport(t, 0, false, dialErr)
+		return "http://example.invalid", &http.Client{Transport: transport}
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		if _, err := io.Copy(w, strings.NewReader(key+" "+url.QueryEscape(key))); err != nil {
@@ -111,26 +148,7 @@ func redactionClient(t *testing.T, key string, status int, read bool, transportE
 		}
 	}))
 	t.Cleanup(srv.Close)
-	hc := srv.Client()
-	if status == 0 && transportErr == nil {
-		srv.Close()
-	}
-	if transportErr != nil {
-		hc.Transport = redactionTransport(func(r *http.Request) (*http.Response, error) {
-			if r.Body != nil {
-				r.Body.Close()
-			}
-			if !read {
-				return nil, transportErr
-			}
-			return &http.Response{StatusCode: status, Body: redactionFailure{transportErr}, Header: make(http.Header)}, nil
-		})
-	}
-	c, err := New(srv.URL, key, WithHTTPClient(hc))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c
+	return srv.URL, srv.Client()
 }
 
 // TestScrubBoundaries checks empty keys, URL error immutability, and error-tree size limits.

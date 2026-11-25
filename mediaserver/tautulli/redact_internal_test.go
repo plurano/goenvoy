@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -90,22 +92,11 @@ func TestAPIErrorResultRedaction(t *testing.T) {
 // checkRequestRedaction checks redaction and error kinds using the configured fixture.
 func checkRequestRedaction(t *testing.T, key string, sentinel error, closed bool, transport http.RoundTripper, timedOut bool) {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		body := fmt.Sprintf("raw %s escaped %s", key, url.QueryEscape(key))
-		if _, err := io.Copy(w, strings.NewReader(body)); err != nil {
-			t.Errorf("tautulli test: write redaction response: %v", err)
-		}
-	}))
-	t.Cleanup(server.Close)
-	if closed {
-		server.Close()
-	}
-	client := server.Client()
+	baseURL, client := redactionEndpoint(t, key, closed)
 	if transport != nil {
 		client.Transport = transport
 	}
-	c, err := New(server.URL, key, WithHTTPClient(client))
+	c, err := New(baseURL, key, WithHTTPClient(client))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +105,24 @@ func checkRequestRedaction(t *testing.T, key string, sentinel error, closed bool
 	_, err = c.GetActivity(ctx)
 	assertRedactedTree(t, err, key)
 	assertRedactionKind(t, err, sentinel, closed, transport, timedOut)
+}
+
+// redactionEndpoint supplies a response server or a deterministic dial failure.
+func redactionEndpoint(t *testing.T, key string, dialFailure bool) (string, *http.Client) {
+	t.Helper()
+	if dialFailure {
+		transport := redactTransport{err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
+		return "http://example.invalid", &http.Client{Transport: transport}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		body := fmt.Sprintf("raw %s escaped %s", key, url.QueryEscape(key))
+		if _, err := io.Copy(w, strings.NewReader(body)); err != nil {
+			t.Errorf("tautulli test: write redaction response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server.URL, server.Client()
 }
 
 // Why: sentinel, timeout, and status contracts survive text sanitization.

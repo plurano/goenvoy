@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -409,10 +410,10 @@ func TestRedactedErrorWalkJoinBudget(t *testing.T) {
 			}
 			var visits int
 			var last error
-			(&redactedError{err: tree}).walk(func(node error) bool {
+			(&redactedError{err: tree}).walk(func(node error) walkAction {
 				visits++
 				last = node
-				return false
+				return walkDescend
 			})
 			if visits != tc.wantVisits {
 				t.Errorf("visited %d nodes; want %d", visits, tc.wantVisits)
@@ -683,5 +684,131 @@ func TestRedactedErrorClassifiers(t *testing.T) {
 				t.Errorf("Temporary() = %v; want %v", value, tc.want)
 			}
 		})
+	}
+}
+
+// TestRedactedErrorTimeoutTemporaryURLOrder checks that the first classifier decides both answers.
+func TestRedactedErrorTimeoutTemporaryURLOrder(t *testing.T) {
+	t.Parallel()
+	nonTimeout := &url.Error{Err: errors.New("fixture failure")}
+	timeout := &net.DNSError{IsTimeout: true, IsTemporary: true}
+	cases := []struct {
+		name string
+		tree error
+		want bool
+	}{
+		{"URL error first", errors.Join(nonTimeout, timeout), false},
+		{"timeout first", errors.Join(timeout, nonTimeout), true},
+		{"URL error with nil cause", errors.Join(&url.Error{}, timeout), false},
+		{"URL error with typed-nil cause", errors.Join(&url.Error{Err: (*net.DNSError)(nil)}, timeout), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := &redactedError{err: tc.tree}
+			if value := got.Timeout(); value != tc.want {
+				t.Errorf("Timeout() = %v; want %v", value, tc.want)
+			}
+			if value := got.Temporary(); value != tc.want {
+				t.Errorf("Temporary() = %v; want %v", value, tc.want)
+			}
+		})
+	}
+}
+
+// redactCountingError counts Is calls made while walking a fixture tree.
+type redactCountingError struct{ calls int }
+
+// Error returns the fixture error text.
+func (*redactCountingError) Error() string { return "fixture counting error" }
+
+// Is counts the visit and leaves the search running.
+func (e *redactCountingError) Is(error) bool {
+	e.calls++
+	return false
+}
+
+// TestRedactedErrorWalkNestedBudget verifies that nested wrappers share the outer walk budget.
+func TestRedactedErrorWalkNestedBudget(t *testing.T) {
+	t.Parallel()
+	counted := &redactCountingError{}
+	children := make([]error, maxWalkSteps+1)
+	for i := range children {
+		children[i] = counted
+	}
+	var tree error = counted
+	for range 4 {
+		children[0] = tree
+		tree = &redactedError{err: errors.Join(children...)}
+	}
+	if errors.Is(tree, errors.New("fixture absent target")) {
+		t.Error("errors.Is matched an absent target")
+	}
+	if counted.calls == 0 || counted.calls > maxWalkSteps {
+		t.Errorf("counted %d Is calls; want 1 through %d", counted.calls, maxWalkSteps)
+	}
+}
+
+// redactWideJoin exposes a fixed child slice without formatting its children.
+type redactWideJoin []error
+
+// Error returns the fixture error text.
+func (redactWideJoin) Error() string { return "fixture wide join" }
+
+// Unwrap returns the fixture children, which may include nil slots.
+func (e redactWideJoin) Unwrap() []error { return e }
+
+// TestRedactedErrorWalkWideJoin checks dense and sparse joins with a target beyond the budget.
+func TestRedactedErrorWalkWideJoin(t *testing.T) {
+	t.Parallel()
+	target := errors.New("fixture target beyond budget")
+	dense := make(redactWideJoin, 1<<16)
+	child := errors.New("fixture child")
+	for i := range dense {
+		dense[i] = child
+	}
+	dense[len(dense)-1] = target
+	sparse := make(redactWideJoin, len(dense))
+	sparse[len(sparse)-1] = target
+	assertWideJoinBudget(t, dense, target)
+	assertWideJoinBudget(t, sparse, target)
+}
+
+// assertWideJoinBudget checks that structural and forwarding walks leave the tail unread.
+func assertWideJoinBudget(t *testing.T, tree redactWideJoin, target error) {
+	t.Helper()
+	children, clipped := walkChildren(tree, tree, maxWalkSteps)
+	if len(children) > maxWalkSteps || !clipped {
+		t.Errorf("walkChildren returned %d children, clipped %v; budget %d", len(children), clipped, maxWalkSteps)
+	}
+	queue := appendWrapped([]error{tree}, tree)
+	if len(queue) > maxErrNodes+1 {
+		t.Errorf("appendWrapped returned %d nodes; budget %d plus overflow", len(queue), maxErrNodes)
+	}
+	if slices.Contains(queue[1:], target) {
+		t.Error("appendWrapped read the child beyond the budget")
+	}
+	got := (&Client{}).scrubError(tree)
+	if got.Error() != redactedTreeMsg {
+		t.Errorf("scrubError = %q; want %q", got.Error(), redactedTreeMsg)
+	}
+	if errors.Is(&redactedError{err: tree}, target) {
+		t.Error("errors.Is matched the target beyond the budget")
+	}
+}
+
+// TestRedactedErrorWalkQueueOverflow checks a full structural queue followed by a single unwrap.
+func TestRedactedErrorWalkQueueOverflow(t *testing.T) {
+	t.Parallel()
+	leaf := errors.New("fixture leaf")
+	children := make([]error, maxErrNodes-1)
+	for i := range children {
+		children[i] = leaf
+	}
+	children[0] = fmt.Errorf("fixture single wrapper: %w", leaf)
+	children[1] = errors.Join(leaf)
+	got := (&Client{}).scrubError(errors.Join(children...))
+	if got.Error() != redactedTreeMsg {
+		t.Errorf("scrubError = %q; want %q", got.Error(), redactedTreeMsg)
 	}
 }

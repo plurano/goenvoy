@@ -400,7 +400,7 @@ func assertAPIErrorEscapedBody(t *testing.T, key, body, want string) {
 	if apiErr.Body != want {
 		t.Errorf("body = %q; want %q", apiErr.Body, want)
 	}
-	if (&Client{apiKey: key}).containsKey(err.Error()) || strings.Contains(apiErr.Body, key) {
+	if (&Client{apiKey: key}).containsKey(err.Error()) || (key != "" && strings.Contains(apiErr.Body, key)) {
 		t.Error("key leaked")
 	}
 }
@@ -538,5 +538,36 @@ func assertOpaqueURLCause(t *testing.T, uerr *url.Error, tc hiddenCauseCase) {
 	}
 	if uerr.Timeout() != tc.wantTimeout {
 		t.Errorf("uerr.Timeout() = %v; want %v", uerr.Timeout(), tc.wantTimeout)
+	}
+}
+
+// TestCanonicalKeyRedaction checks escaped keys in error text and API response bodies.
+func TestCanonicalKeyRedaction(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key"
+	cases := []struct{ name, key, text, want string }{
+		{"lowercase percent", key, "before fixture%2dkey after", "REDACTED"},
+		{"uppercase percent", key, "before fixture%2Dkey after", "REDACTED"},
+		{"unicode escape", key, `before fixture\u002dkey after`, "REDACTED"},
+		{"mixed escapes", key, `before fixture%2d\u006bey after`, "REDACTED"},
+		{"prefix only", key, "before fixture%2dke after", "before fixture%2dke after"},
+		{"empty key", "", `before fixture%2d\u006bey after`, `before fixture%2d\u006bey after`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Client{apiKey: tc.key}
+			raw := errors.New(tc.text)
+			if got := c.containsKey(tc.text); got != (tc.text != tc.want) {
+				t.Errorf("containsKey = %v; want %v", got, tc.text != tc.want)
+			}
+			if got := c.scrubError(raw).Error(); got != tc.want {
+				t.Errorf("scrubError = %q; want %q", got, tc.want)
+			}
+			if got := c.hideCause(raw).Error(); got != tc.want {
+				t.Errorf("hideCause = %q; want %q", got, tc.want)
+			}
+			assertAPIErrorEscapedBody(t, tc.key, tc.text, tc.want)
+		})
 	}
 }

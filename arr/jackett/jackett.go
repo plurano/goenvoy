@@ -135,41 +135,90 @@ func (c *Client) scrub(s string) string {
 
 // scrubBody redacts key forms and hides bodies containing an escaped key.
 func (c *Client) scrubBody(text string) string {
-	text = c.scrub(text)
-	if c.apiKey == "" || !strings.Contains(text, `\`) {
-		return text
-	}
-	if c.containsKey(unescapeBody(text)) {
+	text = c.scrubText(text)
+	// Why: retain detection of key forms with the percent sign itself escaped as JSON.
+	if c.apiKey != "" && strings.Contains(text, `\`) && c.containsKeyForms(unescapeBody(text)) {
 		return "REDACTED"
 	}
 	return text
 }
 
-// unescapeBody decodes recognized escapes while preserving all other bytes.
+// scrubText applies inline redaction and hides text if decoding still reveals the key.
+func (c *Client) scrubText(text string) string {
+	text = c.scrub(text)
+	if c.containsCanonicalKey(text) {
+		return "REDACTED"
+	}
+	return text
+}
+
+// containsCanonicalKey reports whether decoding percent and backslash escapes reveals the raw key.
+func (c *Client) containsCanonicalKey(text string) bool {
+	if c.apiKey == "" {
+		return false
+	}
+	if strings.ContainsAny(text, `%\`) {
+		text = decodeEscapes(text, true)
+	}
+	return strings.Contains(text, c.apiKey)
+}
+
+// unescapeBody decodes recognized backslash escapes while preserving all other bytes.
 func unescapeBody(text string) string {
+	return decodeEscapes(text, false)
+}
+
+// decodeEscapes consumes each recognized escape once and copies all other bytes.
+func decodeEscapes(text string, decodePercent bool) string {
 	var out strings.Builder
 	out.Grow(len(text))
 	for i := 0; i < len(text); {
-		if text[i] != '\\' || i+1 == len(text) {
+		var size int
+		switch text[i] {
+		case '%':
+			if decodePercent {
+				size = writePercentEscape(&out, text[i:])
+			}
+		case '\\':
+			size = writeBackslashEscape(&out, text[i:])
+		}
+		if size == 0 {
 			out.WriteByte(text[i])
-			i++
-			continue
+			size = 1
 		}
-		if r, n := bodyUnicodeEscape(text[i:]); n != 0 {
-			out.WriteRune(r)
-			i += n
-			continue
-		}
-		index := strings.IndexByte(`"\/bfnrt`, text[i+1])
-		if index >= 0 {
-			out.WriteByte("\"\\/\b\f\n\r\t"[index])
-			i += 2
-			continue
-		}
-		out.WriteByte(text[i])
-		i++
+		i += size
 	}
 	return out.String()
+}
+
+// writePercentEscape writes one percent-encoded byte, returning its length or zero.
+func writePercentEscape(out *strings.Builder, text string) int {
+	if len(text) < 3 {
+		return 0
+	}
+	value, err := strconv.ParseUint(text[1:3], 16, 8)
+	if err != nil {
+		return 0
+	}
+	out.WriteByte(byte(value))
+	return 3
+}
+
+// writeBackslashEscape writes the decoded escape, returning its byte length or zero.
+func writeBackslashEscape(out *strings.Builder, text string) int {
+	if len(text) < 2 {
+		return 0
+	}
+	if r, n := bodyUnicodeEscape(text); n != 0 {
+		out.WriteRune(r)
+		return n
+	}
+	index := strings.IndexByte(`"\/bfnrt`, text[1])
+	if index >= 0 {
+		out.WriteByte("\"\\/\b\f\n\r\t"[index])
+		return 2
+	}
+	return 0
 }
 
 // bodyUnicodeEscape decodes a Unicode escape and any following surrogate pair.
@@ -351,23 +400,26 @@ type redactedError struct {
 	key string
 }
 
-// Error returns the sanitized error message.
+// Error returns the sanitized message.
 func (e *redactedError) Error() string {
 	return e.msg
 }
 
-// Is reports whether the hidden error matches target, so errors.Is keeps working without exposing it.
+// Is matches the hidden error without exposing it.
 func (e *redactedError) Is(target error) bool {
 	// Why: a comparable type may contain a dynamically uncomparable value.
 	canCompare := reflect.ValueOf(target).Comparable()
 	found := false
-	e.walk(func(node error) bool {
+	e.walk(func(node error) walkAction {
 		if canCompare && node == target {
 			found = true
 		} else if m, ok := node.(interface{ Is(error) bool }); ok && m.Is(target) {
 			found = true
 		}
-		return found
+		if found {
+			return walkStop
+		}
+		return walkDescend
 	})
 	return found
 }
@@ -375,9 +427,9 @@ func (e *redactedError) Is(target error) bool {
 // Timeout reports whether the underlying error timed out.
 func (e *redactedError) Timeout() bool {
 	reported := false
-	e.walk(func(node error) bool {
-		if _, ok := node.(*url.Error); ok { //nolint:errorlint // skip the URL wrapper and visit its cause
-			return false
+	e.walk(func(node error) walkAction {
+		if _, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies through its cause only
+			return walkCauseOnly
 		}
 		t, ok := node.(interface{ Timeout() bool })
 		if !ok {
@@ -387,8 +439,9 @@ func (e *redactedError) Timeout() bool {
 		}
 		if ok {
 			reported = t.Timeout()
+			return walkStop
 		}
-		return ok
+		return walkDescend
 	})
 	return reported
 }
@@ -396,9 +449,9 @@ func (e *redactedError) Timeout() bool {
 // Temporary reports whether the hidden error is temporary.
 func (e *redactedError) Temporary() bool {
 	reported := false
-	e.walk(func(node error) bool {
-		if _, ok := node.(*url.Error); ok { //nolint:errorlint // skip the URL wrapper and visit its cause
-			return false
+	e.walk(func(node error) walkAction {
+		if _, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies through its cause only
+			return walkCauseOnly
 		}
 		t, ok := node.(interface{ Temporary() bool })
 		if !ok {
@@ -408,37 +461,67 @@ func (e *redactedError) Temporary() bool {
 		}
 		if ok {
 			reported = t.Temporary()
+			return walkStop
 		}
-		return ok
+		return walkDescend
 	})
 	return reported
 }
 
-// walk visits the hidden tree depth-first in errors.Is order, stopping at a match or a node or join budget.
-func (e *redactedError) walk(visit func(error) bool) {
-	// Why: errors.Is and errors.As visit every path, exponential on a fan-out tree; only joined errors spend the maxErrNodes budget, so a long quiet chain stays reachable.
-	// Why: cyclic single-unwrap chain must terminate; bound far above any real chain.
+type walkAction uint8
+
+const (
+	walkDescend walkAction = iota
+	walkStop
+	walkCauseOnly
+)
+
+// walk visits the hidden tree depth-first in errors.Is order, with shared limits on steps and joins.
+func (e *redactedError) walk(visit func(error) walkAction) {
 	if isNilError(e.err) {
 		return
 	}
 	stack := [][]error{{e.err}}
-	for steps, branches := 0, 0; steps < maxWalkSteps && len(stack) > 0; steps++ {
+	for steps, joins := 0, 0; steps < maxWalkSteps && len(stack) > 0; steps++ {
 		var node error
 		stack, node = popWalkNode(stack)
 		joined, isJoin := node.(interface{ Unwrap() []error })
-		if isJoin && branches == maxErrNodes {
-			return
-		}
 		if isJoin {
-			branches++
+			if joins == maxErrNodes {
+				return
+			}
+			joins++
 		}
-		if visit(node) {
+		switch visitWalkNode(node, visit) {
+		case walkStop:
 			return
+		case walkCauseOnly:
+			stack = stack[:0]
+		case walkDescend:
 		}
-		if children := walkChildren(node, joined); children != nil {
-			stack = append(stack, children)
-		}
+		stack = appendWalkChildren(stack, node, joined, maxWalkSteps-steps-1)
 	}
+}
+
+// appendWalkChildren schedules children and drops siblings beyond a clipped join.
+func appendWalkChildren(stack [][]error, node error, joined interface{ Unwrap() []error }, remaining int) [][]error {
+	children, clipped := walkChildren(node, joined, remaining)
+	if clipped {
+		// Why: pending siblings follow the unread part of this join.
+		stack = stack[:0]
+	}
+	if children != nil {
+		stack = append(stack, children)
+	}
+	return stack
+}
+
+// visitWalkNode descends through a nested redacted error without starting a second walk.
+func visitWalkNode(node error, visit func(error) walkAction) walkAction {
+	if _, hidden := node.(*redactedError); hidden { //nolint:errorlint // only this node is tested
+		return walkDescend
+	}
+	return visit(node)
 }
 
 // popWalkNode pops the next non-nil node from the top slice of stack.
@@ -452,15 +535,29 @@ func popWalkNode(stack [][]error) ([][]error, error) {
 	return stack[:len(stack)-1], node
 }
 
-// walkChildren returns the children available for the depth-first walk.
-func walkChildren(node error, joined interface{ Unwrap() []error }) []error {
+// walkChildren returns the available children and reports whether the join was clipped.
+func walkChildren(node error, joined interface{ Unwrap() []error }, remaining int) ([]error, bool) {
+	if remaining == 0 {
+		return nil, false
+	}
 	if joined != nil {
-		return trimNilErrors(joined.Unwrap())
+		children, clipped := boundedJoinChildren(joined, remaining)
+		return trimNilErrors(children), clipped
 	}
-	if child := errors.Unwrap(node); !isNilError(child) {
-		return []error{child}
+	child := errors.Unwrap(node)
+	if hidden, ok := node.(*redactedError); ok { //nolint:errorlint // inspect this wrapper's cause directly
+		child = hidden.err
 	}
-	return nil
+	if isNilError(child) {
+		return nil, false
+	}
+	return []error{child}, false
+}
+
+// boundedJoinChildren slices a join before any child is read.
+func boundedJoinChildren(joined interface{ Unwrap() []error }, remaining int) ([]error, bool) {
+	children := joined.Unwrap()
+	return children[:min(len(children), remaining)], len(children) > remaining
 }
 
 // trimNilErrors returns errs starting at its first non-nil element, or nil when none exists.
@@ -502,7 +599,7 @@ func (e *redactedError) As(target any) bool {
 		if uerr, ok := queue[i].(*url.Error); ok && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
 			// Why: hand out a scrubbed copy, never the original that holds the key.
 			c := Client{apiKey: e.key}
-			*dst = &url.Error{Op: c.scrub(uerr.Op), URL: c.scrub(redactURL(c.scrub(uerr.URL))), Err: c.hideCause(uerr.Err)}
+			*dst = &url.Error{Op: c.scrubText(uerr.Op), URL: c.scrubText(redactURL(c.scrub(uerr.URL))), Err: c.hideCause(uerr.Err)}
 			return true
 		}
 		queue = appendWrapped(queue, queue[i])
@@ -536,7 +633,7 @@ func (c *Client) scrubError(err error) error {
 	if tooLarge {
 		return &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
 	}
-	return &redactedError{msg: c.scrub(err.Error()), err: err, key: c.apiKey}
+	return &redactedError{msg: c.scrubText(err.Error()), err: err, key: c.apiKey}
 }
 
 // hideCause wraps a recovered URL error cause in an opaque error with no Unwrap method.
@@ -547,7 +644,7 @@ func (c *Client) hideCause(err error) error {
 	if _, tooLarge := c.checkErrorTree(err); tooLarge {
 		return &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
 	}
-	return &redactedError{msg: c.scrub(err.Error()), err: err, key: c.apiKey}
+	return &redactedError{msg: c.scrubText(err.Error()), err: err, key: c.apiKey}
 }
 
 // carriesKey reports whether an error tree contains the API key or exceeds the node limit.
@@ -563,15 +660,15 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 	}
 	queue := []error{err}
 	for i := 0; i < maxErrNodes && i < len(queue); i++ {
-		if hasTypedNil(queue[i]) {
-			// Why: formatting a tree that holds a typed-nil error can dereference nil in Error().
+		if unsafeErrorNode(queue[i], maxErrNodes-len(queue)) {
+			// Why: formatting an oversized tree or a typed-nil node can be unsafe.
 			return true, true
 		}
 		queue = appendWrapped(queue, queue[i])
-	}
-	if len(queue) > maxErrNodes {
-		// Why: a tree past the bound is hidden unread; formatting a fan-out root can be exponential.
-		return true, true
+		if len(queue) > maxErrNodes {
+			// Why: a tree past the bound is hidden unread; formatting a fan-out root can be exponential.
+			return true, true
+		}
 	}
 	for _, node := range queue {
 		if c.containsKey(node.Error()) {
@@ -581,8 +678,8 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 	return false, false
 }
 
-// hasTypedNil reports whether err is a typed-nil error or directly wraps one.
-func hasTypedNil(err error) bool {
+// unsafeErrorNode reports whether err or a direct child is typed nil, or the join exceeds the remaining slots.
+func unsafeErrorNode(err error, remaining int) bool {
 	if isNilError(err) {
 		return true
 	}
@@ -593,7 +690,11 @@ func hasTypedNil(err error) bool {
 	if !ok {
 		return false
 	}
-	for _, child := range joined.Unwrap() {
+	children, clipped := boundedJoinChildren(joined, remaining)
+	if clipped {
+		return true
+	}
+	for _, child := range children {
 		if child != nil && isNilError(child) {
 			return true
 		}
@@ -601,8 +702,13 @@ func hasTypedNil(err error) bool {
 	return false
 }
 
-// containsKey reports whether s holds the nonempty raw, query-escaped, path-escaped, Go-quoted, or JSON-escaped API key, with hex-digit case of percent escapes ignored.
+// containsKey reports whether s holds the raw key or an encoded form of it.
 func (c *Client) containsKey(s string) bool {
+	return c.containsKeyForms(s) || c.containsCanonicalKey(s)
+}
+
+// containsKeyForms checks the fixed key forms, ignoring the hex case of percent escapes.
+func (c *Client) containsKeyForms(s string) bool {
 	if slices.ContainsFunc(c.keyForms(), func(form string) bool { return strings.Contains(s, form) }) {
 		return true
 	}
@@ -610,7 +716,7 @@ func (c *Client) containsKey(s string) bool {
 	return start >= 0
 }
 
-// appendWrapped appends the non-nil errors that err wraps directly, single or joined, to queue, never growing it past maxErrNodes+1 errors.
+// appendWrapped appends non-nil wrapped errors while bounding queue growth.
 func appendWrapped(queue []error, err error) []error {
 	if len(queue) > maxErrNodes || isNilError(err) {
 		// Why: carriesKey already treats this tree as too large; a typed-nil node has no children.
@@ -623,22 +729,26 @@ func appendWrapped(queue []error, err error) []error {
 	if !ok {
 		return queue
 	}
-	children := joined.Unwrap()
-	for i := 0; i < len(children) && len(queue) <= maxErrNodes; i++ {
-		if !isNilError(children[i]) {
-			queue = append(queue, children[i])
+	children, clipped := boundedJoinChildren(joined, maxErrNodes-len(queue))
+	for _, child := range children {
+		if !isNilError(child) {
+			queue = append(queue, child)
 		}
+	}
+	if clipped {
+		// Why: retain an overflow slot without reading the next child.
+		queue = append(queue, nil)
 	}
 	return queue
 }
 
-// redactError redacts root URL errors and scrubs raw, query-escaped, quoted, and JSON-escaped API key text.
+// redactError sanitizes URL errors and hides error trees that may expose the API key.
 func (c *Client) redactError(err error) error {
 	// Why: only the root can be a *url.Error to copy; errors.As would search the whole tree unbounded.
 	if uerr, ok := err.(*url.Error); ok && uerr != nil { //nolint:errorlint // root identity wanted; tree search is the defect
 		// Why: copy only when sanitizing changed the URL text or hid the cause; an untouched root keeps its identity for errors.Is.
 		// Why: a copy never mutates an error value net/http or a custom transport may share.
-		cleanOp, cleanURL := c.scrub(uerr.Op), c.scrub(redactURL(c.scrub(uerr.URL)))
+		cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(c.scrub(uerr.URL)))
 		if cleanOp != uerr.Op || cleanURL != uerr.URL || (uerr.Err != nil && c.carriesKey(uerr.Err)) {
 			err = &url.Error{Op: cleanOp, URL: cleanURL, Err: c.scrubError(uerr.Err)}
 		}
@@ -646,7 +756,7 @@ func (c *Client) redactError(err error) error {
 	return c.scrubError(err)
 }
 
-// redactURL replaces the apikey query parameter in raw with REDACTED; it drops the whole query when the URL or its query does not parse.
+// redactURL redacts apikey query values or drops the query when parsing fails.
 func redactURL(raw string) string {
 	u, err := url.Parse(raw)
 	var q url.Values
