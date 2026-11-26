@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"unicode/utf16"
 )
 
@@ -316,7 +317,7 @@ func classifyNode[T any](node error, key string, classify func(T) bool) (walkAct
 	if blocksHiddenClassification(node, key) {
 		return walkStop, false
 	}
-	switch cause := node.(type) { //nolint:errorlint // classify only the current node
+	switch node.(type) { //nolint:errorlint // classify only the current node
 	case *redactedError:
 		return walkDescend, false
 	case *opaqueURLCause:
@@ -324,50 +325,54 @@ func classifyNode[T any](node error, key string, classify func(T) bool) (walkAct
 	case *classifiedURLCause:
 		classifier, ok := node.(T)
 		return walkStop, ok && classify(classifier)
-	case *url.Error:
-		// Why: schedule the immediate cause so nested URL errors share the walk budget.
-		_, classifies := cause.Err.(T)
-		if classifies {
-			return walkCauseOnly, false
-		}
+	}
+	if classifier, ok := node.(T); ok && isStdlibClassifier(node) {
+		return classifyStdlibNode(node, classifier, classify)
+	}
+	return classifyExternalNode(node, classify)
+}
+
+// classifyStdlibNode returns the action for a known stdlib classifier's effective delegate.
+func classifyStdlibNode[T any](node error, classifier T, classify func(T) bool) (walkAction, bool) {
+	delegate := classifierDelegate(node)
+	if isNilError(delegate) {
 		return walkStop, false
 	}
-	return classifyExternalNode(node, key, classify)
+	if _, errno := delegate.(syscall.Errno); errno { //nolint:errorlint // match the direct delegate used by the stdlib classifier
+		// Why: Errno is a leaf, so the stdlib method safely preserves OpError's platform-specific accept rule.
+		return walkStop, classify(classifier)
+	}
+	if _, classifies := delegate.(T); classifies {
+		return walkCauseOnly, false
+	}
+	return walkStop, false
 }
 
 // classifyExternalNode checks the classifier and As methods of an external node.
-func classifyExternalNode[T any](node error, key string, classify func(T) bool) (walkAction, bool) {
-	if !safeClassifierDelegation[T](node, key) {
-		return walkStop, false
-	}
+func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction, bool) {
 	classifier, ok := node.(T)
-	if !ok {
-		as, hasAs := node.(interface{ As(any) bool })
-		if !hasAs || !as.As(&classifier) || isNilValue(classifier) {
-			return walkDescend, false
-		}
+	if ok {
+		return walkStop, classify(classifier)
+	}
+	as, hasAs := node.(interface{ As(any) bool })
+	if !hasAs || !as.As(&classifier) || isNilValue(classifier) {
+		return walkDescend, false
+	}
+	// Why: wrappers supplied by As live outside this walk and cannot share its budget.
+	if supplied, isError := any(classifier).(error); isError && (hiddenRedaction(supplied) != nil || isStdlibClassifier(supplied)) {
+		return walkStop, false
 	}
 	return walkStop, classify(classifier)
 }
 
-// maxClassifierDelegations bounds the number of wrapped errors a stdlib classifier may inspect.
-const maxClassifierDelegations = 8
-
-// safeClassifierDelegation checks each error a stdlib classifier would reach before it runs.
-func safeClassifierDelegation[T any](node error, key string) bool {
-	for step := 0; step <= maxClassifierDelegations; step++ {
-		if isNilError(node) || blocksHiddenClassification(node, key) {
-			return false
-		}
-		if _, classifies := node.(T); !classifies {
-			return true
-		}
-		node = classifierDelegate(node)
-		if node == nil {
-			return true
-		}
+// isStdlibClassifier reports whether node has a classifier that delegates to an underlying error.
+func isStdlibClassifier(node error) bool {
+	switch node.(type) { //nolint:errorlint // match the current stdlib wrapper's dynamic type
+	case *net.OpError, *os.SyscallError, *fs.PathError, *url.Error:
+		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // classifierDelegate returns the error inspected by a known stdlib classifier.
@@ -375,8 +380,8 @@ func classifierDelegate(node error) error {
 	switch wrapper := node.(type) { //nolint:errorlint // inspect only the current stdlib wrapper
 	case *net.OpError:
 		// Why: both OpError classifiers inspect the error inside a SyscallError directly.
-		if syscall, ok := wrapper.Err.(*os.SyscallError); ok && syscall != nil { //nolint:errorlint // match the direct wrapper tested by net.OpError
-			return syscall.Err
+		if syscallError, ok := wrapper.Err.(*os.SyscallError); ok && syscallError != nil { //nolint:errorlint // match the direct wrapper tested by net.OpError
+			return syscallError.Err
 		}
 		return wrapper.Err
 	case *os.SyscallError:

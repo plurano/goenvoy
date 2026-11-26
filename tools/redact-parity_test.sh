@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exercise discovery, comparison, and diagnostics against tracked fixture files.
-# Pass an absolute checker path to replay the missing scrubText case.
+# Pass an absolute checker path to replay the leading comment and missing scrubText cases.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +41,15 @@ expect_refusal 'missing test file' 'second/redact_as_internal_test.go:1: missing
 printf 'package beta\n\n// Traversal tests.\n' >second/redact_as_internal_test.go
 timeout 60 git add second/redact_as_internal_test.go
 expect_output 'different package names and tracked exception excluded' 'redact-parity: 2 redaction copies match' "${SUT[@]}"
+
+leading_comment=$' \t// package ignored\n/*\npackage other\n*/'
+printf '%s package alpha\n\n%s\n' "$leading_comment" "$shared_source" >first/redact.go
+printf '%s package beta\n\n%s\n' "$leading_comment" "$shared_source" >second/redact.go
+expect_output 'leading block comment is preserved before different package clauses' 'redact-parity: 2 redaction copies match' "${SUT[@]}"
+printf '%s package beta\n\n%s\n' "${leading_comment/package other/package another}" "$shared_source" >second/redact.go
+expect_refusal 'package-like text differs inside a leading block comment' 'second/redact.go:3: differs' "${SUT[@]}"
+printf 'package alpha\n\n%s\n' "$shared_source" >first/redact.go
+printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
 
 # Why: two copies must still match if the checker silently drops the planted copy.
 mkdir third

@@ -18,6 +18,7 @@
 // Custom formatting or As on an error node → opaque wrapper.
 // Wrapper with another captured key → opaque boundary for classification and URL recovery.
 // Forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
+// Stdlib classifier delegation (*net.OpError, *os.SyscallError, *fs.PathError, *url.Error) → followed inside that walk; As-supplied package or stdlib wrapper → false.
 // Unsafe tree → Timeout and Temporary false on wrapper and URL copy.
 // Package-owned URL causes end classification → opaque cause false, classified cause captured values.
 // Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.
@@ -29,6 +30,8 @@
 //   - Raw percent sign or backslash directly before key spelled across two or more escape layers.
 //   - Error method prints key only on later call.
 //   - Nested *url.Error with apikey value other than configured key.
+//   - XML or HTML character references and escape schemes other than percent and backslash-u.
+//   - Custom Timeout, Temporary or As methods that call back into a package wrapper.
 //
 // Usage:
 //

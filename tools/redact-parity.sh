@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 PACKAGE = re.compile(rb"^([ \t]*)package[ \t]+[A-Za-z_\x80-\xff][A-Za-z_0-9\x80-\xff]*")
+COMMENT_PREFIX = re.compile(rb"[ \t]*(/\*|//)")
 WRAPPER = re.compile(rb"\bredactedError\b")
 EXCEPTIONS = {
     Path("downloadclient/sabnzbd/redact.go"): "Separate legacy redaction implementation.",
@@ -30,11 +31,34 @@ def read_source(path):
 
 def without_package(path, lines):
     """Remove the package clause tokens and preserve their line's other bytes."""
+    in_block = False
     for index, (number, line) in enumerate(lines):
-        stripped, count = PACKAGE.subn(rb"\1", line, count=1)
-        if count:
-            return lines[:index] + [(number, stripped)] + lines[index + 1:]
+        offset, in_block = after_leading_comments(line, in_block)
+        if offset is not None:
+            stripped, count = PACKAGE.subn(rb"\1", line[offset:], count=1)
+            if count:
+                return lines[:index] + [(number, line[:offset] + stripped)] + lines[index + 1:]
     raise ValueError(f"{path}:1: missing package clause")
+
+
+def after_leading_comments(line, in_block):
+    """Return the first position outside leading comments and the block state."""
+    offset = 0
+    for _ in range(len(line) + 1):
+        if in_block:
+            end = line.find(b"*/", offset)
+            if end == -1:
+                return None, True
+            offset = end + 2
+            in_block = False
+        comment = COMMENT_PREFIX.match(line, offset)
+        if comment is None:
+            return offset, False
+        if comment[1] == b"//":
+            return None, False
+        offset = comment.end()
+        in_block = True
+    return None, in_block
 
 
 def compare(reference, baseline, candidate):

@@ -11,11 +11,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1531,6 +1533,30 @@ func (redactClassifier) Timeout() bool { return true }
 // Temporary reports a temporary error.
 func (redactClassifier) Temporary() bool { return true }
 
+type redactAsFixedClassifier struct {
+	classifier interface {
+		Timeout() bool
+		Temporary() bool
+	}
+}
+
+// Error returns the fixture error text.
+func (redactAsFixedClassifier) Error() string { return "fixed classifier" }
+
+// As supplies the fixed classifier for either classification method.
+func (e redactAsFixedClassifier) As(target any) bool {
+	switch dst := target.(type) {
+	case *interface{ Timeout() bool }:
+		*dst = e.classifier
+		return true
+	case *interface{ Temporary() bool }:
+		*dst = e.classifier
+		return true
+	default:
+		return false
+	}
+}
+
 // TestRedactedErrorClassifiers checks custom As and URL errors with nil and non-nil causes.
 func TestRedactedErrorClassifiers(t *testing.T) {
 	t.Parallel()
@@ -2084,6 +2110,149 @@ func assertErrorClassifications(t *testing.T, got error, wantTimeout, wantTempor
 	var temporary interface{ Temporary() bool }
 	if !errors.As(got, &temporary) || temporary.Temporary() != wantTemporary {
 		t.Errorf("errors.As Temporary classifier missing or differs from %t", wantTemporary)
+	}
+}
+
+// TestRedactedErrorStdlibDelegateCycles checks that both classifications stop within the walk budget.
+func TestRedactedErrorStdlibDelegateCycles(t *testing.T) {
+	t.Parallel()
+	for _, tc := range [...]struct {
+		name        string
+		withSyscall bool
+	}{
+		{"op error", false},
+		{"op error with syscall", true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			hidden := &redactedError{key: "maple"}
+			var cause error = hidden
+			if tc.withSyscall {
+				cause = &os.SyscallError{Syscall: "read", Err: cause}
+			}
+			hidden.err = &net.OpError{Op: "read", Err: cause}
+			assertBoundedClassifications(subtest, hidden, false, false)
+		})
+	}
+}
+
+// assertBoundedClassifications checks that each classifier answers promptly and matches its expected result.
+func assertBoundedClassifications(t *testing.T, hidden *redactedError, wantTimeout, wantTemporary bool) {
+	t.Helper()
+	if got := answerWithinTwoSeconds(t, "Timeout", hidden.Timeout); got != wantTimeout {
+		t.Errorf("Timeout() = %t; want %t", got, wantTimeout)
+	}
+	if got := answerWithinTwoSeconds(t, "Temporary", hidden.Temporary); got != wantTemporary {
+		t.Errorf("Temporary() = %t; want %t", got, wantTemporary)
+	}
+}
+
+// TestRedactedErrorAsSuppliedClassifiers checks the boundary for wrappers supplied by custom As methods.
+func TestRedactedErrorAsSuppliedClassifiers(t *testing.T) {
+	t.Parallel()
+	client := &Client{apiKey: "maple"}
+	foreign := hiddenRedacted(t, "cedar", &net.DNSError{Err: "cedar", IsTimeout: true})
+	sameKey := &redactedError{key: "maple", err: &net.DNSError{IsTimeout: true}}
+	for _, tc := range [...]struct {
+		name  string
+		cause error
+		want  bool
+	}{
+		{"op error with foreign wrapper", redactAsFixedClassifier{&net.OpError{Err: foreign}}, false},
+		{"op error with typed nil", redactAsFixedClassifier{&net.OpError{Err: (*redactedError)(nil)}}, false},
+		{"same-key wrapper", redactAsFixedClassifier{sameKey}, false},
+		{"custom classifier", redactAsClassifier{}, true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			got := client.scrubError(tc.cause)
+			assertOpaqueError(subtest, client, tc.name, got)
+			assertErrorClassifications(subtest, got, tc.want, tc.want)
+		})
+	}
+}
+
+// TestRedactedErrorStdlibClassifierParity compares classified redactions with their raw stdlib errors.
+func TestRedactedErrorStdlibClassifierParity(t *testing.T) {
+	t.Parallel()
+	const key = "maple"
+	client := &Client{apiKey: key}
+	for _, tc := range [...]struct {
+		name string
+		raw  error
+	}{
+		{"accept reset", &net.OpError{Op: "accept", Err: syscall.ECONNRESET}},
+		{"read syscall timeout", &net.OpError{Op: "read", Err: &os.SyscallError{Syscall: "read", Err: syscall.ETIMEDOUT}}},
+		{"read indirect timeout", &net.OpError{Op: "read", Err: fmt.Errorf("w: %w", &net.DNSError{IsTimeout: true})}},
+		{"open path timeout", &fs.PathError{Op: "open", Path: "p", Err: &net.DNSError{IsTimeout: true}}},
+		{"read syscall again", &os.SyscallError{Syscall: "read", Err: syscall.EAGAIN}},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			wantTimeout, wantTemporary := stdlibErrorClassifications(tc.raw)
+			if tc.name == "accept reset" && (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && !wantTemporary {
+				subtest.Error("stdlib accept reset should be temporary")
+			}
+			input := errors.Join(errors.New(key), tc.raw)
+			for _, apply := range [...]func(error) error{client.redactError, client.scrubError} {
+				got := apply(input)
+				assertOpaqueError(subtest, client, tc.name, got)
+				assertErrorClassifications(subtest, got, wantTimeout, wantTemporary)
+			}
+		})
+	}
+}
+
+// stdlibErrorClassifications returns the answers found by errors.As on an unredacted error.
+func stdlibErrorClassifications(err error) (bool, bool) {
+	var timeout interface{ Timeout() bool }
+	var temporary interface{ Temporary() bool }
+	return errors.As(err, &timeout) && timeout.Timeout(), errors.As(err, &temporary) && temporary.Temporary()
+}
+
+// TestRedactedErrorStdlibDelegateBudget checks useful chains and chains that exhaust the walk budget.
+func TestRedactedErrorStdlibDelegateBudget(t *testing.T) {
+	t.Parallel()
+	for _, tc := range [...]struct {
+		name  string
+		depth int
+		want  bool
+	}{
+		{"within budget", 100, true},
+		{"over budget", maxWalkSteps + 1, false},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			var cause error = &net.DNSError{IsTimeout: true}
+			for range tc.depth {
+				cause = &net.OpError{Op: "read", Err: cause}
+			}
+			assertBoundedClassifications(subtest, &redactedError{key: "maple", err: cause}, tc.want, tc.want)
+		})
+	}
+}
+
+// TestClassifyStdlibNilDelegates checks that absent delegates stop before scheduling children.
+func TestClassifyStdlibNilDelegates(t *testing.T) {
+	t.Parallel()
+	for _, tc := range [...]struct {
+		name  string
+		cause error
+	}{
+		{"nil", nil},
+		{"typed nil syscall", (*os.SyscallError)(nil)},
+		{"typed nil classifier", (*net.DNSError)(nil)},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			node := &net.OpError{Op: "read", Err: tc.cause}
+			if action, got := classifyNode(node, "maple", hiddenTimeoutClassifier.Timeout); action != walkStop || got {
+				subtest.Errorf("Timeout classification = (%v, %t); want (%v, false)", action, got, walkStop)
+			}
+			if action, got := classifyNode(node, "maple", hiddenTemporaryClassifier.Temporary); action != walkStop || got {
+				subtest.Errorf("Temporary classification = (%v, %t); want (%v, false)", action, got, walkStop)
+			}
+		})
 	}
 }
 
