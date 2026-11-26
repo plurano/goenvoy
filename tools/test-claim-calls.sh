@@ -12,11 +12,11 @@ ROOT="$(git -C "${1-.}" rev-parse --show-toplevel)" || exit 2
 LIST="$(mktemp)" || exit 2
 trap 'rm -f "$LIST"' EXIT
 git -C "$ROOT" ls-files -z --deduplicate -- '*_test.go' > "$LIST" || exit 2
-mapfile -d '' -t files < "$LIST"
+mapfile -d '' -t files < "$LIST" || exit 2
 
 # Why: check the call claims in one Go test file and send diagnostics to stderr.
 scan_file() {
-  CLAIM_PATH="$1" awk -f "$HERE/test-claim-calls.awk" "$ROOT/$1" >&2
+  LC_ALL=C CLAIM_PATH="$1" awk -f "$HERE/test-claim-calls.awk" "$ROOT/$1" >&2
 }
 
 failed=0
@@ -25,7 +25,7 @@ for file in "${files[@]}"; do
     continue
   else
     status=$?
-    if (( status != 1 )); then exit 2; fi
+    if (( status != 3 )); then exit 2; fi
     failed=1
   fi
 done

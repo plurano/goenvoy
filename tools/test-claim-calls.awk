@@ -2,10 +2,14 @@
 
 BEGIN {
   identifier = "[[:alpha:]_][[:alnum:]_]*"
-  boundary = "(^|[^[:alnum:]_])"
+  boundary = "(^|[^[:alnum:]_\200-\377])"
   verb = "(checks?|asserts?|verif(y|ies)|proves?|ensures?|tests?)"
   claim_pattern = boundary verb "[[:blank:]]+(that[[:blank:]]+)?" identifier "([.]" identifier ")*[(]"
-  call_pattern = boundary identifier "[(]"
+  selector = identifier "([[:blank:]]*[.][[:blank:]]*" identifier ")*"
+  type_args = "[[]([^][]|[[][^][]*[]])*[]]"
+  call_tail = "[[:blank:]]*(" type_args "[[:blank:]]*)?[(]"
+  call_pattern = boundary selector call_tail
+  declaration_pattern = "^[[:blank:]]*func([[:blank:]]+|[[:blank:]]*[(][^)]*[)][[:blank:]]*)" identifier
 }
 
 function masked_width(pair,    ch) {
@@ -49,19 +53,31 @@ function code_only(line,    code, limit, i, pair, ch) {
   return code
 }
 
-function record_matches(line, pattern, is_claim,    limit, i, name) {
+function record_claims(line,    limit, i, name) {
   limit = length(line)
-  for (i = 0; i < limit && match(is_claim ? tolower(line) : line, pattern); i++) {
+  for (i = 0; i < limit && match(tolower(line), claim_pattern); i++) {
     name = substr(line, RSTART, RLENGTH - 1)
-    sub(/^.*[^[:alnum:]_]/, "", name)
-    if (is_claim) {
-      claim_names[++claim_count] = name
-      claim_lines[claim_count] = NR
-    } else {
-      calls[name] = 1
-    }
+    sub(/^.*[[:blank:]]/, "", name)
+    claim_names[++claim_count] = name
+    claim_lines[claim_count] = NR
+    line = substr(line, RSTART + RLENGTH - 1)
+  }
+}
+
+function record_calls(line,    limit, i, j, name) {
+  limit = length(line)
+  for (i = 0; i < limit && match(line, call_pattern); i++) {
+    name = substr(line, RSTART, RLENGTH)
     # Why: the opening parenthesis can be the boundary for a nested call.
     line = substr(line, RSTART + RLENGTH - 1)
+    sub(/^[^[:alnum:]_]/, "", name)
+    sub(call_tail "$", "", name)
+    gsub(/[[:blank:]]/, "", name)
+    # Why: each dot starts a suffix that a shorter claim can name.
+    calls[name] = 1
+    for (j = 1; j <= length(name); j++) {
+      if (substr(name, j, 1) == ".") calls[substr(name, j + 1)] = 1
+    }
   }
 }
 
@@ -79,29 +95,42 @@ function finish_function(    i, name) {
 }
 
 mask_end == "" && /^[[:blank:]]*\/\// {
-  record_matches($0, claim_pattern, 1)
+  record_claims($0)
   next
 }
 
-{ code = code_only($0) }
-
-code ~ /^func[[:blank:]]/ {
-  if (in_function) finish_function()
-  in_function = 1
-  record_matches(code, call_pattern, 0)
-  if (code ~ /[{].*[}][[:blank:]]*$/) finish_function()
-  next
+function closing_brace(line,    limit, i, ch, end) {
+  limit = length(line)
+  for (i = 1; i <= limit; i++) {
+    ch = substr(line, i, 1)
+    if (ch == "{") {
+      brace_depth++
+    } else if (ch == "}" && --brace_depth == 0 && !end) {
+      end = i
+    }
+  }
+  return end
 }
 
-in_function {
-  record_matches(code, call_pattern, 0)
-  if (code ~ /^}[[:blank:]]*$/) finish_function()
-  next
-}
+{
+  code = code_only($0)
+  # Why: function literals share the enclosing top-level declaration's claims and calls.
+  if (brace_depth == 0 && code ~ declaration_pattern) {
+    if (in_function) finish_function()
+    in_function = 1
+    sub(declaration_pattern, "", code)
+  }
 
-{ claim_count = 0 }
+  end = closing_brace(code)
+  if (in_function) {
+    record_calls(end ? substr(code, 1, end) : code)
+    if (end) finish_function()
+  } else {
+    claim_count = 0
+  }
+}
 
 END {
   if (in_function) finish_function()
-  if (found) exit 1
+  if (found) exit 3
 }

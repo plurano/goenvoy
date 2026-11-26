@@ -22,4 +22,20 @@ GIT_DIR="$WORK/caller/.git" GIT_INDEX_FILE="$WORK/caller/.git/index" GIT_WORK_TR
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 expect_output caller_index_untouched '' git -C "$WORK/caller" ls-files
 expect_output fixture_owns_file 'probe.txt' git -C "$WORK/fixture" ls-files
+
+# Why: a failed assertion exits its subshell, leaving the suite to check the result.
+expect_assertion_failure() {
+  if (expect_status "$@") > "$WORK/assertion.log" 2>&1; then
+    printf 'FAIL %s: assertion accepted the planted case\n' "$1" >&2
+    exit 1
+  fi
+  printf 'ok   %s: assertion refused the planted case\n' "$1"
+}
+
+expect_status exact_status 2 'fixture diagnostic' bash -c 'echo "fixture diagnostic" >&2; exit 2'
+expect_assertion_failure wrong_status 2 'fixture diagnostic' bash -c 'echo "fixture diagnostic" >&2; exit 1'
+expect_assertion_failure stdout_diagnostic 2 'fixture diagnostic' bash -c 'echo "fixture diagnostic"; exit 2'
+expect_assertion_failure stdout_newline 2 'fixture diagnostic' bash -c 'echo; echo "fixture diagnostic" >&2; exit 2'
+expect_assertion_failure wrong_diagnostic 2 'fixture diagnostic' bash -c 'echo "other diagnostic" >&2; exit 2'
+expect_assertion_failure empty_needle 2 '' bash -c 'echo "fixture diagnostic" >&2; exit 2'
 echo "testlib: all planted cases pass"
