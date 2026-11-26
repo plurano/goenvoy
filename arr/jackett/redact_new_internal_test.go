@@ -36,8 +36,8 @@ func TestNewRedactsBaseURLKey(t *testing.T) {
 	}
 }
 
-// TestCarriesKeyNil checks that a nil error never reports a key or panics.
-func TestCarriesKeyNil(t *testing.T) {
+// TestCheckErrorTreeNil checks that a nil error never reports a key or panics.
+func TestCheckErrorTreeNil(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name, key string
@@ -49,8 +49,8 @@ func TestCarriesKeyNil(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: tc.key}
-			if c.carriesKey(nil) {
-				t.Error("carriesKey(nil) = true; want false")
+			if carry, _ := c.checkErrorTree(nil); carry {
+				t.Error("checkErrorTree(nil) = true; want false")
 			}
 			if got := c.redactError(nil); got != nil {
 				t.Errorf("redactError(nil) = %v; want nil", got)

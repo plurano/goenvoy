@@ -359,8 +359,8 @@ func quietChain(n int, leaf error) error {
 	return err
 }
 
-// TestCarriesKeyBound verifies that carriesKey reads exactly maxErrNodes errors and treats a longer tree as carrying the key.
-func TestCarriesKeyBound(t *testing.T) {
+// TestCheckErrorTreeBound verifies that checkErrorTree reads exactly maxErrNodes errors and treats a longer tree as carrying the key.
+func TestCheckErrorTreeBound(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -378,8 +378,8 @@ func TestCarriesKeyBound(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := c.carriesKey(tc.err); got != tc.want {
-				t.Errorf("c.carriesKey(chain) = %v, want %v", got, tc.want)
+			if got, _ := c.checkErrorTree(tc.err); got != tc.want {
+				t.Errorf("c.checkErrorTree(chain) = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -394,8 +394,8 @@ func plainLinks(n int) []error {
 	return errs
 }
 
-// TestCarriesKey verifies raw and query-escaped key detection, including a key equal to the redaction placeholder and an empty key.
-func TestCarriesKey(t *testing.T) {
+// TestCheckErrorTree verifies raw and query-escaped key detection, including a key equal to the redaction placeholder and an empty key.
+func TestCheckErrorTree(t *testing.T) {
 	t.Parallel()
 
 	const escapedKey = `s3cr3t+key/=&x`
@@ -416,8 +416,8 @@ func TestCarriesKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: tc.key}
-			if got := c.carriesKey(tc.err); got != tc.want {
-				t.Errorf("c.carriesKey(%q) = %v, want %v", tc.err, got, tc.want)
+			if got, _ := c.checkErrorTree(tc.err); got != tc.want {
+				t.Errorf("c.checkErrorTree(%q) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}

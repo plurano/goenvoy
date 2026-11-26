@@ -36,6 +36,49 @@ func TestRedactErrorRootIdentity(t *testing.T) {
 	}
 }
 
+// TestRedactErrorSameKeyWrapperIdentity checks repeated redaction and URL recovery.
+func TestRedactErrorSameKeyWrapperIdentity(t *testing.T) {
+	t.Parallel()
+	client := &Client{apiKey: "maple"}
+	for _, tc := range [...]struct {
+		name, key string
+		wrap      bool
+		keep      bool
+	}{
+		{"same-key wrapper", "maple", false, true},
+		{"same-key wrapper in chain", "maple", true, true},
+		{"foreign-key wrapper in chain", "cedar", true, false},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			owner := &Client{apiKey: tc.key}
+			input := owner.redactError(fmt.Errorf("fixture op: %w", &url.Error{
+				Op: "Get", URL: "http://h/feed?apikey=" + tc.key, Err: io.EOF,
+			}))
+			if tc.wrap {
+				input = fmt.Errorf("fixture again: %w", input)
+			}
+			got := client.redactError(input)
+			if same := any(got) == any(input); same != tc.keep {
+				subtest.Errorf("same error value = %t; want %t", same, tc.keep)
+			}
+			assertSameKeyWrapperURL(subtest, got, tc.keep)
+		})
+	}
+}
+
+// assertSameKeyWrapperURL checks sanitized URL recovery across the wrapper.
+func assertSameKeyWrapperURL(t *testing.T, got error, want bool) {
+	t.Helper()
+	const cleanURL = "http://h/feed?apikey=REDACTED"
+	var exposed *url.Error
+	if found := errors.As(got, &exposed); found != want {
+		t.Errorf("errors.As found a URL error = %t; want %t", found, want)
+	} else if found && (exposed == nil || exposed.URL != cleanURL) {
+		t.Errorf("exposed URL error = %v; want URL %q", exposed, cleanURL)
+	}
+}
+
 // assertRootIdentity checks the identity, cause, and text of a redacted root URL error.
 func assertRootIdentity(t *testing.T, c *Client, uerr *url.Error, sentinel error, keep bool) {
 	t.Helper()
@@ -586,8 +629,8 @@ func TestCanonicalKeyRedaction(t *testing.T) {
 			if got := c.scrubError(raw).Error(); got != tc.want {
 				t.Errorf("scrubError = %q; want %q", got, tc.want)
 			}
-			if got := c.hideCause(raw).Error(); got != tc.want {
-				t.Errorf("hideCause = %q; want %q", got, tc.want)
+			if got := c.hideURLCause(raw, false).Error(); got != tc.want {
+				t.Errorf("hideURLCause = %q; want %q", got, tc.want)
 			}
 			assertAPIErrorEscapedBody(t, tc.key, tc.text, tc.want)
 		})

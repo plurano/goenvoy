@@ -1500,10 +1500,18 @@ func TestRedactedErrorIsStdlibDeadline(t *testing.T) {
 	}
 }
 
+type redactIsLink struct{ cause error }
+
+// Error returns fixed fixture text.
+func (redactIsLink) Error() string { return "fixture link" }
+
+// Unwrap returns the next link.
+func (e redactIsLink) Unwrap() error { return e.cause }
+
 // wrapIsFixture adds the specified number of single links above the target.
 func wrapIsFixture(target error, links int) error {
 	for range links {
-		target = fmt.Errorf("fixture link: %w", target)
+		target = redactIsLink{cause: target}
 	}
 	return target
 }
@@ -1511,8 +1519,8 @@ func wrapIsFixture(target error, links int) error {
 // TestRedactedErrorIsCustomPrecheckFloor checks the last allowed custom call and the first disallowed call.
 func TestRedactedErrorIsCustomPrecheckFloor(t *testing.T) {
 	t.Parallel()
-	// Why: the links and the custom node each cost one step before reserving maxErrNodes.
-	const links = maxWalkSteps - maxErrNodes - 1
+	// Why: the links and the custom node each cost one step before reserving maxInspectionReads.
+	const links = maxWalkSteps - maxInspectionReads - 1
 	for _, tc := range [...]struct {
 		name      string
 		links     int
@@ -1532,18 +1540,70 @@ func TestRedactedErrorIsCustomPrecheckFloor(t *testing.T) {
 	}
 }
 
+// TestRedactedErrorIsChargesObservedValues checks dropped values and synthetic slots at the next pre-check floor.
+func TestRedactedErrorIsChargesObservedValues(t *testing.T) {
+	t.Parallel()
+	// Why: the first custom node and the join occupy two slots before the join clips its children.
+	typedNil := make(redactWideJoin, maxErrNodes-1)
+	typedNil[0] = (*net.DNSError)(nil)
+	typedNil[maxErrNodes-3] = (*net.DNSError)(nil)
+	for _, tc := range [...]struct {
+		name          string
+		cause         error
+		reads, visits int
+	}{
+		{"overflowing chain", wrapIsFixture(errors.New("fixture tail"), maxErrNodes-1), maxInspectionReads, maxErrNodes},
+		{"clipped join with typed nils", typedNil, 4, 1},
+		{"clipped join with plain nils", make(redactWideJoin, maxErrNodes-1), 2, 1},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			// Why: the outer join and both custom nodes each cost one visit, separately from the first pre-check.
+			links := maxWalkSteps - maxInspectionReads - 3 - tc.reads - tc.visits
+			assertNextCustomIsFloor(subtest, tc.cause, links, true, 1)
+			assertNextCustomIsFloor(subtest, tc.cause, links+1, false, 0)
+		})
+	}
+}
+
+// assertNextCustomIsFloor checks whether the second custom method can run after an unsafe pre-check.
+func assertNextCustomIsFloor(t *testing.T, cause error, links int, wantMatch bool, wantCalls int32) {
+	t.Helper()
+	target := errors.New("fixture target")
+	first := &redactForwardingIs{cause: cause, matches: target}
+	next := &redactForwardingIs{matches: target}
+	root := &redactedError{key: "maple", err: errors.Join(wrapIsFixture(first, links), next)}
+	assertCustomIs(t, root, target, next, wantMatch, wantCalls)
+	if calls := first.calls.Load(); calls != 0 {
+		t.Errorf("unsafe custom Is called %d times; want 0", calls)
+	}
+}
+
 // TestRedactedErrorIsChargesCustomPrecheck checks that prechecking a custom Is spends walk steps.
 func TestRedactedErrorIsChargesCustomPrecheck(t *testing.T) {
 	t.Parallel()
-	// Why: 33 pre-check nodes leave 64 - 33 = 31 steps for 32 descendants, with the target last.
-	const descendants = maxErrNodes / 2
-	target := errors.New("fixture target")
-	node := &redactForwardingIs{
-		cause:   wrapIsFixture(target, descendants-1),
-		matches: errors.New("fixture other target"),
+	// Why: 65 minus 33 reads leaves 32 visits, and one fewer lead link offsets the extra read in the longer row.
+	const descendants = (maxInspectionReads - 1) / 2
+	const links = maxWalkSteps - maxInspectionReads - 1
+	for _, tc := range [...]struct {
+		name               string
+		descendants, links int
+		want               bool
+	}{
+		{"target at last visit", descendants, links, true},
+		{"target one visit too far", descendants + 1, links - 1, false},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			target := errors.New("fixture target")
+			node := &redactForwardingIs{
+				cause:   wrapIsFixture(target, tc.descendants-1),
+				matches: errors.New("fixture other target"),
+			}
+			root := &redactedError{key: "maple", err: wrapIsFixture(node, tc.links)}
+			assertCustomIs(subtest, root, target, node, tc.want, 1)
+		})
 	}
-	root := &redactedError{key: "maple", err: wrapIsFixture(node, maxWalkSteps-maxErrNodes-1)}
-	assertCustomIs(t, root, target, node, false, 1)
 }
 
 // TestRedactErrorRootPathRedaction checks literal and percent-encoded keys in a URL error's path.
@@ -1852,7 +1912,7 @@ func (e redactWideJoin) Unwrap() []error { return e }
 
 // appendWrapped exposes the bounded queue to existing traversal tests.
 func appendWrapped(queue []error, err error) []error {
-	queue, _ = appendWrappedChildren(queue, err)
+	queue, _, _ = appendWrappedChildren(queue, err)
 	return queue
 }
 
@@ -2005,6 +2065,173 @@ func TestRedactErrorRootURLUsesFirstCauseRead(t *testing.T) {
 			}
 			assertObservedRootURL(subtest, got, input, tc.unchanged, tc.unsafe)
 		})
+	}
+}
+
+type redactRootCauseLink struct {
+	text  string
+	next  error
+	calls *int
+}
+
+// Error counts calls and returns the link's fixture text.
+func (e *redactRootCauseLink) Error() string {
+	*e.calls++
+	return e.text
+}
+
+// Unwrap returns the next link.
+func (e *redactRootCauseLink) Unwrap() error { return e.next }
+
+type redactReplacingRootCause struct {
+	parent      *url.Error
+	replacement error
+	onRootText  bool
+	textReads   int
+}
+
+// Error returns the inspected cause's text.
+func (e *redactReplacingRootCause) Error() string {
+	e.textReads++
+	if e.onRootText && e.textReads == 2 {
+		e.replace()
+	}
+	return "fixture inspected cause"
+}
+
+// Unwrap replaces the parent's cause on its first call when configured for structural inspection.
+func (e *redactReplacingRootCause) Unwrap() error {
+	if !e.onRootText {
+		e.replace()
+	}
+	return nil
+}
+
+// replace swaps the parent's cause once.
+func (e *redactReplacingRootCause) replace() {
+	if e.parent != nil {
+		e.parent.Err = e.replacement
+		e.parent = nil
+	}
+}
+
+// TestRedactErrorRootURLReplacedCause checks that replacement text is never read.
+func TestRedactErrorRootURLReplacedCause(t *testing.T) {
+	t.Parallel()
+	const cleanURL = "http://h/feed"
+	client := &Client{apiKey: "maple"}
+	for _, tc := range [...]struct {
+		name, url  string
+		onRootText bool
+	}{
+		{"changed URL", cleanURL + "?apikey=maple", false},
+		{"clean URL", cleanURL, false},
+		{"clean URL replaced in root text", cleanURL, true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			calls := 0
+			replacement := &redactRootCauseLink{text: "fixture maple replacement", calls: &calls}
+			input := &url.Error{Op: "Get", URL: tc.url}
+			input.Err = &redactReplacingRootCause{parent: input, replacement: replacement, onRootText: tc.onRootText}
+			got := client.redactError(input)
+			if tc.url == cleanURL {
+				assertFixedRootURL(subtest, got)
+			} else {
+				assertReplacedRootURLCopy(subtest, got, input, cleanURL+"?apikey=REDACTED")
+			}
+			if calls != 0 {
+				subtest.Errorf("replacement Error called %d times; want 0", calls)
+			}
+		})
+	}
+}
+
+// assertReplacedRootURLCopy checks the copied URL and the text of its inspected cause.
+func assertReplacedRootURLCopy(t *testing.T, got error, input *url.Error, wantURL string) {
+	t.Helper()
+	copied, ok := got.(*url.Error) //nolint:errorlint // require the direct URL copy
+	if !ok || copied == input || copied.URL != wantURL {
+		t.Fatalf("redactError returned %T; want a sanitized URL copy", got)
+	}
+	if copied.Err == nil || copied.Err.Error() != "fixture inspected cause" {
+		t.Errorf("copied cause = %v; want the inspected cause's text", copied.Err)
+	}
+}
+
+// TestRedactErrorRootURLUncomparableCause checks clean roots whose cause cannot be compared safely.
+func TestRedactErrorRootURLUncomparableCause(t *testing.T) {
+	t.Parallel()
+	for _, tc := range [...]struct {
+		name  string
+		cause error
+	}{
+		{"non-comparable type", redactSliceErr{"fixture"}},
+		{"non-comparable field", redactDynamicErr{value: []string{"fixture"}}},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			client := &Client{apiKey: "maple"}
+			assertFixedRootURL(subtest, client.redactError(&url.Error{Op: "Get", URL: "http://h/feed", Err: tc.cause}))
+		})
+	}
+}
+
+// TestRedactErrorCleanRootURLNodeLimit checks the root's slot in the structural budget.
+func TestRedactErrorCleanRootURLNodeLimit(t *testing.T) {
+	t.Parallel()
+	client := &Client{apiKey: "maple"}
+	for _, tc := range [...]struct {
+		name, leaf string
+		nodes      int
+	}{
+		{"63 nodes with key", "fixture maple leaf", maxErrNodes - 1},
+		{"64 nodes with key", "fixture maple leaf", maxErrNodes},
+		{"63 keyless nodes", "fixture leaf", maxErrNodes - 1},
+		{"64 keyless nodes", "fixture leaf", maxErrNodes},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			calls := 0
+			var cause error = &redactRootCauseLink{text: tc.leaf, calls: &calls}
+			for range tc.nodes - 1 {
+				cause = &redactRootCauseLink{text: "fixture link", next: cause, calls: &calls}
+			}
+			input := &url.Error{Op: "Get", URL: "http://h/feed", Err: cause}
+			got := client.redactError(input)
+			assertCleanRootURLNodeLimit(subtest, input, got, tc.nodes, calls, strings.Contains(tc.leaf, "maple"))
+		})
+	}
+}
+
+// assertCleanRootURLNodeLimit checks overflow, copy, and keep outcomes.
+func assertCleanRootURLNodeLimit(t *testing.T, input *url.Error, got error, nodes, calls int, carries bool) {
+	t.Helper()
+	switch {
+	case nodes >= maxErrNodes:
+		assertFixedRootURL(t, got)
+		if calls != 0 {
+			t.Errorf("overflowing cause Error called %d times; want 0", calls)
+		}
+	case carries:
+		copied, ok := got.(*url.Error) //nolint:errorlint // require the direct URL copy
+		if !ok || copied == input || hiddenRedaction(copied.Err) == nil {
+			t.Fatalf("redactError returned %T; want a URL copy with a hidden cause", got)
+		}
+		assertNoKeyForms(t, copied.Error(), "maple")
+	default:
+		if any(got) != input {
+			t.Error("redactError changed the identity of a within-budget clean root")
+		}
+	}
+}
+
+// assertFixedRootURL checks that redaction replaced the whole URL error with the fixed message.
+func assertFixedRootURL(t *testing.T, got error) {
+	t.Helper()
+	hidden, ok := got.(*redactedError) //nolint:errorlint // require the fixed wrapper itself
+	if !ok || hidden.Error() != redactedTreeMsg || !hidden.unsafe {
+		t.Errorf("redactError returned %T; want a fixed redaction wrapper", got)
 	}
 }
 
@@ -2248,7 +2475,7 @@ func TestRedactedErrorSnapshotsStartingWrapper(t *testing.T) {
 			cause := &redactObservedSingle{later: trueClassifierLeaf()}
 			root := &redactedError{key: "maple", err: cause}
 			cause.first = root
-			if got := tc.classify(root); got {
+			if got := answerWithinTwoSeconds(subtest, tc.name, func() bool { return tc.classify(root) }); got {
 				subtest.Errorf("%s() = %t; want false", tc.name, got)
 			}
 			if calls := cause.calls.Load(); calls != 1 {
@@ -2503,12 +2730,13 @@ func TestOwnedURLCauseClassification(t *testing.T) {
 		t.Run(name, func(subtest *testing.T) {
 			subtest.Parallel()
 			counted := &redactCountingTimeout{}
-			opaque := opaqueURLCause{hidden: &redactedError{msg: key, key: key, err: counted}}
+			opaque := opaqueURLCause{hidden: &redactedError{msg: "fixture timeout", key: key, err: counted}}
 			var root error = &opaque
 			if want {
 				root = &classifiedURLCause{opaqueURLCause: opaque, timeout: true}
 			}
-			assertOwnedURLCauseClassification(subtest, c.scrubError(root), counted, want)
+			parent := fmt.Errorf("fixture %s: %w", key, root)
+			assertOwnedURLCauseClassification(subtest, c.scrubError(parent), counted, want)
 		})
 	}
 }
@@ -3035,8 +3263,8 @@ func stdlibErrorClassifications(err error) (bool, bool) {
 // TestRedactedErrorStdlibDelegateBudget checks classifier chains at and beyond both limits.
 func TestRedactedErrorStdlibDelegateBudget(t *testing.T) {
 	t.Parallel()
-	// Why: each wrapper costs one read, and the terminal tree costs maxErrNodes reads.
-	const walkDepth = maxWalkSteps - maxErrNodes
+	// Why: each wrapper costs one read, and entering the terminal tree requires maxInspectionReads left.
+	const walkDepth = maxWalkSteps - maxInspectionReads
 	for _, tc := range [...]struct {
 		name  string
 		cause error
@@ -3082,8 +3310,8 @@ func walkBudgetTail() error {
 // TestClassificationWrapperEntryFloor checks that the final wrapper reserves a full inspection.
 func TestClassificationWrapperEntryFloor(t *testing.T) {
 	t.Parallel()
-	// Why: the join and each link cost one read; the final single-leaf tree still requires maxErrNodes units to enter.
-	const depth = maxWalkSteps - maxErrNodes - 1
+	// Why: the join and each link cost one read, and the final single-leaf tree requires maxInspectionReads left.
+	const depth = maxWalkSteps - maxInspectionReads - 1
 	for _, tc := range [...]struct {
 		name  string
 		extra error
@@ -3108,7 +3336,7 @@ func TestClassificationWrapperEntryFloor(t *testing.T) {
 func TestURLCopyClassificationEntryFloor(t *testing.T) {
 	t.Parallel()
 	// Why: the cause costs two reads, the join and its first child cost two, and depth - 1 links cost one each.
-	const depth = maxWalkSteps - maxErrNodes - 3
+	const depth = maxWalkSteps - maxInspectionReads - 3
 	for _, tc := range [...]struct {
 		name  string
 		extra error
@@ -3136,7 +3364,7 @@ func TestURLCopyClassificationEntryFloor(t *testing.T) {
 func TestClassificationChargesSharedWrapperOnce(t *testing.T) {
 	t.Parallel()
 	// Why: the root join costs four reads, the shared snapshot costs one, and depth - 1 links cost one each.
-	const depth = maxWalkSteps - maxErrNodes - 4
+	const depth = maxWalkSteps - maxInspectionReads - 4
 	for _, tc := range [...]struct {
 		name string
 		same bool
@@ -3163,7 +3391,7 @@ func TestClassificationChargesSharedWrapperOnce(t *testing.T) {
 func TestClassificationChargesStartingWrapperOnce(t *testing.T) {
 	t.Parallel()
 	// Why: the starting join costs three reads and depth - 1 links cost one each before the final reservation.
-	const depth = maxWalkSteps - maxErrNodes - 2
+	const depth = maxWalkSteps - maxInspectionReads - 2
 	for _, tc := range [...]struct {
 		name  string
 		extra error
@@ -3231,8 +3459,9 @@ func wideRedactionChain(depth, extra int, leaf *redactCountingUnwrap) *redactedE
 // TestClassificationChargesInspections checks that each classifier budgets wide wrapper reads.
 func TestClassificationChargesInspections(t *testing.T) {
 	t.Parallel()
-	// Why: each wide tree costs maxErrNodes - 1 reads, including its join; the terminal tree costs maxErrNodes.
-	const depth = (maxWalkSteps - maxErrNodes) / (maxErrNodes - 1)
+	// Why: each wide tree costs maxErrNodes - 1 reads, with the last width adjusted to leave maxInspectionReads.
+	const depth = (maxWalkSteps - maxInspectionReads + maxErrNodes - 2) / (maxErrNodes - 1)
+	const extra = maxWalkSteps - maxInspectionReads - depth*(maxErrNodes-1)
 	for _, tc := range [...]struct {
 		name     string
 		depth    int
@@ -3240,10 +3469,10 @@ func TestClassificationChargesInspections(t *testing.T) {
 		classify func(*redactedError) bool
 		want     bool
 	}{
-		{"wide Timeout at budget", depth, 0, (*redactedError).Timeout, true},
-		{"wide Timeout over budget", depth, 1, (*redactedError).Timeout, false},
-		{"wide Temporary at budget", depth, 0, (*redactedError).Temporary, true},
-		{"wide Temporary over budget", depth, 1, (*redactedError).Temporary, false},
+		{"wide Timeout at budget", depth, extra, (*redactedError).Timeout, true},
+		{"wide Timeout over budget", depth, extra + 1, (*redactedError).Timeout, false},
+		{"wide Temporary at budget", depth, extra, (*redactedError).Temporary, true},
+		{"wide Temporary over budget", depth, extra + 1, (*redactedError).Temporary, false},
 		{"small timeout tree", 2, 0, (*redactedError).Timeout, true},
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {

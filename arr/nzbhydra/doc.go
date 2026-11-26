@@ -19,20 +19,24 @@
 // Custom formatting or As on an error node → opaque wrapper.
 // Wrapper with another captured key → opaque boundary for classification and URL recovery.
 // Wrapper of another goenvoy client (RedactionBoundary method) → opaque boundary: classification false; its Is, As, Timeout and Temporary not called.
-// Forwarded identity search visits up to 4096 nodes and 64 joined errors. Each custom Is pre-check reads up to 64 nodes against the same 4096.
+// Forwarded identity search visits up to 4096 nodes and 64 joined errors.
 // Stdlib classifier delegation (*net.OpError, *os.SyscallError, *fs.PathError, *url.Error) → followed during classification.
 // Classification skips custom As methods and continues into their Unwrap tree.
-// External Is method → called only when its Unwrap tree (64 nodes) holds no package wrapper and is safe. Fewer than 64 steps left → false.
+// External Is method → called only when its Unwrap tree (64 nodes) holds no package wrapper and is safe.
 // External Timeout or Temporary method → false when its Unwrap tree (64 nodes)
 // holds a package wrapper or is unsafe.
 // Classification reads each wrapper tree once within 64 nodes and classifies from that read, the starting wrapper included.
 // A same-key wrapper entered during classification is read once the same way.
-// Each classification charges the cause tree and each same-key wrapper tree once against 4096 nodes. A wrapper needs 64 nodes left before its first charge.
+// Each classification charges the cause tree and each same-key wrapper tree once against 4096 reads.
+// Each custom Is pre-check and each same-key wrapper entry charges the values its inspection examined (up to 65). Fewer than 65 units left → false.
+// Classification dispatch pops at most 4096 slots on its own. A re-entered charged wrapper costs no read, but each pop counts.
 // Unsafe tree → Timeout and Temporary false.
 // Package-owned URL causes end classification → opaque cause false, classified cause captured values.
 // Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.
 // URL copies keep nil causes. Typed-nil or unsafe causes become fixed opaque errors without classification.
 // Root URL copy → one cause inspection. Unsafe first read → fixed opaque cause.
+// Clean root whose cause field changes during inspection, or whose cause value is not comparable → fixed message.
+// Unchanged root counts as one of 64 nodes: cause of 64 or more nodes → fixed message, no cause text read.
 // Safe immediate cause implements Timeout or Temporary → read its tree and every same-key wrapper tree inside it once and use them for both classifications.
 // The once-only read covers the copy's classification snapshot; the errors.As search that selects the URL error reads the cause separately.
 //
