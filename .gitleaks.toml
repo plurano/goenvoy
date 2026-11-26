@@ -5,3 +5,11 @@ useDefault = true
 [[allowlists]]
 description = "Go module pseudo-versions in tool pins (vX.Y.Z-yyyymmddhhmmss-commit) are not keys"
 regexes = ['''v\d+\.\d+\.\d+-\d{14}-[0-9a-f]{12}''']
+
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+description = "Redaction tests use the fake key fixture-key42 and its percent-escaped spelling"
+condition = "AND"
+paths = ['''^(arr/(jackett|mylar|nzbhydra)|mediaserver/tautulli)/[^/]+_test\.go$''']
+regexes = ['''^fixture(-|%2D)key42$''']

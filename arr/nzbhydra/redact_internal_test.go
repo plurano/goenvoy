@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func (redactionFailure) Close() error { return nil }
 // TestRequestRedaction checks key redaction across request and response failures.
 func TestRequestRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "placeholder+k/y=1"
+	const key = "fixture-key42"
 	sentinel := errors.New("transport sentinel")
 	leak := fmt.Errorf("%s %s: %w", key, url.QueryEscape(key), sentinel)
 	cases := []struct {
@@ -104,6 +105,41 @@ func assertRedacted(t *testing.T, err error, key string, wantMarker bool) {
 // redactionClient creates a client with a test server and optional transport or body errors.
 func redactionClient(t *testing.T, key string, status int, read bool, transportErr error) *Client {
 	t.Helper()
+	baseURL, hc := redactionEndpoint(t, key, status == 0 && transportErr == nil)
+	if transportErr != nil {
+		hc.Transport = redactionResponseTransport(t, status, read, transportErr)
+	}
+	c, err := New(baseURL, key, WithHTTPClient(hc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// redactionResponseTransport supplies the configured failure and closes the request body.
+func redactionResponseTransport(t *testing.T, status int, read bool, transportErr error) redactionTransport {
+	t.Helper()
+	return redactionTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Body != nil {
+			if err := r.Body.Close(); err != nil {
+				t.Errorf("nzbhydra test: close request body: %v", err)
+			}
+		}
+		if !read {
+			return nil, transportErr
+		}
+		return &http.Response{StatusCode: status, Body: redactionFailure{transportErr}, Header: make(http.Header)}, nil
+	})
+}
+
+// redactionEndpoint supplies a response server or a deterministic dial failure.
+func redactionEndpoint(t *testing.T, key string, dialFailure bool) (string, *http.Client) {
+	t.Helper()
+	if dialFailure {
+		dialErr := &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+		transport := redactionResponseTransport(t, 0, false, dialErr)
+		return "http://example.invalid", &http.Client{Transport: transport}
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		if _, err := io.Copy(w, strings.NewReader(key+" "+url.QueryEscape(key))); err != nil {
@@ -111,26 +147,7 @@ func redactionClient(t *testing.T, key string, status int, read bool, transportE
 		}
 	}))
 	t.Cleanup(srv.Close)
-	hc := srv.Client()
-	if status == 0 && transportErr == nil {
-		srv.Close()
-	}
-	if transportErr != nil {
-		hc.Transport = redactionTransport(func(r *http.Request) (*http.Response, error) {
-			if r.Body != nil {
-				r.Body.Close()
-			}
-			if !read {
-				return nil, transportErr
-			}
-			return &http.Response{StatusCode: status, Body: redactionFailure{transportErr}, Header: make(http.Header)}, nil
-		})
-	}
-	c, err := New(srv.URL, key, WithHTTPClient(hc))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c
+	return srv.URL, srv.Client()
 }
 
 // TestScrubBoundaries checks empty keys, URL error immutability, and error-tree size limits.
@@ -141,10 +158,17 @@ func TestScrubBoundaries(t *testing.T) {
 	}
 	c := &Client{apiKey: "placeholder"}
 	original := &url.Error{URL: "?apikey=placeholder", Err: errors.New("placeholder")}
-	assertRedacted(t, c.redactError(original), "placeholder", true)
-	if original.URL != "?apikey=placeholder" || original.Err.Error() != "placeholder" {
+	want := original.Err
+	result := c.redactError(original)
+	assertRedacted(t, result, "placeholder", true)
+	if original.URL != "?apikey=placeholder" {
 		t.Error("mutated original URL error")
 	}
+	copied, ok := result.(*url.Error) //nolint:errorlint // require the root type directly
+	if !ok || copied == nil {
+		t.Fatal("expected a sanitized URL error copy")
+	}
+	assertRedactedRootCause(t, copied, original, want)
 	for _, width := range []int{maxErrNodes - 1, maxErrNodes, maxErrNodes + 1} {
 		children := make([]error, width)
 		for i := range children {
@@ -182,7 +206,7 @@ func checkRedaction(t *testing.T, err error, key, name string, sentinel error, h
 // TestRedactError checks root URL sanitization without discarding outer error trees.
 func TestRedactError(t *testing.T) {
 	t.Parallel()
-	const key = "placeholder+k/y=1"
+	const key = "fixture-key42"
 	c := &Client{apiKey: key}
 	inner := errors.New("fixture inner sentinel")
 	uerr := &url.Error{Op: "Get", URL: "http://example.invalid/?apikey=" + url.QueryEscape(key), Err: inner}
@@ -191,12 +215,12 @@ func TestRedactError(t *testing.T) {
 		name      string
 		err       error
 		sentinel  error
-		rootURL   bool
+		hasURL    bool
 		unchanged bool
 	}{
-		{name: "root URL", err: uerr, sentinel: inner, rootURL: true},
-		{name: "joined URL", err: errors.Join(io.ErrUnexpectedEOF, uerr), sentinel: io.ErrUnexpectedEOF},
-		{name: "wrapped URL", err: fmt.Errorf("read: %w", uerr), sentinel: inner},
+		{name: "root URL", err: uerr, sentinel: inner, hasURL: true},
+		{name: "joined URL", err: errors.Join(io.ErrUnexpectedEOF, uerr), sentinel: io.ErrUnexpectedEOF, hasURL: true},
+		{name: "wrapped URL", err: fmt.Errorf("read: %w", uerr), sentinel: inner, hasURL: true},
 		{name: "keyless join", err: keyless, sentinel: io.ErrUnexpectedEOF, unchanged: true},
 	}
 	for _, tc := range cases {
@@ -205,14 +229,26 @@ func TestRedactError(t *testing.T) {
 			got := c.redactError(tc.err)
 			assertNoKey(t, got.Error(), key)
 			assertSentinel(t, got, tc.sentinel)
-			var matched *url.Error
-			if isURL := errors.As(got, &matched); isURL != tc.rootURL {
-				t.Errorf("root URL type = %v; want %v", isURL, tc.rootURL)
-			}
+			assertMatchedURLError(t, got, key, tc.hasURL)
 			if same := any(got) == any(tc.err); same != tc.unchanged {
 				t.Errorf("same error value = %v; want %v", same, tc.unchanged)
 			}
 		})
+	}
+}
+
+// assertMatchedURLError checks whether errors.As reaches a sanitized *url.Error.
+func assertMatchedURLError(t *testing.T, got error, key string, wantURL bool) {
+	t.Helper()
+	var matched *url.Error
+	if isURL := errors.As(got, &matched); isURL != wantURL {
+		t.Errorf("URL error reachable = %v; want %v", isURL, wantURL)
+	}
+	if wantURL {
+		if matched == nil {
+			t.Fatal("matched URL error = nil; want non-nil")
+		}
+		assertNoKey(t, matched.URL, key)
 	}
 }
 
@@ -227,15 +263,130 @@ func assertSentinel(t *testing.T, got, sentinel error) {
 // TestNewRedaction checks constructor errors with keys embedded in invalid URLs.
 func TestNewRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "placeholder+k/y=1"
+	const key = "fixture-key42"
+	const escaped = "fixture%2Dkey42"
 	for _, base := range []string{"http://%zz/", "ftp://example.invalid/", "https:///"} {
 		t.Run(base, func(t *testing.T) {
 			t.Parallel()
-			c, err := New(base+"?raw="+key+"&escaped="+url.QueryEscape(key), key)
+			c, err := New(base+"?raw="+key+"&escaped="+escaped, key)
 			if c != nil || err == nil {
 				t.Fatalf("New = %v, %v; want nil client and error", c, err)
 			}
-			assertSafeText(t, err.Error(), key)
+			assertNoKey(t, err.Error(), key)
+			if strings.Contains(err.Error(), escaped) {
+				t.Error("constructor error leaked the percent-escaped key")
+			}
+		})
+	}
+}
+
+// TestNewRedactsForeignQueryKey checks that constructor errors strip a query apikey different from the client key.
+func TestNewRedactsForeignQueryKey(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, baseURL, key string
+	}{
+		{name: "unsupported scheme", baseURL: "ftp://example.invalid/?apikey=other", key: "k"},
+		{name: "parse failure", baseURL: "http://%zz/?apikey=other", key: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := New(tc.baseURL, tc.key)
+			if c != nil || err == nil {
+				t.Fatalf("New(%q) = %v, %v; want nil client and error", tc.baseURL, c, err)
+			}
+			if strings.Contains(err.Error(), "other") {
+				t.Errorf("error leaked query key: %s", err.Error())
+			}
+		})
+	}
+}
+
+// TestNewDropsUserinfo checks that constructor errors return a fixed message and omit userinfo and keys.
+func TestNewDropsUserinfo(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-userinfo-key"
+	cases := []struct {
+		name, baseURL, secret string
+	}{
+		{name: "password equal to key with query", baseURL: "ftp://user:fixture-userinfo-key@example.invalid/?apikey=fixture-userinfo-key", secret: key},
+		{name: "foreign password with query", baseURL: "ftp://user:foreign-pass@example.invalid/?apikey=fixture-userinfo-key", secret: "foreign-pass"},
+		{name: "parse failure with foreign password", baseURL: "http://user:foreign-pass@%zz/?apikey=fixture-userinfo-key", secret: "foreign-pass"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertNewDropsUserinfo(t, tc.baseURL, key, tc.secret)
+		})
+	}
+}
+
+// assertNewDropsUserinfo checks that New fails on baseURL with the fixed message without leaking user, key, or secret.
+func assertNewDropsUserinfo(t *testing.T, baseURL, key, secret string) {
+	t.Helper()
+	c, err := New(baseURL, key)
+	if c != nil || err == nil {
+		t.Fatalf("New(%q) = %v, %v; want nil client and error", baseURL, c, err)
+	}
+	const want = "nzbhydra: invalid base URL: must be http(s) with a host"
+	if err.Error() != want {
+		t.Errorf("err.Error() = %q; want %q", err.Error(), want)
+	}
+	for _, sub := range []string{"user", key, secret} {
+		if strings.Contains(err.Error(), sub) {
+			t.Errorf("error leaked %q: %s", sub, err.Error())
+		}
+	}
+}
+
+// TestNewOversizedKey checks that an oversized API key does not panic during constructor error scrubbing.
+func TestNewOversizedKey(t *testing.T) {
+	t.Parallel()
+	key := strings.Repeat("k~", 150000)
+	cases := []struct {
+		name, baseURL string
+	}{
+		{name: "unsupported scheme", baseURL: "ftp://example.invalid/?raw=" + key},
+		{name: "parse failure", baseURL: "http://%zz/?raw=" + key},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := New(tc.baseURL, key)
+			if c != nil {
+				t.Errorf("New() client = %v; want nil", c)
+			}
+			if err == nil {
+				t.Fatal("New() error = nil; want non-nil")
+			}
+			assertNoKey(t, err.Error(), key)
+		})
+	}
+}
+
+// TestCheckErrorTreeNil checks that a nil error never reports a key or panics.
+func TestCheckErrorTreeNil(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, key string
+	}{
+		{name: "keyed client", key: "k"},
+		{name: "empty key", key: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Client{apiKey: tc.key}
+			if carry, unsafe := c.checkErrorTree(nil); carry || unsafe {
+				t.Errorf("checkErrorTree(nil) = (%t, %t); want (false, false)", carry, unsafe)
+			}
+			if got := c.redactError(nil); got != nil {
+				t.Errorf("redactError(nil) = %v; want nil", got)
+			}
+			if got := c.scrubError(nil); got != nil {
+				t.Errorf("scrubError(nil) = %v; want nil", got)
+			}
 		})
 	}
 }
@@ -278,6 +429,8 @@ func TestDecodeErrorRedaction(t *testing.T) {
 	t.Parallel()
 	// Why: integer overflow errors echo this oversized numeric fixture key.
 	const numericKey = "1234567890123456789012345678901234567890"
+	const xmlKey = "fixture-key42"
+	const escapedXMLKey = "fixture%2Dkey42"
 	cases := []struct {
 		name string
 		key  string
@@ -292,11 +445,11 @@ func TestDecodeErrorRedaction(t *testing.T) {
 			var out int
 			return c.postJSON(ctx, "/fixture", nil, &out)
 		}},
-		{name: "xml raw", key: "placeholder+k/y=1", body: `<rss><channel><item><size>placeholder+k/y=1</size></item></channel></rss>`, call: func(ctx context.Context, c *Client) error {
+		{name: "xml raw", key: xmlKey, body: `<rss><channel><item><size>` + xmlKey + `</size></item></channel></rss>`, call: func(ctx context.Context, c *Client) error {
 			_, err := c.Search(ctx, "fixture", nil)
 			return err
 		}},
-		{name: "xml escaped", key: "placeholder+k/y=1", body: `<rss><channel><item><size>placeholder%2Bk%2Fy%3D1</size></item></channel></rss>`, call: func(ctx context.Context, c *Client) error {
+		{name: "xml escaped", key: xmlKey, body: `<rss><channel><item><size>` + escapedXMLKey + `</size></item></channel></rss>`, call: func(ctx context.Context, c *Client) error {
 			_, err := c.Search(ctx, "fixture", nil)
 			return err
 		}},
@@ -312,6 +465,7 @@ func TestDecodeErrorRedaction(t *testing.T) {
 				t.Fatal("expected decoder error")
 			}
 			assertSafeText(t, err.Error(), tc.key)
+			assertNoKey(t, err.Error(), escapedXMLKey)
 		})
 	}
 }
@@ -334,7 +488,7 @@ func (tr responseStatusTransport) RoundTrip(req *http.Request) (*http.Response, 
 // TestStatusTextRedaction checks server status text exposed through APIError fields.
 func TestStatusTextRedaction(t *testing.T) {
 	t.Parallel()
-	const key = "placeholder+k/y=1"
+	const key = "fixture-key42"
 	cases := []struct {
 		name string
 		call func(context.Context, *Client) error
@@ -354,7 +508,7 @@ func TestStatusTextRedaction(t *testing.T) {
 			c := responseTextClient(t, key, "fixture failure")
 			c.httpClient.Transport = responseStatusTransport{
 				RoundTripper: c.httpClient.Transport,
-				status:       "500 " + key + " " + url.QueryEscape(key),
+				status:       "500 raw=" + key + " echo=" + key,
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
@@ -364,6 +518,9 @@ func TestStatusTextRedaction(t *testing.T) {
 				t.Fatalf("expected APIError, got %v", err)
 			}
 			assertSafeText(t, apiErr.Status, key)
+			if apiErr.Status != "500 raw=REDACTED echo=REDACTED" {
+				t.Error("Status did not preserve the status code and both redaction markers")
+			}
 			if apiErr.StatusCode != http.StatusInternalServerError {
 				t.Errorf("status code = %d", apiErr.StatusCode)
 			}
@@ -371,28 +528,24 @@ func TestStatusTextRedaction(t *testing.T) {
 	}
 }
 
-// TestRedactQuotedKey checks nested URL errors with Go-quoted keys and preserves joined causes.
+// TestRedactQuotedKey checks nested URL errors with escaped keys and preserves joined causes.
 func TestRedactQuotedKey(t *testing.T) {
 	t.Parallel()
-	cases := []struct{ name, key string }{
-		{name: "plain", key: "placeholder"},
-		{name: "quote and backslash", key: `k"y\z`},
-		{name: "control", key: "k\ny\tz"},
-	}
-	for _, tc := range cases {
+	const key = "fixture-key42"
+	for _, tc := range []struct{ name, spelling string }{
+		{"literal", key},
+		{"percent encoded", "fixture%2Dkey42"},
+		{"Unicode escaped", `fixture\u002dkey42`},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			c := &Client{apiKey: tc.key}
+			c := &Client{apiKey: key}
 			original := errors.Join(io.ErrUnexpectedEOF,
-				&url.Error{Op: "Get", URL: "http://h/?apikey=" + tc.key, Err: errors.New("x")})
+				&url.Error{Op: "Get", URL: "http://h/?apikey=" + tc.spelling, Err: errors.New("x")})
 			got := c.redactError(original)
-			quoted := strconv.Quote(tc.key)
 			text := got.Error()
-			if strings.Contains(text, tc.key) || strings.Contains(text, quoted[1:len(quoted)-1]) {
-				t.Errorf("key leaked: %s", text)
-			}
-			if !strings.Contains(text, "REDACTED") {
-				t.Error("missing REDACTED")
+			if c.containsKey(text) || !strings.Contains(text, "REDACTED") {
+				t.Error("expected redaction marker in key-free error text")
 			}
 			if !errors.Is(got, io.ErrUnexpectedEOF) {
 				t.Error("lost sentinel")
@@ -401,31 +554,114 @@ func TestRedactQuotedKey(t *testing.T) {
 	}
 }
 
-// TestScrubQuotedKey checks raw, query-escaped, Go-quoted, absent, and empty key forms.
+// TestScrubQuotedKey checks literal and escaped keys, along with absent and empty keys.
 func TestScrubQuotedKey(t *testing.T) {
 	t.Parallel()
+	const key = "fixture-key42"
 	cases := []struct {
 		name, key, input, want string
 		contains               bool
 	}{
-		{name: "empty", input: "plain", want: "plain"},
-		{name: "absent", key: `k"y\z`, input: "plain", want: "plain"},
-		{name: "plain", key: "placeholder", input: "key=placeholder", want: "key=REDACTED", contains: true},
-		{name: "raw", key: `k"y\z`, input: `key=k"y\z`, want: "key=REDACTED", contains: true},
-		{name: "query", key: `k"y\z`, input: "key=k%22y%5Cz", want: "key=REDACTED", contains: true},
-		{name: "quoted", key: `k"y\z`, input: `key=k\"y\\z`, want: "key=REDACTED", contains: true},
-		{name: "control", key: "k\ny\tz", input: `key=k\ny\tz`, want: "key=REDACTED", contains: true},
+		{"empty", "", "plain", "plain", false},
+		{"absent", key, "plain", "plain", false},
+		{"literal", key, "key=" + key, "key=REDACTED", true},
+		{"percent encoded", key, "key=" + strings.Replace(key, "-", "%2D", 1), "REDACTED", true},
+		{"Unicode escaped", key, "key=" + strings.Replace(key, "-", `\u002d`, 1), "REDACTED", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: tc.key}
-			if got := c.scrub(tc.input); got != tc.want {
-				t.Errorf("scrub = %q; want %q", got, tc.want)
+			if c.scrubText(tc.input) != tc.want {
+				t.Error("unexpected text redaction")
 			}
-			if got := c.containsKey(tc.input); got != tc.contains {
-				t.Errorf("containsKey = %v; want %v", got, tc.contains)
+			if c.containsKey(tc.input) != tc.contains {
+				t.Error("unexpected key detection")
 			}
 		})
 	}
+}
+
+// redactionFanout is a keyless error whose Unwrap returns the previous level twice.
+type redactionFanout struct{ prev error }
+
+// Error returns constant text so only the tree shape costs time.
+func (redactionFanout) Error() string { return "fixture fanout level" }
+
+// Unwrap returns the previous level twice, doubling the tree per level.
+func (e redactionFanout) Unwrap() []error { return []error{e.prev, e.prev} }
+
+// TestRedactErrorFanoutBounded checks that a keyless exponential error tree returns promptly.
+func TestRedactErrorFanoutBounded(t *testing.T) {
+	t.Parallel()
+	c := &Client{apiKey: "fixture-key42"}
+	var err error
+	err = errors.New("fixture fanout leaf")
+	for range 40 {
+		err = redactionFanout{prev: err}
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.redactError(err) }()
+	select {
+	case got := <-done:
+		hidden, ok := got.(*redactedError) //nolint:errorlint // require the wrapper itself without traversing the tree
+		if !ok || hidden == nil {
+			t.Fatalf("redactError(%T) = %T; want *redactedError", err, got)
+		}
+		if hidden.Error() != redactedTreeMsg {
+			t.Errorf("Error() = %q; want %q", hidden.Error(), redactedTreeMsg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("redactError did not return within 2s")
+	}
+}
+
+// TestNewAPIKeyAlphabet covers accepted and rejected API key bytes.
+func TestNewAPIKeyAlphabet(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, key string
+		wantError bool
+	}{
+		{name: "alphanumeric", key: "Fixture9key"},
+		{name: "punctuation boundary", key: "-._~"},
+		{name: "empty"},
+		{name: "space", key: "fixture key", wantError: true},
+		{name: "plus", key: "fixture+key", wantError: true},
+		{name: "percent", key: "fixture%key", wantError: true},
+		{name: "slash", key: "fixture/key", wantError: true},
+		{name: "non-ASCII", key: "fixtureäkey", wantError: true},
+		{name: "invalid UTF-8", key: "fixture\xffkey", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := New("http://localhost", tc.key)
+			if tc.wantError {
+				assertInvalidAPIKey(t, c, err)
+				return
+			}
+			if err != nil || c == nil || c.apiKey != tc.key {
+				t.Error("New did not retain an allowed key")
+			}
+		})
+	}
+}
+
+// assertInvalidAPIKey checks the fixed diagnostic without printing the rejected input.
+func assertInvalidAPIKey(t *testing.T, c *Client, err error) {
+	t.Helper()
+	const invalid = "nzbhydra: invalid API key: only letters, digits and - . _ ~ allowed"
+	if c != nil || err == nil || err.Error() != invalid {
+		t.Error("New did not reject the key with the fixed diagnostic")
+	}
+}
+
+// TestResponseReadHidesCustomFormatter checks the error returned to callers when reading the body fails.
+func TestResponseReadHidesCustomFormatter(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	sentinel := errors.New("fixture read failure")
+	c := newFormatterResponseClient(t, key, sentinel)
+	_, err := c.GetIndexerStatuses(t.Context())
+	assertFormatterRedacted(t, err, sentinel, key)
 }

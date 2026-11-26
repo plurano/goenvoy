@@ -41,6 +41,7 @@ type Client struct {
 
 // New creates a Jackett [Client] for the instance at baseURL with the given API key.
 // It returns an error if baseURL is not a valid HTTP/HTTPS URL, or if it contains a query or fragment.
+// API keys may be empty or use only ASCII letters, digits, and - . _ ~.
 func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if strings.ContainsAny(baseURL, "?#") {
@@ -50,10 +51,15 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("jackett: invalid base URL %q: %w", baseURL, err)
+		return nil, errors.New("jackett: invalid base URL: must be http(s) with a host")
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("jackett: invalid base URL %q: must be http(s) with a host", baseURL)
+		return nil, errors.New("jackett: invalid base URL: must be http(s) with a host")
+	}
+
+	// Why: URL key spellings reduce to literal or percent-escaped unreserved bytes that the redactor already covers.
+	if !validAPIKey(apiKey) {
+		return nil, errors.New("jackett: invalid API key: only letters, digits and - . _ ~ allowed")
 	}
 
 	c := &Client{
@@ -67,14 +73,24 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// APIError is returned when the API responds with a non-2xx status.
+// APIError reports a non-2xx response. StatusCode is the raw HTTP status: Go-syntax formatting (%#v),
+// reflection and encoding/json print it unscrubbed; only Error renders the scrubbed code.
 type APIError struct {
 	StatusCode int
 	Status     string
 	Body       string
+
+	statusText string
 }
 
+// Error returns the HTTP status and any response message.
 func (e *APIError) Error() string {
+	if e.statusText != "" {
+		if e.Body != "" {
+			return "jackett: HTTP " + e.statusText + ": " + e.Body
+		}
+		return "jackett: HTTP " + e.statusText
+	}
 	if e.Body != "" {
 		return fmt.Sprintf("jackett: HTTP %d: %s", e.StatusCode, e.Body)
 	}
@@ -100,142 +116,15 @@ func (c *Client) doRequest(ctx context.Context, u string) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &APIError{StatusCode: resp.StatusCode, Status: resp.Status, Body: c.scrub(string(data))}
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     c.scrubText(resp.Status),
+			Body:       c.scrubBody(string(data)),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	return data, nil
-}
-
-// scrub replaces raw, query-escaped, and quoted occurrences of the API key in s with REDACTED.
-func (c *Client) scrub(s string) string {
-	if c.apiKey == "" {
-		// Why: ReplaceAll with empty old inserts at every rune.
-		return s
-	}
-	s = strings.ReplaceAll(s, c.apiKey, "REDACTED")
-	s = strings.ReplaceAll(s, url.QueryEscape(c.apiKey), "REDACTED")
-	quoted := strconv.Quote(c.apiKey)
-	return strings.ReplaceAll(s, quoted[1:len(quoted)-1], "REDACTED")
-}
-
-// redactedError presents sanitized message text and hides the error it replaces, whose text holds the API key.
-type redactedError struct {
-	msg string
-	// Why: no Unwrap method, so callers cannot reach text that holds the key.
-	err error
-}
-
-// Error returns the sanitized error message.
-func (e *redactedError) Error() string {
-	return e.msg
-}
-
-// Is reports whether the hidden error matches target, so errors.Is keeps working without exposing it.
-func (e *redactedError) Is(target error) bool {
-	return errors.Is(e.err, target)
-}
-
-// Timeout reports whether the underlying error timed out.
-func (e *redactedError) Timeout() bool {
-	// Why: url.Error.Timeout type-asserts its Err directly, so the wrapper must forward it.
-	var t interface{ Timeout() bool }
-	return errors.As(e.err, &t) && t.Timeout()
-}
-
-// Format prints only the sanitized message for every fmt verb and flag, so no verb reaches the hidden error.
-func (e *redactedError) Format(f fmt.State, verb rune) {
-	if _, err := fmt.Fprintf(f, fmt.FormatString(f, verb), e.msg); err != nil {
-		// Why: Format has no error return; a failed write leaves nothing more to print.
-		return
-	}
-}
-
-// maxErrNodes bounds the error tree walk in carriesKey.
-const maxErrNodes = 64
-
-// scrubError returns err unchanged when no error in its tree prints the API key; otherwise it hides err behind its scrubbed message.
-func (c *Client) scrubError(err error) error {
-	if err == nil || !c.carriesKey(err) {
-		return err
-	}
-	return &redactedError{msg: c.scrub(err.Error()), err: err}
-}
-
-// carriesKey reports whether err or any error it wraps, single or joined, prints the raw, query-escaped, or quoted API key.
-func (c *Client) carriesKey(err error) bool {
-	queue := []error{err}
-	for i := 0; i < maxErrNodes && i < len(queue); i++ {
-		if c.containsKey(queue[i].Error()) {
-			return true
-		}
-		queue = appendWrapped(queue, queue[i])
-	}
-	// Why: a tree past the bound is hidden, never trusted unread.
-	return len(queue) > maxErrNodes
-}
-
-// containsKey reports whether s holds the raw, query-escaped, or quoted API key.
-func (c *Client) containsKey(s string) bool {
-	// Why: strings.Contains with an empty key matches every string.
-	if c.apiKey == "" {
-		return false
-	}
-	quoted := strconv.Quote(c.apiKey)
-	return strings.Contains(s, c.apiKey) || strings.Contains(s, url.QueryEscape(c.apiKey)) ||
-		strings.Contains(s, quoted[1:len(quoted)-1])
-}
-
-// appendWrapped appends the non-nil errors that err wraps directly, single or joined, to queue, never growing it past maxErrNodes+1 errors.
-func appendWrapped(queue []error, err error) []error {
-	if len(queue) > maxErrNodes {
-		// Why: carriesKey already treats this tree as too large; more entries only cost memory.
-		return queue
-	}
-	if w := errors.Unwrap(err); w != nil {
-		return append(queue, w)
-	}
-	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok {
-		return queue
-	}
-	children := joined.Unwrap()
-	for i := 0; i < len(children) && len(queue) <= maxErrNodes; i++ {
-		if children[i] != nil {
-			queue = append(queue, children[i])
-		}
-	}
-	return queue
-}
-
-// redactError redacts root URL errors and scrubs raw, query-escaped, and quoted API key text.
-func (c *Client) redactError(err error) error {
-	var uerr *url.Error
-	if errors.As(err, &uerr) && any(err) == any(uerr) {
-		// Why: only replace a root URL error, preserving outer wrappers and joined siblings.
-		// Why: copy, never mutate an error value net/http or a custom transport may share.
-		err = &url.Error{Op: uerr.Op, URL: c.scrub(redactURL(uerr.URL)), Err: c.scrubError(uerr.Err)}
-	}
-	return c.scrubError(err)
-}
-
-// redactURL replaces the apikey query parameter in raw with REDACTED; it drops the whole query when the URL or its query does not parse.
-func redactURL(raw string) string {
-	u, err := url.Parse(raw)
-	var q url.Values
-	if err == nil {
-		q, err = url.ParseQuery(u.RawQuery)
-	}
-	if err != nil {
-		// Why: an unparseable URL or query may still carry the key, so drop the query whole.
-		base, _, _ := strings.Cut(raw, "?")
-		return base
-	}
-	if !q.Has("apikey") {
-		return raw
-	}
-	q.Set("apikey", "REDACTED")
-	u.RawQuery = q.Encode()
-	return u.String()
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, params url.Values, v any) error {

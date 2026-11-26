@@ -875,7 +875,7 @@ func runTransportErrorCase(t *testing.T, tc transportTestCase, key string) {
 func TestTransportErrorRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
-	const secretKey = `s3cr3t+key/=&x`
+	const secretKey = "fixture-key42"
 	cases := []transportTestCase{
 		{
 			name:    "search torznab path on closed server",
@@ -1007,10 +1007,10 @@ func runCustomTransportErrorCases(t *testing.T, cases []customTransportTestCase,
 func TestCustomTransportErrorRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
-	const secretKey = `s3cr3t+key/=&x`
+	const secretKey = "fixture-key42"
 	cases := []customTransportTestCase{
 		{
-			name: "escaped key in inner text",
+			name: "key in inner request URL",
 			tripErr: func(r *http.Request) error {
 				return fmt.Errorf("upstream refused %s", r.URL)
 			},
@@ -1077,7 +1077,7 @@ func deepQuietChain(r *http.Request, n int) error {
 func TestNestedTransportErrorRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
-	const secretKey = `s3cr3t+key/=&x`
+	const secretKey = "fixture-key42"
 	cases := []customTransportTestCase{
 		{
 			name: "quiet wrapper over url error",
@@ -1121,7 +1121,7 @@ func echoKeyHandler(t *testing.T) http.HandlerFunc {
 func TestAPIErrorBodyRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
-	const secretKey = `s3cr3t+key/=&x`
+	const secretKey = "fixture-key42"
 	srv := httptest.NewServer(echoKeyHandler(t))
 	t.Cleanup(srv.Close)
 
@@ -1142,14 +1142,8 @@ func TestAPIErrorBodyRedactsAPIKey(t *testing.T) {
 	if apiErr.StatusCode != http.StatusInternalServerError {
 		t.Errorf("StatusCode = %d, want 500", apiErr.StatusCode)
 	}
-	if !strings.Contains(apiErr.Body, "REDACTED") {
-		t.Errorf("apiErr.Body missing REDACTED: %q", apiErr.Body)
-	}
-	if strings.Contains(apiErr.Body, secretKey) {
-		t.Errorf("apiErr.Body leaked raw key: %q", apiErr.Body)
-	}
-	if strings.Contains(apiErr.Body, url.QueryEscape(secretKey)) {
-		t.Errorf("apiErr.Body leaked escaped key: %q", apiErr.Body)
+	if want := "bad request /api/v2.0/indexers?apikey=REDACTED&configured=true key=REDACTED"; apiErr.Body != want {
+		t.Errorf("apiErr.Body = %q, want %q", apiErr.Body, want)
 	}
 	errMsg := err.Error()
 	if strings.Contains(errMsg, secretKey) {
@@ -1261,7 +1255,7 @@ func TestResponseErrorRedactsAPIKey(t *testing.T) {
 	cases := []responseErrorTestCase{
 		{
 			name:       "read error without key keeps text",
-			key:        `s3cr3t+key/=&x`,
+			key:        "fixture-key42",
 			body:       readErrPlainBody,
 			call:       callGetIndexers,
 			wantPrefix: "jackett: read response: read sentinel",
@@ -1269,7 +1263,7 @@ func TestResponseErrorRedactsAPIKey(t *testing.T) {
 		},
 		{
 			name:       "read error carries URL",
-			key:        `s3cr3t+key/=&x`,
+			key:        "fixture-key42",
 			body:       readErrURLBody,
 			call:       callGetIndexers,
 			wantPrefix: "jackett: read response:",
@@ -1277,7 +1271,7 @@ func TestResponseErrorRedactsAPIKey(t *testing.T) {
 		},
 		{
 			name:       "read error carries raw key",
-			key:        `s3cr3t+key/=&x`,
+			key:        "fixture-key42",
 			body:       readErrRawKeyBody,
 			call:       callGetIndexers,
 			wantPrefix: "jackett: read response:",
@@ -1285,7 +1279,7 @@ func TestResponseErrorRedactsAPIKey(t *testing.T) {
 		},
 		{
 			name:       "read error is url error",
-			key:        `s3cr3t+key/=&x`,
+			key:        "fixture-key42",
 			body:       readErrURLStructBody,
 			call:       callGetIndexers,
 			wantPrefix: "jackett: read response:",

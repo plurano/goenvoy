@@ -168,6 +168,8 @@ module-scripts-check: ## Module discovery, per-module lint scripts, and test-com
 	bash tools/test-claim-calls.sh
 	bash tools/module-dirs_test.sh
 	bash tools/golangci-modules_test.sh
+	bash tools/redact-parity_test.sh
+	bash tools/redact-parity.sh
 
 doc: ## Local godoc server at :6060
 	@echo "Starting godoc server at http://localhost:6060"

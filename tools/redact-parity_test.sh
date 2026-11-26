@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Exercise discovery, comparison, and diagnostics against tracked fixture files.
+# Pass an absolute checker path to replay the package clause and missing scrubText cases.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUT=(bash "${1:-$HERE/redact-parity.sh}")
+# Why: keep all caller-provided Git configuration out of the fixture repository.
+for name in "${!GIT_@}"; do
+  unset "$name"
+done
+# Why: this script resolves the checked-in helper relative to its own path at runtime.
+# shellcheck source=tools/testlib.sh disable=SC1091
+. "$HERE/testlib.sh"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK"
+timeout 60 git init -q --template=''
+exception=downloadclient/sabnzbd/redact.go
+mkdir -p first second "${exception%/*}" unrelated
+
+wrapper_and_span=$'type redactedError struct{}\n\nfunc (c *Client) percentSpan() {}'
+shared_source="$wrapper_and_span"$'\n\nfunc (c *Client) scrubText() {}'
+printf 'package alpha\n\n%s\n' "$shared_source" >first/redact.go
+printf 'package alpha\n\n// Traversal tests.\n' >first/redact_as_internal_test.go
+printf 'package unrelated\n' >unrelated/redact.go
+timeout 60 git add first
+if [[ $# -eq 0 ]]; then
+  expect_refusal 'absent exception' "$exception:1: stale exception" "${SUT[@]}"
+fi
+printf 'package standalone\n\n%s\n' "$wrapper_and_span" >"$exception"
+timeout 60 git add "$exception"
+expect_refusal 'single shared copy with other redact.go files' 'found 1 redaction copies' "${SUT[@]}"
+
+printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
+timeout 60 git add second/redact.go
+expect_refusal 'missing test file' 'second/redact_as_internal_test.go:1: missing file' "${SUT[@]}"
+
+printf 'package beta\n\n// Traversal tests.\n' >second/redact_as_internal_test.go
+timeout 60 git add second/redact_as_internal_test.go
+expect_output 'different package names and tracked exception excluded' 'redact-parity: 2 redaction copies match' "${SUT[@]}"
+
+leading_comment=$' \t// package ignored\n/*\npackage other\n*/'
+printf '%s package alpha\n\n%s\n' "$leading_comment" "$shared_source" >first/redact.go
+printf '%s package beta\n\n%s\n' "$leading_comment" "$shared_source" >second/redact.go
+expect_output 'leading block comment is preserved before different package clauses' 'redact-parity: 2 redaction copies match' "${SUT[@]}"
+printf '%s package beta\n\n%s\n' "${leading_comment/package other/package another}" "$shared_source" >second/redact.go
+expect_refusal 'package-like text differs inside a leading block comment' 'second/redact.go:3: differs' "${SUT[@]}"
+
+printf "package alpha\nvar fixture = \`\n\n\`\n%s\n" "$shared_source" >first/redact.go
+printf "\nvar fixture = \`\npackage beta\n\`\n%s\n" "$shared_source" >second/redact.go
+expect_refusal 'raw string cannot supply the package clause' 'second/redact.go:2: missing package clause' "${SUT[@]}"
+
+printf 'package /* comment */ alpha\n\n%s\n' "$shared_source" >first/redact.go
+printf 'package /* other */ beta\n\n%s\n' "$shared_source" >second/redact.go
+expect_output 'same-line comments inside package clauses' 'redact-parity: 2 redaction copies match' "${SUT[@]}"
+printf 'package /*\ncomment */ beta\n\n%s\n' "$shared_source" >second/redact.go
+expect_refusal 'package clause cannot continue on the next line' 'second/redact.go:1: missing package clause' "${SUT[@]}"
+
+printf 'package alpha\n\n%s\n' "$shared_source" >first/redact.go
+printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
+
+# Why: two copies must still match if the checker silently drops the planted copy.
+mkdir third
+printf 'package gamma\n\n%s\n' "$shared_source" >third/redact.go
+printf 'package gamma\n\n// Traversal tests.\n' >third/redact_as_internal_test.go
+timeout 60 git add third
+printf 'package beta\n\n%s\n\n' "$wrapper_and_span" >second/redact.go
+expect_refusal 'missing scrubText in a copy with percentSpan' 'second/redact.go:7: differs' "${SUT[@]}"
+if [[ $# -gt 0 ]]; then
+  exit 0
+fi
+
+printf 'package beta\n\ntype redactedError struct{ key string }\n' >second/redact.go
+expect_refusal 'implementation drift' 'second/redact.go:3: differs' "${SUT[@]}"
+
+printf 'package mylar; var extra = 1\n\n%s\n' "$shared_source" >second/redact.go
+inline_rc=0
+inline_output="$("${SUT[@]}" 2>&1)" || inline_rc=$?
+if [[ $inline_rc -ne 1 || $inline_output != *'second/redact.go:1: differs'* ]]; then
+  printf 'FAIL inline package declaration drift: checker rc=%d\n%s\n' "$inline_rc" "$inline_output" >&2
+  exit 1
+fi
+echo "ok   inline package declaration drift: refused (checker rc=$inline_rc)"
+
+printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
+printf 'package beta\n\n// Traversal tests.' >second/redact_as_internal_test.go
+expect_refusal 'test drift at the final newline' 'second/redact_as_internal_test.go:3: differs' "${SUT[@]}"
+
+printf 'package beta\n\n// Traversal tests.\n' >second/redact_as_internal_test.go
+printf 'package standalone\n\ntype redactedError struct{}\n' >"$exception"
+expect_output 'tracked exception excluded by path' 'redact-parity: 3 redaction copies match' "${SUT[@]}"
+
+printf 'package gamma\n\ntype (\n  redactedError struct{}\n)\n' >third/redact.go
+grouped_rc=0
+grouped_output="$("${SUT[@]}" 2>&1)" || grouped_rc=$?
+if [[ $grouped_rc -ne 1 || $grouped_output != *'third/redact.go:3: differs'* ]]; then
+  printf 'FAIL grouped declaration drift: checker rc=%d\n%s\n' "$grouped_rc" "$grouped_output" >&2
+  exit 1
+fi
+echo "ok   grouped declaration drift: refused (checker rc=$grouped_rc)"
+printf 'package gamma\n\n%s\n' "$shared_source" >third/redact.go
+
+printf 'package standalone\n' >"$exception"
+expect_refusal 'exception without wrapper' "$exception:1: stale exception" "${SUT[@]}"
+
+printf 'package standalone\n\n// redactedError was here\n' >"$exception"
+expect_refusal 'exception with only a wrapper comment' "$exception:1: stale exception" "${SUT[@]}"
+
+printf 'package standalone\n\ntype (\n  redactedError struct{}\n)\n' >"$exception"
+expect_output 'grouped declaration keeps the exception' 'redact-parity: 3 redaction copies match' "${SUT[@]}"
+
+printf 'package standalone\n\ntype (Other int; redactedError struct{})\n' >"$exception"
+expect_output 'same-line grouped declaration keeps the exception' 'redact-parity: 3 redaction copies match' "${SUT[@]}"
+
+printf 'package standalone\n\ntype redactedError struct{}\nfunc broken(]\n' >"$exception"
+expect_refusal 'parse error in the exception' "$exception:4:" "${SUT[@]}"
+
+printf 'package standalone\n\n%s\n' "$wrapper_and_span" >"$exception"
+planted_rc=0
+
+printf 'package beta\n\n%s\n' "${shared_source//redactedError/otherError}" >second/redact.go
+(expect_refusal 'tracked copy without wrapper references' 'second/redact.go:3: differs' "${SUT[@]}") || planted_rc=1
+printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
+
+printf 'package unrelated\n\n%s\n' "$shared_source" >unrelated/redact.go
+printf 'package unrelated\n\n// Traversal tests.\n' >unrelated/redact_as_internal_test.go
+timeout 60 git add unrelated/redact.go
+(expect_refusal 'untracked parity test exists on disk' 'unrelated/redact_as_internal_test.go:1: missing file in git index' "${SUT[@]}") || planted_rc=1
+exit "$planted_rc"
