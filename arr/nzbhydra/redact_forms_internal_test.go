@@ -198,7 +198,7 @@ func TestRedactedErrorTemporary(t *testing.T) {
 		{name: "permanent cause", cause: temporaryCause{text: "fixture " + key, temporary: false}, want: false},
 		{name: "wrapped temporary cause", cause: fmt.Errorf("fixture %s: %w", key, temporaryCause{text: "fixture cause", temporary: true}), want: true},
 		{name: "cause without method", cause: errors.New("fixture " + key), want: false},
-		{name: "root url error temporary cause", cause: &url.Error{Op: "Get", URL: "http://example.invalid/", Err: temporaryCause{text: "fixture " + key, temporary: true}}, root: true, want: true},
+		{name: "root url error temporary cause", cause: &url.Error{Op: "Get", URL: "http://example.invalid/", Err: &temporaryCause{text: "fixture " + key, temporary: true}}, root: true, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -217,6 +217,7 @@ func assertTemporaryRedacted(t *testing.T, c *Client, cause error, root, want bo
 		if !ok {
 			t.Fatalf("redactError(%T) = %T; want *url.Error", cause, got)
 		}
+		assertRedactedRootCause(t, uerr, cause)
 		if gotTemp := uerr.Temporary(); gotTemp != want {
 			t.Errorf("Temporary() = %v; want %v", gotTemp, want)
 		}
@@ -229,6 +230,25 @@ func assertTemporaryRedacted(t *testing.T, c *Client, cause error, root, want bo
 	}
 	if gotTemp := hidden.Temporary(); gotTemp != want {
 		t.Errorf("Temporary() = %v; want %v", gotTemp, want)
+	}
+}
+
+// assertRedactedRootCause checks that the copied root wraps its original cause.
+func assertRedactedRootCause(t *testing.T, got *url.Error, cause error) {
+	t.Helper()
+	original, ok := cause.(*url.Error) //nolint:errorlint // inspect the fixture root, not its error tree
+	if !ok {
+		t.Fatalf("root fixture has type %T; want *url.Error", cause)
+	}
+	if got == original {
+		t.Fatal("redactError returned the original *url.Error")
+	}
+	hidden := hiddenRedaction(got.Err)
+	if hidden == nil {
+		t.Fatalf("redacted root cause has type %T; want a package redaction wrapper", got.Err)
+	}
+	if hidden.err != original.Err { //nolint:errorlint // require the same cause instance
+		t.Error("redacted root wrapper does not retain the original cause")
 	}
 }
 
@@ -267,6 +287,21 @@ func TestAPIErrorBodyEscapeLayers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			assertAPIErrorEscapedBody(t, key, tc.body, tc.want)
+		})
+	}
+}
+
+// TestAPIErrorBodyScrubKeepsEscapedKey checks redaction when inline replacement leaves an escaped key.
+func TestAPIErrorBodyScrubKeepsEscapedKey(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ name, key, body, want string }{
+		{"split unicode escape", `ab`, `{"x":"\u00ab","y":"\u0061\u0062"}`, "REDACTED"},
+		{"escaped backslash before encoded key", `a\`, `{"v":"a\\\u0061\u005c"}`, "REDACTED"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertAPIErrorEscapedBody(t, tc.key, tc.body, tc.want)
 		})
 	}
 }
@@ -327,10 +362,12 @@ func assertAPIErrorEscapedBody(t *testing.T, key, body, want string) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	c, err := New(srv.URL, key, WithHTTPClient(srv.Client()))
+	c, err := New(srv.URL, "", WithHTTPClient(srv.Client()))
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Why: fixture key injection tests body redaction independently of constructor validation.
+	c.apiKey = key
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	calls := []func() error{
