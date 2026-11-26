@@ -2,6 +2,11 @@ package mylar
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -1891,12 +1896,16 @@ func TestURLCopyUsesObservedUnsafeTree(t *testing.T) {
 	}{
 		{"unchanged", nil, true},
 		{"typed nil", []error{(*redactNilTimeoutCause)(nil), original}, false},
+		{"sibling typed nil", []error{original, &redactCycleErr{text: "fixture sibling", next: (*redactNilTimeoutCause)(nil)}}, false},
 		{"overflow", wide, false},
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
 			tree := &redactChangingJoin{link: original, after: tc.after}
-			got := client.scrubError(tree)
+			got, ok := client.scrubError(tree).(*redactedError) //nolint:errorlint // require the wrapper itself
+			if !ok {
+				subtest.Fatal("expected an opaque wrapper")
+			}
 			tree.changed.Store(tc.after != nil)
 			var copied *url.Error
 			if !errors.As(got, &copied) || copied == nil || copied == original {
@@ -1904,6 +1913,7 @@ func TestURLCopyUsesObservedUnsafeTree(t *testing.T) {
 			}
 			assertNoKeyForms(subtest, copied.Error(), key)
 			assertClassifierValues(subtest, "copy", copied, tc.want, tc.want)
+			assertClassifierValues(subtest, "wrapper", got, tc.want, tc.want)
 		})
 	}
 }
@@ -2035,6 +2045,7 @@ func TestForeignRedactionRemainsOpaque(t *testing.T) {
 		Err: &net.DNSError{Err: first + second, IsTimeout: true},
 	}
 	foreign := (&Client{apiKey: first}).scrubError(&redactCycleErr{text: "fixture outer", next: inner})
+	assertRecoverableForeignURL(t, foreign, inner, first)
 	c := &Client{apiKey: second}
 	for name, apply := range map[string]func(error) error{"redactError": c.redactError, "scrubError": c.scrubError} {
 		t.Run(name, func(subtest *testing.T) {
@@ -2049,7 +2060,9 @@ func TestForeignRedactionBehindStdlibDelegates(t *testing.T) {
 	t.Parallel()
 	const first, second = "cedar", "maple"
 	dns := &net.DNSError{Err: first, IsTimeout: true}
-	foreign := (&Client{apiKey: first}).scrubError(dns)
+	inner := &url.Error{Op: "Get", URL: "https://example.invalid/?apikey=" + first, Err: dns}
+	foreign := (&Client{apiKey: first}).scrubError(inner)
+	assertRecoverableForeignURL(t, foreign, inner, first)
 	client := &Client{apiKey: second}
 	for _, tc := range [...]struct {
 		name    string
@@ -2067,6 +2080,127 @@ func TestForeignRedactionBehindStdlibDelegates(t *testing.T) {
 			subtest.Parallel()
 			assertStdlibDelegate(subtest, client.redactError(tc.wrapper), tc.target, first, second, tc.want)
 			assertStdlibDelegate(subtest, client.scrubError(tc.wrapper), tc.target, first, second, tc.want)
+		})
+	}
+}
+
+// assertRecoverableForeignURL verifies that the first-key wrapper can recover a sanitized URL copy.
+func assertRecoverableForeignURL(t *testing.T, foreign error, original *url.Error, key string) {
+	t.Helper()
+	var recovered *url.Error
+	if !errors.As(foreign, &recovered) || recovered == nil || recovered == original {
+		t.Fatal("expected the first-key wrapper to recover a sanitized URL copy")
+	}
+	assertNoKeyForms(t, recovered.Error(), key)
+}
+
+// redactTLSPermanentError mirrors the GOROOT crypto/tls/conn.go permanentError at lines 187–194.
+type redactTLSPermanentError struct{ err net.Error }
+
+// Error returns the delegated message.
+func (e *redactTLSPermanentError) Error() string { return e.err.Error() }
+
+// Unwrap returns the delegated error.
+func (e *redactTLSPermanentError) Unwrap() error { return e.err }
+
+// Timeout returns the delegated classification.
+func (e *redactTLSPermanentError) Timeout() bool { return e.err.Timeout() }
+
+// Temporary reports false for a permanent error.
+func (*redactTLSPermanentError) Temporary() bool { return false }
+
+type redactTLSWriteFailure struct {
+	net.Conn
+	err error
+}
+
+// Write forwards handshake writes and injects the fixture error afterward.
+func (c *redactTLSWriteFailure) Write(data []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	return c.Conn.Write(data)
+}
+
+// tlsPermanentError runs an in-memory handshake and gets the TLS wrapper for a failed write.
+func tlsPermanentError(t *testing.T, cause error) error {
+	t.Helper()
+	const host = "example.invalid"
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate TLS fixture key: %v", err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{DNSNames: []string{host}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
+	if err != nil {
+		t.Fatalf("create TLS fixture certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse TLS fixture certificate: %v", err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert)
+	pipe, peer := net.Pipe()
+	t.Cleanup(func() {
+		if closeErr := errors.Join(pipe.Close(), peer.Close()); closeErr != nil {
+			t.Errorf("close TLS fixture pipe: %v", closeErr)
+		}
+	})
+	conn := &redactTLSWriteFailure{Conn: pipe}
+	client := tls.Client(conn, &tls.Config{ServerName: host, RootCAs: roots, MinVersion: tls.VersionTLS13})
+	server := tls.Server(peer, &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, MinVersion: tls.VersionTLS13, SessionTicketsDisabled: true})
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- server.HandshakeContext(ctx) }()
+	clientErr, serverErr := client.HandshakeContext(ctx), <-done
+	if err = errors.Join(clientErr, serverErr); err != nil {
+		t.Fatalf("handshake over TLS fixture pipe: %v", err)
+	}
+	conn.err = cause
+	_, err = client.Write([]byte("fixture"))
+	if fmt.Sprintf("%T", err) != "*tls.permanentError" || !errors.Is(err, cause) {
+		t.Fatalf("TLS fixture write returned %T; want *tls.permanentError wrapping the fixture cause", err)
+	}
+	return err
+}
+
+// TestForeignRedactionBehindDelegatingClassifier checks external delegates over both key boundaries.
+func TestForeignRedactionBehindDelegatingClassifier(t *testing.T) {
+	t.Parallel()
+	const first, second = "cedar", "maple"
+	firstClient, client := &Client{apiKey: first}, &Client{apiKey: second}
+	dns := &net.DNSError{Err: first, IsTimeout: true}
+	sameKeyDNS := &net.DNSError{Err: second, IsTimeout: true}
+	foreign := hiddenRedaction(firstClient.scrubError(dns))
+	sameKey := hiddenRedaction(client.scrubError(sameKeyDNS))
+	if foreign == nil || sameKey == nil {
+		t.Fatal("expected opaque DNS fixtures")
+	}
+	delegate := &redactTLSPermanentError{err: foreign}
+	for _, tc := range [...]struct {
+		name  string
+		input error
+		cause error
+	}{
+		{"op error with foreign delegate", &net.OpError{Err: delegate}, dns},
+		{"foreign delegate", delegate, dns},
+		{"real TLS delegate", &net.OpError{Err: tlsPermanentError(t, foreign)}, dns},
+		{"same-key delegate", errors.Join(&redactTLSPermanentError{err: sameKey}, errors.New(second)), sameKeyDNS},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			for _, apply := range [...]func(error) error{client.redactError, client.scrubError} {
+				got := apply(tc.input)
+				assertOpaqueError(subtest, firstClient, tc.name, got)
+				assertOpaqueError(subtest, client, tc.name, got)
+				assertErrorClassifications(subtest, got, false, false)
+				if !errors.Is(got, tc.cause) {
+					subtest.Error("errors.Is did not preserve hidden identity")
+				}
+			}
 		})
 	}
 }
@@ -2153,12 +2287,15 @@ func TestRedactedErrorAsSuppliedClassifiers(t *testing.T) {
 	client := &Client{apiKey: "maple"}
 	foreign := hiddenRedacted(t, "cedar", &net.DNSError{Err: "cedar", IsTimeout: true})
 	sameKey := &redactedError{key: "maple", err: &net.DNSError{IsTimeout: true}}
+	delegate := &redactTLSPermanentError{err: hiddenRedaction(foreign)}
 	for _, tc := range [...]struct {
 		name  string
 		cause error
 		want  bool
 	}{
 		{"op error with foreign wrapper", redactAsFixedClassifier{&net.OpError{Err: foreign}}, false},
+		{"foreign delegate", redactAsFixedClassifier{delegate}, false},
+		{"op error with foreign delegate", redactAsFixedClassifier{&net.OpError{Err: delegate}}, false},
 		{"op error with typed nil", redactAsFixedClassifier{&net.OpError{Err: (*redactedError)(nil)}}, false},
 		{"same-key wrapper", redactAsFixedClassifier{sameKey}, false},
 		{"custom classifier", redactAsClassifier{}, true},
@@ -2210,7 +2347,7 @@ func stdlibErrorClassifications(err error) (bool, bool) {
 	return errors.As(err, &timeout) && timeout.Timeout(), errors.As(err, &temporary) && temporary.Temporary()
 }
 
-// TestRedactedErrorStdlibDelegateBudget checks useful chains and chains that exhaust the walk budget.
+// TestRedactedErrorStdlibDelegateBudget checks classifier chains at and beyond the structural limit.
 func TestRedactedErrorStdlibDelegateBudget(t *testing.T) {
 	t.Parallel()
 	for _, tc := range [...]struct {
@@ -2218,8 +2355,9 @@ func TestRedactedErrorStdlibDelegateBudget(t *testing.T) {
 		depth int
 		want  bool
 	}{
-		{"within budget", 100, true},
-		{"over budget", maxWalkSteps + 1, false},
+		{"at structural limit", maxErrNodes - 1, true},
+		{"over structural limit", maxErrNodes, false},
+		{"over walk budget", maxWalkSteps + 1, false},
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
@@ -2350,16 +2488,7 @@ func TestSpellingScanWorkBound(t *testing.T) {
 			subtest.Parallel()
 			client := &Client{apiKey: strings.Repeat("a", tc.keyLen-1) + "b"}
 			text := "%" + strings.Repeat("a", tc.textLen-1)
-			scan := func() bool { return client.matchesKeySpelling(text) }
-			var got bool
-			if tc.guardHang {
-				got = answerWithinTwoSeconds(subtest, "matchesKeySpelling", scan)
-			} else {
-				got = scan()
-			}
-			if got != tc.want {
-				subtest.Errorf("matchesKeySpelling with text length %d and key length %d = %t, want %t", tc.textLen, tc.keyLen, got, tc.want)
-			}
+			assertSpellingScanAndScrub(subtest, client, text, tc.want, tc.guardHang)
 		})
 	}
 	const word = "fixture"
@@ -2369,5 +2498,30 @@ func TestSpellingScanWorkBound(t *testing.T) {
 	escaped := fmt.Sprintf("%%%02x%s", key[0], key[1:])
 	if c.matchesKeySpelling(body) || !c.matchesKeySpelling(body+escaped) {
 		t.Error("unexpected spelling scan result for an ordinary body")
+	}
+}
+
+// assertSpellingScanAndScrub checks the spelling limit and its effect on the scrubbed text.
+func assertSpellingScanAndScrub(t *testing.T, client *Client, text string, want, guardHang bool) {
+	t.Helper()
+	scan := func() bool { return client.matchesKeySpelling(text) }
+	scrub := func() string { return client.scrubText(text) }
+	var scanned bool
+	var scrubbed string
+	if guardHang {
+		scanned = answerWithinTwoSeconds(t, "matchesKeySpelling", scan)
+		scrubbed = answerWithinTwoSeconds(t, "scrubText", scrub)
+	} else {
+		scanned, scrubbed = scan(), scrub()
+	}
+	if scanned != want {
+		t.Errorf("matchesKeySpelling with text length %d and key length %d = %t, want %t", len(text), len(client.apiKey), scanned, want)
+	}
+	wantText := text
+	if want {
+		wantText = "REDACTED"
+	}
+	if scrubbed != wantText {
+		t.Errorf("scrubText with text length %d and key length %d: redacted = %t, unchanged = %t, want redacted = %t", len(text), len(client.apiKey), scrubbed == "REDACTED", scrubbed == text, want)
 	}
 }

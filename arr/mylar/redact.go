@@ -303,6 +303,9 @@ func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	if e.unsafe {
 		return false
 	}
+	if _, unsafe := inspectErrorTree(e.err); unsafe {
+		return false
+	}
 	reported := false
 	e.walk(nil, func(node error) walkAction {
 		var action walkAction
@@ -352,6 +355,9 @@ func classifyStdlibNode[T any](node error, classifier T, classify func(T) bool) 
 func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction, bool) {
 	classifier, ok := node.(T)
 	if ok {
+		if reachesPackageWrapper(node) {
+			return walkStop, false
+		}
 		return walkStop, classify(classifier)
 	}
 	as, hasAs := node.(interface{ As(any) bool })
@@ -359,10 +365,19 @@ func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction,
 		return walkDescend, false
 	}
 	// Why: wrappers supplied by As live outside this walk and cannot share its budget.
-	if supplied, isError := any(classifier).(error); isError && (hiddenRedaction(supplied) != nil || isStdlibClassifier(supplied)) {
+	if supplied, isError := any(classifier).(error); isError && (hiddenRedaction(supplied) != nil ||
+		isStdlibClassifier(supplied) || reachesPackageWrapper(supplied)) {
 		return walkStop, false
 	}
 	return walkStop, classify(classifier)
+}
+
+// reachesPackageWrapper reports whether the bounded Unwrap tree contains a package wrapper or is unsafe.
+func reachesPackageWrapper(err error) bool {
+	queue, unsafe := inspectErrorTree(err)
+	return unsafe || slices.ContainsFunc(queue, func(node error) bool {
+		return hiddenRedaction(node) != nil
+	})
 }
 
 // isStdlibClassifier reports whether node has a classifier that delegates to an underlying error.
@@ -528,7 +543,7 @@ func isNilValue(value any) bool {
 }
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
-// It preserves nil causes and replaces typed-nil or unsafe causes with a fixed, unclassified error.
+// It suppresses classification if the current tree is unsafe, preserves nil causes, and replaces unsafe causes with a fixed error.
 // If the tree is safe and the immediate cause implements Timeout or Temporary, the copy captures both classifications
 // in one walk of up to 4096 nodes and 64 joined errors.
 func (e *redactedError) As(target any) bool {
@@ -536,26 +551,27 @@ func (e *redactedError) As(target any) bool {
 	if !ok {
 		return false
 	}
-	// Why: bounded breadth-first walk over the hidden tree; errors.As on it would search unbounded.
+	// Why: finish bounded inspection before copying so a later sibling can suppress classification.
 	queue := []error{e.err}
 	unsafe := e.unsafe
+	var firstURL *url.Error
 	for i := 0; i < maxErrNodes && i < len(queue); i++ {
-		if uerr, isURL := queue[i].(*url.Error); isURL && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
-			// Why: hand out a scrubbed copy, never the original that holds the key.
-			c := Client{apiKey: e.key}
-			*dst = &url.Error{
-				Op: c.scrubText(uerr.Op), URL: c.scrubText(redactURL(uerr.URL)),
-				Err: c.hideURLCause(uerr.Err, unsafe),
-			}
-			return true
+		if uerr, isURL := queue[i].(*url.Error); firstURL == nil && isURL && uerr != nil { //nolint:errorlint // select the first URL error of the bounded walk
+			firstURL = uerr
 		}
-		// Why: package wrappers expose no Unwrap, so URL recovery cannot cross into their hidden tree.
 		var unsafeNode bool
 		queue, unsafeNode = appendWrappedChildren(queue, queue[i])
-		// Why: overflow is unsafe under the same 64-node budget as inspectErrorTree, even if Unwrap changes after scrubbing.
 		unsafe = unsafe || unsafeNode
 	}
-	return false
+	if firstURL == nil {
+		return false
+	}
+	c := Client{apiKey: e.key}
+	*dst = &url.Error{
+		Op: c.scrubText(firstURL.Op), URL: c.scrubText(redactURL(firstURL.URL)),
+		Err: c.hideURLCause(firstURL.Err, unsafe),
+	}
+	return true
 }
 
 // Format prints only the sanitized message for every verb and flag.
