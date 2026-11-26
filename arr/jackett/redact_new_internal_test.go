@@ -49,8 +49,8 @@ func TestCheckErrorTreeNil(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: tc.key}
-			if carry, _ := c.checkErrorTree(nil); carry {
-				t.Error("checkErrorTree(nil) = true; want false")
+			if carry, unsafe := c.checkErrorTree(nil); carry || unsafe {
+				t.Errorf("checkErrorTree(nil) = (%t, %t); want (false, false)", carry, unsafe)
 			}
 			if got := c.redactError(nil); got != nil {
 				t.Errorf("redactError(nil) = %v; want nil", got)

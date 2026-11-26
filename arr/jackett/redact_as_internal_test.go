@@ -2136,6 +2136,9 @@ func TestRedactErrorRootURLReplacedCause(t *testing.T) {
 			input := &url.Error{Op: "Get", URL: tc.url}
 			input.Err = &redactReplacingRootCause{parent: input, replacement: replacement, onRootText: tc.onRootText}
 			got := client.redactError(input)
+			if any(input.Err) != any(replacement) {
+				subtest.Error("fixture did not replace the root URL cause")
+			}
 			if tc.url == cleanURL {
 				assertFixedRootURL(subtest, got)
 			} else {
@@ -2426,6 +2429,57 @@ func TestRedactErrorCleanRootURLNodeLimit(t *testing.T) {
 			assertCleanRootURLNodeLimit(subtest, input, got, tc.nodes, calls, strings.Contains(tc.leaf, "maple"))
 		})
 	}
+}
+
+// TestRedactErrorCleanRootURLReadLimit checks that typed nils spend the cause budget.
+func TestRedactErrorCleanRootURLReadLimit(t *testing.T) {
+	t.Parallel()
+	client := &Client{apiKey: "maple"}
+	for _, tc := range [...]struct {
+		name  string
+		count int
+		cause func(int, *int) error
+		fixed bool
+	}{
+		{"64 reads in join", maxErrNodes - 2, typedNilRootJoin, true},
+		{"63 reads in join", maxErrNodes - 3, typedNilRootJoin, false},
+		{"64 reads in chain", maxErrNodes - 2, typedNilRootChain, true},
+		{"63 reads in chain", maxErrNodes - 3, typedNilRootChain, false},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			calls := 0
+			input := &url.Error{Op: "Get", URL: wrapperFixtureURL, Err: tc.cause(tc.count, &calls)}
+			got := client.redactError(input)
+			if tc.fixed {
+				assertFixedRootURL(subtest, got)
+			} else {
+				assertObservedRootURL(subtest, got, input, false, true)
+			}
+			if calls != 0 {
+				subtest.Errorf("cause leaf or link Error called %d times; want 0", calls)
+			}
+		})
+	}
+}
+
+// typedNilRootJoin builds a join of counted leaves and a final typed nil.
+func typedNilRootJoin(leaves int, calls *int) error {
+	var children [maxErrNodes - 1]error
+	for index := range leaves {
+		children[index] = &redactRootCauseLink{text: "fixture leaf", calls: calls}
+	}
+	children[leaves] = (*redactRootCauseLink)(nil)
+	return errors.Join(children[:leaves+1]...)
+}
+
+// typedNilRootChain builds counted links over a terminal cause that unwraps to a typed nil.
+func typedNilRootChain(links int, calls *int) error {
+	var cause error = &redactRootCauseLink{text: "fixture leaf", next: (*redactRootCauseLink)(nil), calls: calls}
+	for range links {
+		cause = &redactRootCauseLink{text: "fixture link", next: cause, calls: calls}
+	}
+	return cause
 }
 
 // TestRedactErrorCheckMethodCounts pins the call counts on clean trees.

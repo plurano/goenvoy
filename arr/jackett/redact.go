@@ -1158,8 +1158,8 @@ func (c *Client) redactRootURL(uerr *url.Error) error {
 	cleanOp, cleanURL := c.scrubText(op), c.scrubText(redactURL(rawURL))
 	changed := cleanOp != op || cleanURL != rawURL
 	tree, unsafe := inspectErrorTree(cause)
-	// Why: an unchanged URL root still counts toward the whole-tree inspection limit.
-	if !changed && len(tree.nodes) >= maxErrNodes {
+	// Why: the unchanged root spends one read, and typed-nil and examined overflow children spend reads too.
+	if !changed && tree.reads >= maxErrNodes {
 		return c.scrubCheckedError(uerr, true, true)
 	}
 	if changed || c.errorTreeNeedsRedaction(tree, unsafe) {

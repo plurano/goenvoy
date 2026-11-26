@@ -25,7 +25,9 @@
 // Reflection checks up to 1024 values per node and follows only the start pointer.
 // Overflow or a nested fmt.Formatter or fmt.GoStringer → opaque wrapper.
 // Custom formatting or As on an error node → opaque wrapper.
-// Wrapper with this client's key at any position (root, wrapped chain, exported field such as a URL error cause) → kept without another wrapper.
+// Wrapper with this client's key → retain the inner wrapper.
+// Key in outer error text, URL error fields or reflected values → opaque wrapper for the outer error,
+// or sanitized copy for a root URL error with changed fields.
 // Wrapper with another captured key → opaque boundary for classification and URL recovery.
 // Wrapper of another goenvoy client (RedactionBoundary method) → opaque boundary: classification false; its Is, As, Timeout and Temporary not called.
 // Forwarded identity search visits up to 4096 nodes and 64 joined errors.
@@ -45,7 +47,7 @@
 // URL copies keep nil causes. Typed-nil or unsafe causes become fixed opaque errors without classification.
 // Root URL copy → one cause inspection. Unsafe first read → fixed opaque cause.
 // Clean root whose Op, URL or cause field changes during inspection, or whose cause value is not comparable → fixed message.
-// Unchanged root counts as one of 64 nodes: cause of 64 or more nodes → fixed message, no cause text read.
+// Unchanged root spends one of 64 reads: cause of 64 or more values read (typed-nil children included) → fixed message, no cause text read.
 // Safe immediate cause implements Timeout or Temporary → read its tree and every same-key wrapper tree inside it once and use them for both classifications.
 // The once-only read covers the copy's classification snapshot; the errors.As search that selects the URL error reads the cause separately.
 //

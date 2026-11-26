@@ -18,7 +18,7 @@ API key passed as `apikey` query parameter.
 - URL copy cause -> keep nil. Typed-nil or unsafe cause -> fixed opaque error with no classification. Safe cause -> scrubbed message.
 - Root URL copy -> one cause inspection. Unsafe first read -> fixed opaque cause.
 - Clean root whose Op, URL or cause field changes during inspection, or whose cause value is not comparable -> fixed message.
-- Unchanged root counts as one of 64 nodes: cause of 64 or more nodes -> fixed message, no cause text read.
+- Unchanged root spends one of 64 reads: cause of 64 or more values read (typed-nil children included) -> fixed message, no cause text read.
 - `APIError.Status` + `APIError.Body` on non-2xx. Literal key -> inline `REDACTED`.
 - Decode percent-only, backslash-only, and mixed projections.
 - Match literal, percent, and backslash-u spellings per key byte. Hex digits -> ASCII only.
@@ -33,7 +33,9 @@ API key passed as `apikey` query parameter.
   reflected visible values) -> key found -> opaque wrapper.
 - Reflection -> up to 1024 values per error node, start pointer only. Overflow or nested `fmt.Formatter` / `fmt.GoStringer` -> opaque wrapper.
 - Custom `fmt.Formatter`, `fmt.GoStringer`, or `As` method on error node -> opaque wrapper.
-- Wrapper with this client's key at any position (root, wrapped chain, exported field such as a URL error cause) -> kept without another wrapper.
+- Wrapper with this client's key -> retain the inner wrapper.
+- Key in outer error text, URL error fields or reflected values -> opaque wrapper for the outer error,
+  or sanitized copy for a root URL error with changed fields.
 - Wrapper with another captured key -> opaque boundary for classification and URL recovery.
 - Wrapper of another goenvoy client (RedactionBoundary method) -> opaque boundary: classification false; its Is, As, Timeout and Temporary not called.
 - Forwarded identity search visits up to 4096 nodes and 64 joined errors.

@@ -364,22 +364,22 @@ func TestCheckErrorTreeBound(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name string
-		err  error
-		want bool
+		name         string
+		err          error
+		want, unsafe bool
 	}{
 		{name: "no key within bound", err: quietChain(maxErrNodes, errors.New("plain")), want: false},
 		{name: "key at last node read", err: quietChain(maxErrNodes, errors.New("apikey=secret")), want: true},
-		{name: "one node past bound", err: quietChain(maxErrNodes+1, errors.New("plain")), want: true},
-		{name: "wide join past bound", err: errors.Join(plainLinks(4 * maxErrNodes)...), want: true},
+		{name: "one node past bound", err: quietChain(maxErrNodes+1, errors.New("plain")), want: true, unsafe: true},
+		{name: "wide join past bound", err: errors.Join(plainLinks(4 * maxErrNodes)...), want: true, unsafe: true},
 	}
 
 	c := &Client{apiKey: "secret"}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got, _ := c.checkErrorTree(tc.err); got != tc.want {
-				t.Errorf("c.checkErrorTree(chain) = %v, want %v", got, tc.want)
+			if carry, unsafe := c.checkErrorTree(tc.err); carry != tc.want || unsafe != tc.unsafe {
+				t.Errorf("checkErrorTree(chain) = (%t, %t); want (%t, %t)", carry, unsafe, tc.want, tc.unsafe)
 			}
 		})
 	}
@@ -416,8 +416,8 @@ func TestCheckErrorTree(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: tc.key}
-			if got, _ := c.checkErrorTree(tc.err); got != tc.want {
-				t.Errorf("c.checkErrorTree(%q) = %v, want %v", tc.err, got, tc.want)
+			if carry, unsafe := c.checkErrorTree(tc.err); carry != tc.want || unsafe {
+				t.Errorf("checkErrorTree(%q) = (%t, %t); want (%t, false)", tc.err, carry, unsafe, tc.want)
 			}
 		})
 	}
