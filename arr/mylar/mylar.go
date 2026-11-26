@@ -64,7 +64,8 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// APIError reports a non-2xx response. StatusCode holds the raw code and Error renders the scrubbed code.
+// APIError reports a non-2xx response. StatusCode is the raw HTTP status: Go-syntax formatting (%#v) and
+// reflection print it unscrubbed (encoding/json skips it); only Error renders the scrubbed code.
 type APIError struct {
 	StatusCode int    `json:"-"`
 	Status     string `json:"-"`

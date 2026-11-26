@@ -20,8 +20,8 @@
 // Retained projection storage → charge parent length, matching builder growth.
 // Error redaction scans up to 64 nodes for structural inspection and URL recovery.
 // Key in Error text, direct URL error fields, or reflected leaves → opaque wrapper.
-// After the check, one method-free re-read of recorded node fields (URL error Op and URL,
-// reflected visible values) → key found → opaque wrapper.
+// After the check finds nothing, a method-free re-read of recorded node fields (URL error Op and
+// URL, reflected visible values) runs until the first node with the key → key found → opaque wrapper.
 // Reflection checks up to 1024 values per node and follows only the start pointer.
 // Overflow or a nested fmt.Formatter or fmt.GoStringer → opaque wrapper.
 // Custom formatting or As on an error node → opaque wrapper.
@@ -54,9 +54,10 @@
 // Contract limits
 //
 //   - Raw percent sign or backslash directly before key spelled across two or more escape layers.
-//   - The check reads Unwrap results and checks Error text once per visited node, then re-reads
-//     every recorded node's fields without calling error methods. A method can print the key or
-//     write it into a recorded node's fields only on a later call, including after redaction returns.
+//   - The check reads Unwrap results and checks Error text once per visited node; when that finds
+//     nothing, it re-reads recorded node fields without calling error methods and stops at the
+//     first node with the key. A method can print the key or write it into a recorded node's fields
+//     only on a later call, including after redaction returns.
 //     The check cannot see that later text or write.
 //   - A method call during the check can replace a recorded node's cause after it was read,
 //     for example by assigning to the Err field of a *url.Error. The field re-read only checks
@@ -68,6 +69,9 @@
 //     own bounded walk (4096 pops, 65-read floor). The return value is a boolean and carries no key text.
 //   - Key that also occurs in key-independent text (REDACTED placeholder, fixed messages, Go-syntax
 //     type names, field names or pointer addresses) → that text stays because it carries no key-derived bytes.
+//   - APIError.StatusCode is the raw HTTP status. Go-syntax formatting (%#v) and reflection
+//     print it unscrubbed (encoding/json skips it); only Error renders the scrubbed code. A key that is
+//     only the digits of the status therefore stays visible there.
 //
 // # Usage
 //

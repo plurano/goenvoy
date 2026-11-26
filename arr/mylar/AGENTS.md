@@ -29,8 +29,8 @@ API key passed as `apikey` query parameter.
 - Retained projection storage -> charge parent length, matching builder growth.
 - Decode + request errors -> breadth-first walk, 64 nodes, single or joined `Unwrap`. Overflow or typed-nil node -> fixed message.
 - Key in `Error` text, direct `*url.Error` fields, or reflected leaves -> opaque wrapper, scrubbed message.
-- After check, one method-free re-read of every recorded node's fields (URL error `Op` and `URL`,
-  reflected visible values) -> key found -> opaque wrapper.
+- Check finds nothing -> method-free re-read of recorded node fields (URL error `Op` and `URL`,
+  reflected visible values) until first node with key -> key found -> opaque wrapper.
 - Reflection -> up to 1024 values per error node, start pointer only. Overflow or nested `fmt.Formatter` / `fmt.GoStringer` -> opaque wrapper.
 - Custom `fmt.Formatter`, `fmt.GoStringer`, or `As` method on error node -> opaque wrapper.
 - Wrapper with this client's key -> retain the inner wrapper.
@@ -56,7 +56,8 @@ API key passed as `apikey` query parameter.
 - Opaque `errors.As` -> copy first non-nil `*url.Error` within 64 breadth-first nodes, same cause handling as root.
 - Contract limits:
   - Raw percent sign or backslash directly before key spelled across two or more escape layers
-  - Check -> one `Unwrap` result and one `Error` text check per visited node, then method-free field re-read.
+  - Check -> one `Unwrap` result and one `Error` text check per visited node; nothing found ->
+    method-free field re-read, stops at first node with key.
     Print key or write key into recorded node field only on call after re-read (including after redaction returns) -> unseen.
   - Method call during check replaces recorded node cause after read (e.g., `*url.Error` `Err`) -> replacement unvisited.
     Re-read checks recorded fields only -> replacement unseen.
@@ -66,3 +67,5 @@ API key passed as `apikey` query parameter.
     wrapper's own bounded walk (4096 pops, 65-read floor). Boolean result only, no key text.
   - Key that also occurs in key-independent text (`REDACTED` placeholder, fixed messages, Go-syntax
     type names, field names or pointer addresses) -> that text stays because it carries no key-derived bytes.
+  - `APIError.StatusCode` raw HTTP status -> `%#v`, reflection print raw (`encoding/json` skips);
+    only `Error` scrubbed. Digit-only key equal to status -> visible there.
