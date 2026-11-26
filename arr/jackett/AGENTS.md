@@ -28,16 +28,17 @@ API key passed as `apikey` query parameter.
 - Reflection -> up to 1024 values per error node, start pointer only. Overflow or nested `fmt.Formatter` / `fmt.GoStringer` -> opaque wrapper.
 - Custom `fmt.Formatter`, `fmt.GoStringer`, or `As` method on error node -> opaque wrapper.
 - Wrapper with another captured key -> opaque boundary for classification and URL recovery.
-- Opaque identity and classification walks -> depth-first, 64 joined errors and 4096 nodes. Nested wrappers share `errors.Is` budget.
-- Stdlib classifier delegation (`*net.OpError`, `*os.SyscallError`, `*fs.PathError`, `*url.Error`) -> followed inside that walk.
+- Opaque identity walk -> depth-first, 4096 nodes and 64 joined errors. Nested wrappers share `errors.Is` budget.
+- Stdlib classifier delegation (`*net.OpError`, `*os.SyscallError`, `*fs.PathError`, `*url.Error`) -> followed during classification.
 - Classification skips custom `As` methods and continues into their `Unwrap` tree.
 - External `Timeout` or `Temporary` method -> false when its `Unwrap` tree (64 nodes)
   holds a package wrapper or is unsafe.
-- Wrapper and URL copy -> inspect the current tree within 64 nodes.
-- Classification entering a same-key wrapper -> inspect that wrapper's current tree within 64 nodes.
+- Classification reads each wrapper tree once within 64 nodes and classifies from that read.
+- A same-key wrapper entered during classification is read once the same way.
+- All reads of one classification share a budget of 4096 visited nodes.
 - Unsafe tree -> `Timeout` and `Temporary` false.
 - Package-owned URL causes end classification -> opaque cause false, classified cause captured values.
-- Safe immediate URL cause implements `Timeout` or `Temporary` -> one walk per classification.
+- Safe immediate URL cause implements `Timeout` or `Temporary` -> read its tree once and use it for both classifications.
 - Opaque `errors.As` -> copy first non-nil `*url.Error` within 64 breadth-first nodes, same cause handling as root.
 - Contract limits:
   - Raw percent sign or backslash directly before key spelled across two or more escape layers

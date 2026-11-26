@@ -39,13 +39,17 @@ func TestRedactErrorRootIdentity(t *testing.T) {
 // assertRootIdentity checks the identity, cause, and text of a redacted root URL error.
 func assertRootIdentity(t *testing.T, c *Client, uerr *url.Error, sentinel error, keep bool) {
 	t.Helper()
+	op, want := uerr.Op, uerr.Err
 	got := c.redactError(uerr)
 	if same := any(got) == any(uerr); same != keep {
 		t.Errorf("same error value = %v; want %v", same, keep)
 	}
 	// Why: a sanitized root stays a *url.Error copy, not a hidden wrapper, so callers keep Op, URL and Err.
-	if clean, ok := got.(*url.Error); !keep && (!ok || clean.Op != c.scrub(uerr.Op)) { //nolint:errorlint // root type wanted, not a tree search
-		t.Errorf("redacted root = %T; want a *url.Error copy with a scrubbed Op", got)
+	if clean, ok := got.(*url.Error); !keep { //nolint:errorlint // require the root type directly
+		if !ok || clean.Op != c.scrub(op) {
+			t.Fatalf("redacted root = %T; want a *url.Error copy with a scrubbed Op", got)
+		}
+		assertRedactedRootCause(t, clean, uerr, want)
 	}
 	if keep && !errors.Is(got, uerr) {
 		t.Error("errors.Is lost the original root URL error")
@@ -174,17 +178,22 @@ func TestRedactedErrorTemporary(t *testing.T) {
 }
 
 // assertTemporaryRedacted checks the wrapper type and Temporary result from scrubError or redactError.
-func assertTemporaryRedacted(t *testing.T, c *Client, cause error, root, want bool) {
+func assertTemporaryRedacted(t *testing.T, c *Client, cause error, root, wantTemporary bool) {
 	t.Helper()
 	if root {
+		original, isURL := cause.(*url.Error) //nolint:errorlint // inspect the fixture root, not its error tree
+		if !isURL {
+			t.Fatalf("root fixture has type %T; want *url.Error", cause)
+		}
+		want := original.Err
 		got := c.redactError(cause)
 		uerr, ok := got.(*url.Error) //nolint:errorlint // root type assertion wanted, not a tree search
 		if !ok {
 			t.Fatalf("redactError(%T) = %T; want *url.Error", cause, got)
 		}
-		assertRedactedRootCause(t, uerr, cause)
-		if gotTemp := uerr.Temporary(); gotTemp != want {
-			t.Errorf("Temporary() = %v; want %v", gotTemp, want)
+		assertRedactedRootCause(t, uerr, original, want)
+		if gotTemp := uerr.Temporary(); gotTemp != wantTemporary {
+			t.Errorf("Temporary() = %v; want %v", gotTemp, wantTemporary)
 		}
 		return
 	}
@@ -193,26 +202,25 @@ func assertTemporaryRedacted(t *testing.T, c *Client, cause error, root, want bo
 	if !ok {
 		t.Fatalf("scrubError(%T) = %T; want *redactedError", cause, got)
 	}
-	if gotTemp := hidden.Temporary(); gotTemp != want {
-		t.Errorf("Temporary() = %v; want %v", gotTemp, want)
+	if gotTemp := hidden.Temporary(); gotTemp != wantTemporary {
+		t.Errorf("Temporary() = %v; want %v", gotTemp, wantTemporary)
 	}
 }
 
 // assertRedactedRootCause checks that the copied root wraps its original cause.
-func assertRedactedRootCause(t *testing.T, got *url.Error, cause error) {
+func assertRedactedRootCause(t *testing.T, got, original *url.Error, want error) {
 	t.Helper()
-	original, ok := cause.(*url.Error) //nolint:errorlint // inspect the fixture root, not its error tree
-	if !ok {
-		t.Fatalf("root fixture has type %T; want *url.Error", cause)
-	}
 	if got == original {
 		t.Fatal("redactError returned the original *url.Error")
+	}
+	if original.Err != want { //nolint:errorlint // require the original cause instance
+		t.Error("redactError changed the original URL error's cause")
 	}
 	hidden := hiddenRedaction(got.Err)
 	if hidden == nil {
 		t.Fatalf("redacted root cause has type %T; want a package redaction wrapper", got.Err)
 	}
-	if hidden.err != original.Err { //nolint:errorlint // require the same cause instance
+	if hidden.err != want { //nolint:errorlint // require the original cause instance
 		t.Error("redacted root wrapper does not retain the original cause")
 	}
 }

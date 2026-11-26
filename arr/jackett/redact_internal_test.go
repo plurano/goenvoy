@@ -222,17 +222,19 @@ func checkRedactErrorRootURL(t *testing.T, key string) {
 	t.Helper()
 
 	rawURL := "http://h/?apikey=" + url.QueryEscape(key)
+	const op = "Get"
 	inner := errors.New("x")
-	uerr := &url.Error{Op: "Get", URL: rawURL, Err: inner}
+	uerr := &url.Error{Op: op, URL: rawURL, Err: inner}
 	got := (&Client{apiKey: key}).redactError(uerr)
 	var clean *url.Error
 	if !errors.As(got, &clean) || any(got) != any(clean) {
 		t.Fatalf("redactError = %T, want *url.Error", got)
 	}
-	if clean == uerr || uerr.URL != rawURL {
+	if clean == uerr || uerr.URL != rawURL || uerr.Op != op {
 		t.Error("redactError did not preserve the original URL error")
 	}
-	if clean.URL != "http://h/?apikey=REDACTED" || clean.Op != uerr.Op || !errors.Is(got, inner) {
+	assertRedactedRootCause(t, clean, uerr, inner)
+	if clean.URL != "http://h/?apikey=REDACTED" || clean.Op != op || !errors.Is(got, inner) {
 		t.Errorf("redactError = %#v, want sanitized URL with original operation and underlying error", clean)
 	}
 	checkRedactedKeyForms(t, got.Error(), key)

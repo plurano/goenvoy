@@ -17,18 +17,19 @@
 // Overflow or a nested fmt.Formatter or fmt.GoStringer → opaque wrapper.
 // Custom formatting or As on an error node → opaque wrapper.
 // Wrapper with another captured key → opaque boundary for classification and URL recovery.
-// Forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
-// Stdlib classifier delegation (*net.OpError, *os.SyscallError, *fs.PathError, *url.Error) → followed inside that walk.
+// Forwarded identity search visits up to 4096 nodes and 64 joined errors.
+// Stdlib classifier delegation (*net.OpError, *os.SyscallError, *fs.PathError, *url.Error) → followed during classification.
 // Classification skips custom As methods and continues into their Unwrap tree.
 // External Timeout or Temporary method → false when its Unwrap tree (64 nodes)
 // holds a package wrapper or is unsafe.
-// Wrapper and URL copy → inspect the current tree within 64 nodes.
-// Classification entering a same-key wrapper → inspect that wrapper's current tree within 64 nodes.
+// Classification reads each wrapper tree once within 64 nodes and classifies from that read.
+// A same-key wrapper entered during classification is read once the same way.
+// All reads of one classification share a budget of 4096 visited nodes.
 // Unsafe tree → Timeout and Temporary false.
 // Package-owned URL causes end classification → opaque cause false, classified cause captured values.
 // Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.
 // URL copies keep nil causes. Typed-nil or unsafe causes become fixed opaque errors without classification.
-// Safe immediate cause implements Timeout or Temporary → one walk per classification.
+// Safe immediate cause implements Timeout or Temporary → read its tree once and use it for both classifications.
 //
 // Contract limits
 //

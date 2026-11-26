@@ -298,39 +298,98 @@ type (
 	hiddenTemporaryClassifier = interface{ Temporary() bool }
 )
 
-// classifyHiddenError reports the first applicable classification within the walk budget for a safe tree.
+// classifyHiddenError snapshots the hidden tree once and reports its first applicable bounded classification.
 func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	if e.unsafe {
 		return false
 	}
-	if _, unsafe := inspectErrorTree(e.err); unsafe {
+	tree, unsafe := inspectErrorTree(e.err)
+	if unsafe {
 		return false
 	}
-	return classifyWalk(e, classify)
+	return classifyTree(tree, e.key, classify)
 }
 
-// classifyWalk reports the first applicable classification in a bounded walk.
-func classifyWalk[T any](e *redactedError, classify func(T) bool) bool {
-	reported := false
-	e.walk(nil, func(node error) walkAction {
-		var action walkAction
-		action, reported = classifyNode(node, e.key, classify)
-		return action
-	})
-	return reported
+type errorTree struct {
+	nodes []error
+	ends  []int
+}
+
+type errorSpan struct {
+	tree       *errorTree
+	start, end int
+}
+
+type errorSlot struct {
+	tree  *errorTree
+	index int
+}
+
+// children returns the range recorded when this slot was inspected.
+func (slot errorSlot) children() errorSpan {
+	start := 1
+	if slot.index > 0 {
+		start = slot.tree.ends[slot.index-1]
+	}
+	return errorSpan{tree: slot.tree, start: start, end: slot.tree.ends[slot.index]}
+}
+
+// classifyTree reports the first applicable classification in depth-first errors.Is order.
+func classifyTree[T any](tree errorTree, key string, classify func(T) bool) bool {
+	if len(tree.nodes) == 0 {
+		return false
+	}
+	// Why: classify the tree that passed inspection.
+	stack := []errorSpan{{tree: &tree, end: 1}}
+	for steps := 0; steps < maxWalkSteps && len(stack) > 0; steps++ {
+		var slot errorSlot
+		stack, slot = popErrorSlot(stack)
+		action, reported := classifyNode(slot, key, classify)
+		if action == walkStop {
+			return reported
+		}
+		if action == walkCauseOnly {
+			stack = stack[:0]
+		}
+		children, unsafe := classificationChildren(slot)
+		if unsafe {
+			return false
+		}
+		if children.start < children.end {
+			stack = append(stack, children)
+		}
+	}
+	return false
+}
+
+// popErrorSlot advances the top span and returns its first slot.
+func popErrorSlot(stack []errorSpan) ([]errorSpan, errorSlot) {
+	last := &stack[len(stack)-1]
+	slot := errorSlot{tree: last.tree, index: last.start}
+	last.start++
+	if last.start == last.end {
+		return stack[:len(stack)-1], slot
+	}
+	return stack, slot
+}
+
+// classificationChildren enters a same-key redacted wrapper or returns the slot's recorded children.
+func classificationChildren(slot errorSlot) (errorSpan, bool) {
+	if wrapper, ok := slot.tree.nodes[slot.index].(*redactedError); ok { //nolint:errorlint // enter only the current package wrapper
+		tree, unsafe := inspectErrorTree(wrapper.err)
+		return errorSpan{tree: &tree, end: min(1, len(tree.nodes))}, unsafe
+	}
+	return slot.children(), false
 }
 
 // classifyNode returns the traversal action and classification for a single node.
-func classifyNode[T any](node error, key string, classify func(T) bool) (walkAction, bool) {
+func classifyNode[T any](slot errorSlot, key string, classify func(T) bool) (walkAction, bool) {
+	node := slot.tree.nodes[slot.index]
 	if blocksHiddenClassification(node, key) {
 		return walkStop, false
 	}
-	switch wrapper := node.(type) { //nolint:errorlint // classify only the current node
+	switch node.(type) { //nolint:errorlint // classify only the current node
 	case *redactedError:
-		// Why: the hidden tree can change after the wrapper was constructed.
-		if _, unsafe := inspectErrorTree(wrapper.err); unsafe {
-			return walkStop, false
-		}
 		return walkDescend, false
 	case *opaqueURLCause:
 		return walkStop, false
@@ -338,21 +397,23 @@ func classifyNode[T any](node error, key string, classify func(T) bool) (walkAct
 		classifier, ok := node.(T)
 		return walkStop, ok && classify(classifier)
 	}
-	if classifier, ok := node.(T); ok && isStdlibClassifier(node) {
-		return classifyStdlibNode(node, classifier, classify)
+	if _, ok := node.(T); ok && isStdlibClassifier(node) {
+		return classifyStdlibNode(slot, classify)
 	}
-	return classifyExternalNode(node, classify)
+	return classifyExternalNode(slot, classify)
 }
 
 // classifyStdlibNode returns the action for a known stdlib classifier's effective delegate.
-func classifyStdlibNode[T any](node error, classifier T, classify func(T) bool) (walkAction, bool) {
-	delegate := classifierDelegate(node)
-	if isNilError(delegate) {
+func classifyStdlibNode[T any](slot errorSlot, classify func(T) bool) (walkAction, bool) {
+	children := slot.children()
+	if children.start == children.end {
 		return walkStop, false
 	}
-	if _, errno := delegate.(syscall.Errno); errno { //nolint:errorlint // match the direct delegate used by the stdlib classifier
-		// Why: Errno is a leaf, so the stdlib method safely preserves OpError's platform-specific accept rule.
-		return walkStop, classify(classifier)
+	node := slot.tree.nodes[slot.index]
+	child := errorSlot{tree: slot.tree, index: children.start}
+	delegate := classifierDelegate(node, child)
+	if errno, ok := delegate.(syscall.Errno); ok { //nolint:errorlint // match the effective delegate used by the stdlib classifier
+		return walkStop, classifyErrno(node, errno, slot.tree.nodes[child.index], classify)
 	}
 	if _, classifies := delegate.(T); classifies {
 		return walkCauseOnly, false
@@ -360,25 +421,48 @@ func classifyStdlibNode[T any](node error, classifier T, classify func(T) bool) 
 	return walkStop, false
 }
 
+// classifyErrno classifies an observed Errno and preserves OpError's platform-specific accept rule.
+func classifyErrno[T any](node error, errno syscall.Errno, child error, classify func(T) bool) bool {
+	var leaf error = errno
+	if op, ok := node.(*net.OpError); ok { //nolint:errorlint // preserve only the current OpError's accept behavior
+		if _, syscallChild := child.(*os.SyscallError); syscallChild { //nolint:errorlint // preserve the observed delegate shape
+			leaf = &os.SyscallError{Err: errno}
+		}
+		leaf = &net.OpError{Op: op.Op, Err: leaf}
+	}
+	classifier, ok := leaf.(T)
+	return ok && classify(classifier)
+}
+
 // classifyExternalNode checks the classification method of an external node.
-func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction, bool) {
-	classifier, ok := node.(T)
+func classifyExternalNode[T any](slot errorSlot, classify func(T) bool) (walkAction, bool) {
+	classifier, ok := slot.tree.nodes[slot.index].(T)
 	if !ok {
 		// Why: an As hook runs code outside the walked tree.
 		return walkDescend, false
 	}
-	if reachesPackageWrapper(node) {
+	if slot.hasPackageWrapper() {
 		return walkStop, false
 	}
 	return walkStop, classify(classifier)
 }
 
-// reachesPackageWrapper reports whether the bounded Unwrap tree contains a package wrapper or is unsafe.
-func reachesPackageWrapper(err error) bool {
-	queue, unsafe := inspectErrorTree(err)
-	return unsafe || slices.ContainsFunc(queue, func(node error) bool {
-		return hiddenRedaction(node) != nil
-	})
+// hasPackageWrapper reports whether the slot's recorded subtree contains a package wrapper.
+func (slot errorSlot) hasPackageWrapper() bool {
+	queue := [maxErrNodes]int{slot.index}
+	count := 1
+	for i := 0; i < maxErrNodes && i < count; i++ {
+		current := errorSlot{tree: slot.tree, index: queue[i]}
+		if hiddenRedaction(slot.tree.nodes[current.index]) != nil {
+			return true
+		}
+		children := current.children()
+		for index := children.start; index < children.end; index++ {
+			queue[count] = index
+			count++
+		}
+	}
+	return false
 }
 
 // isStdlibClassifier reports whether node has a classifier that delegates to an underlying error.
@@ -391,24 +475,20 @@ func isStdlibClassifier(node error) bool {
 	}
 }
 
-// classifierDelegate returns the error inspected by a known stdlib classifier.
-func classifierDelegate(node error) error {
-	switch wrapper := node.(type) { //nolint:errorlint // inspect only the current stdlib wrapper
-	case *net.OpError:
+// classifierDelegate returns the recorded error used by a known stdlib classifier.
+func classifierDelegate(node error, child errorSlot) error {
+	delegate := child.tree.nodes[child.index]
+	if _, op := node.(*net.OpError); op { //nolint:errorlint // match only the current stdlib wrapper
 		// Why: both OpError classifiers inspect the error inside a SyscallError directly.
-		if syscallError, ok := wrapper.Err.(*os.SyscallError); ok && syscallError != nil { //nolint:errorlint // match the direct wrapper tested by net.OpError
-			return syscallError.Err
+		if _, syscallChild := delegate.(*os.SyscallError); syscallChild { //nolint:errorlint // match the observed direct wrapper
+			children := child.children()
+			if children.start == children.end {
+				return nil
+			}
+			return child.tree.nodes[children.start]
 		}
-		return wrapper.Err
-	case *os.SyscallError:
-		return wrapper.Err
-	case *fs.PathError:
-		return wrapper.Err
-	case *url.Error:
-		return wrapper.Err
-	default:
-		return nil
 	}
+	return delegate
 }
 
 // blocksHiddenClassification reports whether a package wrapper is unsafe or belongs to another key.
@@ -445,12 +525,8 @@ func (e *redactedError) walk(target error, visit func(error) walkAction) bool {
 			}
 			joins++
 		}
-		switch visitWalkNode(node, target, visit) {
-		case walkStop:
+		if visitWalkNode(node, target, visit) == walkStop {
 			return true
-		case walkCauseOnly:
-			stack = stack[:0]
-		case walkDescend:
 		}
 		stack = appendWalkChildren(stack, node, joined, maxWalkSteps-steps-1)
 	}
@@ -540,8 +616,8 @@ func isNilError(err error) bool {
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
 // It suppresses classification if the current tree is unsafe, preserves nil causes, and replaces unsafe causes with a fixed error.
-// If the tree is safe and the immediate cause implements Timeout or Temporary, the copy uses one walk per classifier.
-// Each walk visits up to 4096 nodes and 64 joined errors.
+// For a safe immediate cause implementing Timeout or Temporary, the copy reads its tree once and classifies from that read.
+// Each classification visits up to 4096 nodes across the cause and any same-key wrapper trees it enters.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
 	if !ok {
@@ -604,14 +680,26 @@ func (e *classifiedURLCause) Timeout() bool { return e.timeout }
 // Temporary reports whether the cause was temporary when copied.
 func (e *classifiedURLCause) Temporary() bool { return e.temporary }
 
-// newClassifiedURLCause captures a structurally inspected cause with one URL-aware walk per classifier.
-func newClassifiedURLCause(cause opaqueURLCause) *classifiedURLCause {
-	probe := &redactedError{err: &url.Error{Err: cause.hidden.err}, key: cause.hidden.key}
+// newClassifiedURLCause captures each classifier's result from the same inspected cause and a synthetic URL root.
+func newClassifiedURLCause(cause opaqueURLCause, tree errorTree) *classifiedURLCause {
+	tree = tree.withURLRoot()
 	return &classifiedURLCause{
 		opaqueURLCause: cause,
-		timeout:        classifyWalk(probe, hiddenTimeoutClassifier.Timeout),
-		temporary:      classifyWalk(probe, hiddenTemporaryClassifier.Temporary),
+		timeout:        classifyTree(tree, cause.hidden.key, hiddenTimeoutClassifier.Timeout),
+		temporary:      classifyTree(tree, cause.hidden.key, hiddenTemporaryClassifier.Temporary),
 	}
+}
+
+// withURLRoot adds a synthetic URL slot outside the cause's 64-node inspection limit.
+func (tree errorTree) withURLRoot() errorTree {
+	nodes := make([]error, 1, len(tree.nodes)+1)
+	nodes[0] = &url.Error{Err: tree.nodes[0]}
+	ends := make([]int, len(tree.ends)+1)
+	ends[0] = 2
+	for index, end := range tree.ends {
+		ends[index+1] = end + 1
+	}
+	return errorTree{nodes: append(nodes, tree.nodes...), ends: ends}
 }
 
 // hiddenRedaction returns the package-owned wrapper behind node, if any.
@@ -631,7 +719,7 @@ func hiddenRedaction(node error) *redactedError {
 // maxErrNodes bounds the error tree walk in carriesKey and the joined-error budget in walk.
 const maxErrNodes = 64
 
-// maxWalkSteps bounds the total nodes visited by walk so cyclic unwrap chains terminate.
+// maxWalkSteps bounds the total nodes visited by identity search or classification.
 const maxWalkSteps = 4096
 
 // redactedTreeMsg is the replacement message when an error tree exceeds maxErrNodes.
@@ -656,12 +744,12 @@ func (c *Client) hideCause(err error) error {
 	return c.hideURLCause(err, false)
 }
 
-// hideURLCause sanitizes the cause and suppresses classification for unsafe trees.
+// hideURLCause sanitizes the cause and uses its single inspection for both classifications when safe.
 func (c *Client) hideURLCause(err error, unsafeParent bool) error {
 	if err == nil {
 		return nil
 	}
-	_, unsafe := inspectErrorTree(err)
+	tree, unsafe := inspectErrorTree(err)
 	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey, unsafe: unsafe || unsafeParent}
 	cause := opaqueURLCause{hidden: hidden}
 	if unsafe {
@@ -675,7 +763,7 @@ func (c *Client) hideURLCause(err error, unsafeParent bool) error {
 	_, timesOut := err.(hiddenTimeoutClassifier)
 	_, temporary := err.(hiddenTemporaryClassifier)
 	if timesOut || temporary {
-		return newClassifiedURLCause(cause)
+		return newClassifiedURLCause(cause, tree)
 	}
 	return &cause
 }
@@ -688,14 +776,14 @@ func (c *Client) carriesKey(err error) bool {
 
 // checkErrorTree reports whether err needs redaction and whether its Error method is unsafe to call.
 func (c *Client) checkErrorTree(err error) (bool, bool) {
-	queue, unsafe := inspectErrorTree(err)
+	tree, unsafe := inspectErrorTree(err)
 	if unsafe {
 		return true, true
 	}
-	if slices.ContainsFunc(queue, c.hasCustomFormattingOrAs) {
+	if slices.ContainsFunc(tree.nodes, c.hasCustomFormattingOrAs) {
 		return true, false
 	}
-	for _, node := range queue {
+	for _, node := range tree.nodes {
 		if c.errorNodeNeedsRedaction(node) {
 			return true, false
 		}
@@ -703,21 +791,22 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 	return false, false
 }
 
-// inspectErrorTree collects nodes in breadth-first order without calling Error or classifiers.
-func inspectErrorTree(err error) ([]error, bool) {
+// inspectErrorTree records each node's children in one bounded breadth-first read without calling Error or classifiers.
+func inspectErrorTree(err error) (errorTree, bool) {
 	if err == nil {
-		return nil, false
+		return errorTree{}, false
 	}
-	queue := []error{err}
-	for i := 0; i < maxErrNodes && i < len(queue); i++ {
+	tree := errorTree{nodes: []error{err}}
+	for i := 0; i < maxErrNodes && i < len(tree.nodes); i++ {
 		var unsafe bool
-		queue, unsafe = appendWrappedChildren(queue, queue[i])
+		tree.nodes, unsafe = appendWrappedChildren(tree.nodes, tree.nodes[i])
 		if unsafe {
 			// Why: formatting an oversized tree or a typed-nil node can be unsafe.
-			return nil, true
+			return errorTree{}, true
 		}
+		tree.ends = append(tree.ends, len(tree.nodes))
 	}
-	return queue, false
+	return tree, false
 }
 
 // hasCustomFormattingOrAs reports whether a node outside the current key's wrappers controls formatting or errors.As.

@@ -158,10 +158,17 @@ func TestScrubBoundaries(t *testing.T) {
 	}
 	c := &Client{apiKey: "placeholder"}
 	original := &url.Error{URL: "?apikey=placeholder", Err: errors.New("placeholder")}
-	assertRedacted(t, c.redactError(original), "placeholder", true)
-	if original.URL != "?apikey=placeholder" || original.Err.Error() != "placeholder" {
+	want := original.Err
+	result := c.redactError(original)
+	assertRedacted(t, result, "placeholder", true)
+	if original.URL != "?apikey=placeholder" {
 		t.Error("mutated original URL error")
 	}
+	var copied *url.Error
+	if !errors.As(result, &copied) || copied == nil {
+		t.Fatal("expected a sanitized URL error copy")
+	}
+	assertRedactedRootCause(t, copied, original, want)
 	for _, width := range []int{maxErrNodes - 1, maxErrNodes, maxErrNodes + 1} {
 		children := make([]error, width)
 		for i := range children {

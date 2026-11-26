@@ -767,32 +767,41 @@ func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
-			original := &url.Error{Op: "Get", URL: "http://fixture.invalid/" + key, Err: tc.cause}
+			fixture := url.Error{Op: "Get", URL: "http://fixture.invalid/" + key, Err: tc.cause}
 			subtest.Run("As", func(view *testing.T) {
 				view.Parallel()
-				assertURLCopyClassifies(view, c.scrubError(errors.Join(original)), original, sentinel, key, tc.wantTimeout, tc.wantTemporary)
+				original := fixture
+				want := original.Err
+				got := c.scrubError(errors.Join(&original))
+				assertURLCopyClassifies(view, got, &original, want, sentinel, key, tc.wantTimeout, tc.wantTemporary)
 			})
 			subtest.Run("redactError", func(view *testing.T) {
 				view.Parallel()
-				assertURLCopyClassifies(view, c.redactError(original), original, sentinel, key, tc.wantTimeout, tc.wantTemporary)
+				original := fixture
+				want := original.Err
+				got := c.redactError(&original)
+				assertURLCopyClassifies(view, got, &original, want, sentinel, key, tc.wantTimeout, tc.wantTemporary)
 			})
 		})
 	}
 }
 
 // assertURLCopyClassifies checks classification and sentinel identity through a sanitized copy.
-func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, sentinel error, key string, wantTimeout, wantTemporary bool) {
+func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, want, sentinel error, key string, wantTimeout, wantTemporary bool) {
 	t.Helper()
 	var copyErr *url.Error
 	if !errors.As(got, &copyErr) || copyErr == nil || copyErr == original {
 		t.Fatalf("expected a sanitized URL error copy, got %T", got)
 	}
-	if original.Err == nil {
-		if copyErr.Err != nil {
+	if want == nil {
+		if original.Err != nil || copyErr.Err != nil {
 			t.Error("copy changed a nil cause")
 		}
-	} else if !errors.Is(copyErr, sentinel) {
-		t.Error("errors.Is through the copy did not reach the sentinel")
+	} else {
+		assertRedactedRootCause(t, copyErr, original, want)
+		if !errors.Is(copyErr, sentinel) {
+			t.Error("errors.Is through the copy did not reach the sentinel")
+		}
 	}
 	fallback := &net.DNSError{IsTimeout: true, IsTemporary: true}
 	nested := &redactedError{err: errors.Join(copyErr, fallback), key: key}
@@ -863,9 +872,10 @@ func TestRedactedErrorAsURLError(t *testing.T) {
 // checkRedactedErrorAs redacts a tree that nests a key-bearing URL error and checks what errors.As reaches.
 func checkRedactedErrorAs(t *testing.T, key string) {
 	t.Helper()
+	const op = "Get"
 	c := &Client{apiKey: key}
 	inner := &url.Error{
-		Op:  "Get",
+		Op:  op,
 		URL: "http://h/?apikey=" + url.QueryEscape(key),
 		Err: fmt.Errorf("dial %s %q", key, key),
 	}
@@ -885,8 +895,8 @@ func checkRedactedErrorAs(t *testing.T, key string) {
 	if uerr == inner {
 		t.Error("errors.As returned the original URL error, not a copy")
 	}
-	if uerr.Op != inner.Op {
-		t.Errorf("Op = %q; want %q", uerr.Op, inner.Op)
+	if uerr.Op != op {
+		t.Errorf("Op = %q; want %q", uerr.Op, op)
 	}
 	assertNoKeyForms(t, uerr.Error(), key)
 	assertNoKeyForms(t, uerr.URL, key)
@@ -1955,6 +1965,133 @@ type redactChangingJoin struct {
 	after   []error
 }
 
+type redactObservedJoin struct {
+	first, later []error
+	firstReads   int32
+	calls        atomic.Int32
+}
+
+// Error returns a fixed fixture message.
+func (*redactObservedJoin) Error() string { return "fixture observed join" }
+
+// Unwrap returns the first children for the configured number of reads.
+func (e *redactObservedJoin) Unwrap() []error {
+	if e.calls.Add(1) <= e.firstReads {
+		return e.first
+	}
+	return e.later
+}
+
+// TestRedactedErrorClassifiesObservedTree checks both classifications and the number of unwraps.
+func TestRedactedErrorClassifiesObservedTree(t *testing.T) {
+	t.Parallel()
+	leaf := &net.DNSError{IsTimeout: true, IsTemporary: true}
+	for _, tc := range [...]struct {
+		name         string
+		first, later []error
+		nested, want bool
+	}{
+		{"stable", []error{leaf}, []error{leaf}, false, true},
+		{"later typed nil", []error{leaf}, []error{leaf, (*net.DNSError)(nil)}, false, true},
+		{"later false leaf", []error{leaf}, []error{&net.DNSError{}}, false, true},
+		{"first typed nil", []error{(*net.DNSError)(nil), leaf}, []error{leaf}, false, false},
+		{"nested same-key wrapper", []error{leaf}, []error{&net.DNSError{}}, true, true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			assertSingleTreeRead(subtest, tc.want, func() (*atomic.Int32, error) {
+				join := &redactObservedJoin{first: tc.first, later: tc.later, firstReads: 1}
+				var tree error = join
+				if tc.nested {
+					tree = &redactedError{key: "maple", err: tree}
+				}
+				return &join.calls, tree
+			})
+		})
+	}
+}
+
+// assertSingleTreeRead asks each classifier on a fresh tree and checks its unwrap count.
+func assertSingleTreeRead(t *testing.T, want bool, fixture func() (*atomic.Int32, error)) {
+	t.Helper()
+	for _, check := range [...]struct {
+		name     string
+		classify func(*redactedError) bool
+	}{
+		{"Timeout", (*redactedError).Timeout},
+		{"Temporary", (*redactedError).Temporary},
+	} {
+		calls, tree := fixture()
+		if got := check.classify(&redactedError{key: "maple", err: tree}); got != want {
+			t.Errorf("%s() = %t; want %t", check.name, got, want)
+		}
+		if count := calls.Load(); count != 1 {
+			t.Errorf("%s read Unwrap %d times; want 1", check.name, count)
+		}
+	}
+}
+
+type redactObservedURLJoin struct{ *redactObservedJoin }
+
+// Timeout reports the classification associated with the observed children.
+func (e *redactObservedURLJoin) Timeout() bool { return e.calls.Load() <= e.firstReads }
+
+// Temporary reports the classification associated with the observed children.
+func (e *redactObservedURLJoin) Temporary() bool { return e.calls.Load() <= e.firstReads }
+
+// TestURLCopyClassifiesObservedCause checks that both captured classifications use the cause inspection.
+func TestURLCopyClassifiesObservedCause(t *testing.T) {
+	t.Parallel()
+	first := &net.DNSError{IsTimeout: true, IsTemporary: true}
+	later := &net.DNSError{}
+	join := &redactObservedURLJoin{&redactObservedJoin{first: []error{first}, later: []error{later}, firstReads: 2}}
+	hidden := &redactedError{key: "maple", err: &url.Error{Err: join}}
+	var copied *url.Error
+	if !errors.As(hidden, &copied) || copied == nil {
+		t.Fatal("expected a sanitized URL error copy")
+	}
+	reads := join.calls.Load()
+	if reads != 2 {
+		t.Errorf("errors.As read Unwrap %d times; want 2", reads)
+	}
+	assertClassifierValues(t, "copy", copied, true, true)
+	if count := join.calls.Load(); count != reads {
+		t.Errorf("copied classifiers read Unwrap %d times; want 0", count-reads)
+	}
+}
+
+type redactObservedExternalClassifier struct {
+	calls atomic.Int32
+	cause error
+}
+
+// Error returns a fixed fixture message.
+func (*redactObservedExternalClassifier) Error() string { return "fixture external classifier" }
+
+// Unwrap returns the package wrapper on the first read.
+func (e *redactObservedExternalClassifier) Unwrap() error {
+	if e.calls.Add(1) == 1 {
+		return e.cause
+	}
+	return nil
+}
+
+// Timeout reports a timeout.
+func (*redactObservedExternalClassifier) Timeout() bool { return true }
+
+// Temporary reports a temporary error.
+func (*redactObservedExternalClassifier) Temporary() bool { return true }
+
+// TestExternalClassifierUsesObservedSubtree checks that a recorded wrapper blocks both classifiers.
+func TestExternalClassifierUsesObservedSubtree(t *testing.T) {
+	t.Parallel()
+	assertSingleTreeRead(t, false, func() (*atomic.Int32, error) {
+		wrapper := &redactedError{key: "maple", err: &net.DNSError{IsTimeout: true, IsTemporary: true}}
+		node := &redactObservedExternalClassifier{cause: wrapper}
+		return &node.calls, node
+	})
+}
+
 // Error returns the fixture join message.
 func (*redactChangingJoin) Error() string { return "fixture changing join" }
 
@@ -2201,6 +2338,33 @@ func (e *redactTLSPermanentError) Timeout() bool { return e.err.Timeout() }
 // Temporary reports false for a permanent error.
 func (*redactTLSPermanentError) Temporary() bool { return false }
 
+type redactForwardingDelegate struct {
+	err interface {
+		error
+		Timeout() bool
+		Temporary() bool
+	}
+	timeoutCalls, temporaryCalls int
+}
+
+// Error returns the delegated message.
+func (e *redactForwardingDelegate) Error() string { return e.err.Error() }
+
+// Unwrap returns the delegated error.
+func (e *redactForwardingDelegate) Unwrap() error { return e.err }
+
+// Timeout counts the call and returns the delegated classification.
+func (e *redactForwardingDelegate) Timeout() bool {
+	e.timeoutCalls++
+	return e.err.Timeout()
+}
+
+// Temporary counts the call and returns the delegated classification.
+func (e *redactForwardingDelegate) Temporary() bool {
+	e.temporaryCalls++
+	return e.err.Temporary()
+}
+
 type redactTLSWriteFailure struct {
 	net.Conn
 	err error
@@ -2292,6 +2456,30 @@ func TestForeignRedactionBehindDelegatingClassifier(t *testing.T) {
 				if !errors.Is(got, tc.cause) {
 					subtest.Error("errors.Is did not preserve hidden identity")
 				}
+			}
+		})
+	}
+	assertForwardingDelegateBoundaries(t)
+}
+
+// assertForwardingDelegateBoundaries checks both external classifiers at each package wrapper boundary.
+func assertForwardingDelegateBoundaries(t *testing.T) {
+	t.Helper()
+	for _, tc := range [...]struct{ name, key string }{
+		{"foreign forwarding delegate", "cedar"},
+		{"same-key forwarding delegate", "maple"},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			leaf := &net.DNSError{IsTimeout: true, IsTemporary: true}
+			delegate := &redactForwardingDelegate{err: &redactedError{key: tc.key, err: leaf}}
+			hidden := &redactedError{key: "maple", err: delegate}
+			assertErrorClassifications(subtest, hidden, false, false)
+			if delegate.timeoutCalls != 0 {
+				subtest.Errorf("called delegated Timeout %d times; want 0", delegate.timeoutCalls)
+			}
+			if delegate.temporaryCalls != 0 {
+				subtest.Errorf("called delegated Temporary %d times; want 0", delegate.temporaryCalls)
 			}
 		})
 	}
@@ -2450,28 +2638,37 @@ func stdlibErrorClassifications(err error) (bool, bool) {
 	return errors.As(err, &timeout) && timeout.Timeout(), errors.As(err, &temporary) && temporary.Temporary()
 }
 
-// TestRedactedErrorStdlibDelegateBudget checks classifier chains at and beyond the structural limit.
+// TestRedactedErrorStdlibDelegateBudget checks classifier chains at and beyond both limits.
 func TestRedactedErrorStdlibDelegateBudget(t *testing.T) {
 	t.Parallel()
 	for _, tc := range [...]struct {
 		name  string
 		depth int
+		wrap  func(error) error
 		want  bool
 	}{
-		{"at structural limit", maxErrNodes - 1, true},
-		{"over structural limit", maxErrNodes, false},
-		{"over walk budget", maxWalkSteps + 1, false},
+		{"at structural limit", maxErrNodes - 1, wrapWithOpError, true},
+		{"over structural limit", maxErrNodes, wrapWithOpError, false},
+		// Why: depth wrappers followed by one leaf place the leaf at visit depth + 1.
+		{"at walk budget", maxWalkSteps - 1, wrapWithSameKey, true},
+		{"over walk budget", maxWalkSteps, wrapWithSameKey, false},
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
-			var cause error = &net.DNSError{IsTimeout: true}
+			var cause error = &net.DNSError{IsTimeout: true, IsTemporary: true}
 			for range tc.depth {
-				cause = &net.OpError{Op: "read", Err: cause}
+				cause = tc.wrap(cause)
 			}
 			assertBoundedClassifications(subtest, &redactedError{key: "maple", err: cause}, tc.want, tc.want)
 		})
 	}
 }
+
+// wrapWithOpError adds a stdlib delegate to the fixture tree.
+func wrapWithOpError(err error) error { return &net.OpError{Op: "read", Err: err} }
+
+// wrapWithSameKey adds a same-key wrapper to the fixture tree.
+func wrapWithSameKey(err error) error { return &redactedError{key: "maple", err: err} }
 
 // TestClassifyStdlibNilDelegates checks that absent delegates stop before scheduling children.
 func TestClassifyStdlibNilDelegates(t *testing.T) {
@@ -2487,10 +2684,11 @@ func TestClassifyStdlibNilDelegates(t *testing.T) {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
 			node := &net.OpError{Op: "read", Err: tc.cause}
-			if action, got := classifyNode(node, "maple", hiddenTimeoutClassifier.Timeout); action != walkStop || got {
+			slot := errorSlot{tree: &errorTree{nodes: []error{node}, ends: []int{1}}}
+			if action, got := classifyNode(slot, "maple", hiddenTimeoutClassifier.Timeout); action != walkStop || got {
 				subtest.Errorf("Timeout classification = (%v, %t); want (%v, false)", action, got, walkStop)
 			}
-			if action, got := classifyNode(node, "maple", hiddenTemporaryClassifier.Temporary); action != walkStop || got {
+			if action, got := classifyNode(slot, "maple", hiddenTemporaryClassifier.Temporary); action != walkStop || got {
 				subtest.Errorf("Temporary classification = (%v, %t); want (%v, false)", action, got, walkStop)
 			}
 		})
