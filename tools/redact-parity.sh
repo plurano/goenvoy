@@ -67,7 +67,7 @@ def check_exceptions(tracked):
 def check_parity():
     """Discover redaction copies in the index and compare their working-tree contents."""
     raw_paths = subprocess.check_output(
-        ["git", "ls-files", "-z", "--", ":(glob)**/*.go", ":(exclude,glob)**/*_test.go"],
+        ["git", "ls-files", "-z", "--", ":(glob)**/*.go"],
         timeout=60,
     ).split(b"\0")
     tracked = [Path(os.fsdecode(raw_path)) for raw_path in raw_paths if raw_path]
@@ -75,13 +75,17 @@ def check_parity():
 
     copies = {}
     for path in tracked:
-        if path in EXCEPTIONS:
+        if path in EXCEPTIONS or path.name.endswith("_test.go"):
             continue
         lines = read_source(path)
-        if any(WRAPPER.search(line) for _, line in lines):
-            if path.name != "redact.go":
-                raise ValueError(f"{path}:1: redactedError reference outside the parity set")
+        if path.name == "redact.go":
             copies[path.parent] = lines
+        elif any(WRAPPER.search(line) for _, line in lines):
+            raise ValueError(f"{path}:1: redactedError reference outside the parity set")
+    for directory in copies:
+        test_path = directory / "redact_as_internal_test.go"
+        if test_path not in tracked:
+            raise ValueError(f"{test_path}:1: missing file in git index (untracked or missing parity test)")
     if len(copies) < 2:
         raise ValueError(f"found {len(copies)} redaction copies; need at least 2")
 

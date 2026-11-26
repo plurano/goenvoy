@@ -4,14 +4,17 @@
 // a Newznab-compatible search API plus statistics and history endpoints.
 // Authentication uses an API key passed as a query parameter.
 //
-// Key detection decodes percent escapes, backslash escapes, and both together.
+// Key detection matches literal, percent-encoded, or backslash-u key bytes at each offset
+// in input and in percent-only, backslash-only, and mixed decode projections.
 // It redacts on a key match, more than 16 new projections in a layer,
 // or a new projection at the fourth layer.
 // Error redaction scans up to 64 nodes for structural inspection and URL recovery.
-// Errors that control their own formatting or expose the key in Go-syntax output are wrapped.
+// Errors with custom formatting or As methods, or with exposed keys in Go-syntax output, are wrapped.
 // Each forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
-// A sanitized URL error copy preserves nil and typed-nil causes. It hides other causes
-// and captures their timeout and temporary classification together within one such walk.
+// Root and errors.As URL copies parse and redact apikey query values before literal key replacement
+// and canonical check. Copies preserve nil and typed-nil causes and hide other causes.
+// Immediate cause implements Timeout or Temporary → both classifications captured within one such walk.
+// Contract limits — Raw percent sign or backslash directly before key spelled across two or more escape layers, typed-nil causes below immediate cause classify false, %#v inherits fmt recursion on self-referential values, formatting code emits key only on later call, nested *url.Error with apikey value other than configured key.
 //
 // Usage:
 //

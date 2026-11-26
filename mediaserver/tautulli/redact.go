@@ -57,7 +57,7 @@ func (c *Client) containsKey(text string) bool {
 	if c.apiKey == "" {
 		return false
 	}
-	if strings.Contains(text, c.apiKey) {
+	if c.matchesKeySpelling(text) {
 		return true
 	}
 	if !strings.ContainsAny(text, `%\`) {
@@ -76,6 +76,61 @@ func (c *Client) containsKey(text string) bool {
 	return len(frontier) != 0
 }
 
+// matchesKeySpelling checks every possible start for literal or single-layer key bytes.
+func (c *Client) matchesKeySpelling(text string) bool {
+	key := c.apiKey
+	if strings.Contains(text, key) {
+		return true
+	}
+	if !strings.ContainsAny(text, `%\`) {
+		return false
+	}
+	for start := 0; start <= len(text)-len(key); start++ {
+		if matchesKeyAt(text[start:], key) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesKeyAt checks whether the key starts at the first byte of text.
+func matchesKeyAt(text, key string) bool {
+	for i := range len(key) {
+		if len(text) < len(key)-i {
+			return false
+		}
+		size := keyByteSpellingLen(text, key[i])
+		if size == 0 {
+			return false
+		}
+		text = text[size:]
+	}
+	return true
+}
+
+// keyByteSpellingLen returns the width of the matching spelling, or zero.
+func keyByteSpellingLen(text string, want byte) int {
+	switch text[0] {
+	case '%':
+		if len(text) >= 3 && matchesHexByte(text[1:3], want) {
+			return 3
+		}
+	case '\\':
+		if len(text) >= 6 && text[:4] == `\u00` && matchesHexByte(text[4:6], want) {
+			return 6
+		}
+	case want:
+		return 1
+	}
+	return 0
+}
+
+// matchesHexByte compares a pair of hex digits to a byte without allocating.
+func matchesHexByte(text string, want byte) bool {
+	const digits = "0123456789abcdef"
+	return text[0]|0x20 == digits[want>>4] && text[1]|0x20 == digits[want&0xf]
+}
+
 // decodeLayer collects unseen projections and reports a key match or projection overflow.
 func (c *Client) decodeLayer(frontier []string, seen map[string]struct{}) ([]string, bool) {
 	next := make([]string, 0, maxDecodeProjections)
@@ -86,7 +141,7 @@ func (c *Client) decodeLayer(frontier []string, seen map[string]struct{}) ([]str
 			if _, visited := seen[decoded]; visited {
 				continue
 			}
-			if strings.Contains(decoded, c.apiKey) || len(next) == maxDecodeProjections {
+			if c.matchesKeySpelling(decoded) || len(next) == maxDecodeProjections {
 				return nil, true
 			}
 			seen[decoded] = struct{}{}
@@ -380,7 +435,8 @@ func isNilValue(value any) bool {
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
 // The copy preserves nil and typed-nil causes and hides other causes.
-// Classifications for an opaque cause are captured in one walk of up to 4096 nodes and 64 joined errors.
+// If the immediate cause implements Timeout or Temporary, the copy captures both classifications
+// in one walk of up to 4096 nodes and 64 joined errors.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
 	if !ok {
@@ -484,7 +540,7 @@ const maxWalkSteps = 4096
 // redactedTreeMsg is the replacement message when an error tree exceeds maxErrNodes.
 const redactedTreeMsg = "error tree too large: details redacted"
 
-// scrubError hides error trees that carry the API key, contain custom formatters, or exceed the traversal limit.
+// scrubError hides error trees that carry the API key, contain custom formatting or As, or exceed the traversal limit.
 func (c *Client) scrubError(err error) error {
 	carry, tooLarge := c.checkErrorTree(err)
 	if !carry {
@@ -537,7 +593,7 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 			return true, true
 		}
 	}
-	if slices.ContainsFunc(queue, hasCustomErrorFormatting) {
+	if slices.ContainsFunc(queue, hasCustomFormattingOrAs) {
 		return true, false
 	}
 	for _, node := range queue {
@@ -548,15 +604,15 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 	return false, false
 }
 
-// hasCustomErrorFormatting reports whether a caller controls the formatted error.
-func hasCustomErrorFormatting(node error) bool {
-	// Why: fmt's operand rules use Formatter or GoStringer for Go syntax and prefer Error to String for error text.
+// hasCustomFormattingOrAs reports whether an external node controls formatting or errors.As.
+func hasCustomFormattingOrAs(node error) bool {
 	if hiddenRedaction(node) != nil {
 		return false
 	}
 	_, formats := node.(fmt.Formatter)
 	_, goStrings := node.(fmt.GoStringer)
-	return formats || goStrings
+	_, customAs := node.(interface{ As(any) bool })
+	return formats || goStrings || customAs
 }
 
 // errorNodeNeedsRedaction checks URL fields, error text, and Go-syntax output.

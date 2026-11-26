@@ -14,6 +14,109 @@ import (
 	"time"
 )
 
+// TestScrubOverlappingKeySpellings checks offset-anchored matching in text and bodies.
+func TestScrubOverlappingKeySpellings(t *testing.T) {
+	t.Parallel()
+	const (
+		percentKey   = "ab12"
+		backslashKey = "b12"
+		otherDigit   = '3'
+	)
+	first, last := percentKey[2], percentKey[3]
+	upper := fmt.Sprintf("%%%02X%%%02X", first, last)
+	lower := fmt.Sprintf("%%%02x%%%02x", first, last)
+	unicodePair := fmt.Sprintf("\\u%04x\\u%04x", first, last)
+	mixed := fmt.Sprintf("%%%02X\\u%04x", first, last)
+	otherPercent := fmt.Sprintf("%%%02X%%%02X", first, otherDigit)
+	otherUnicode := fmt.Sprintf("\\u%04x\\u%04x", first, otherDigit)
+	percentPrefix := "prefix %" + percentKey[:2]
+	backslashPrefix := "prefix \\" + backslashKey[:1]
+	const suffix = " suffix"
+	cases := []struct {
+		name, key, text string
+		redact          bool
+	}{
+		{"percent upper hex", percentKey, percentPrefix + upper + suffix, true},
+		{"percent lower hex", percentKey, percentPrefix + lower + suffix, true},
+		{"percent before Unicode", percentKey, percentPrefix + unicodePair + suffix, true},
+		{"backslash before Unicode", backslashKey, backslashPrefix + unicodePair + suffix, true},
+		{"ends at text boundary", percentKey, percentPrefix + mixed, true},
+		{"percent different digit", percentKey, percentPrefix + otherPercent + suffix, false},
+		{"percent before different Unicode digit", percentKey, percentPrefix + otherUnicode + suffix, false},
+		{"backslash before different Unicode digit", backslashKey, backslashPrefix + otherUnicode + suffix, false},
+		{"truncated final escape", percentKey, percentPrefix + mixed[:len(mixed)-1], false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Client{apiKey: tc.key}
+			want := tc.text
+			if tc.redact {
+				want = "REDACTED"
+			}
+			if got := c.scrubText(tc.text); got != want {
+				t.Errorf("scrubText = %q; want %q", got, want)
+			}
+			if got := c.scrubBody(tc.text); got != want {
+				t.Errorf("scrubBody = %q; want %q", got, want)
+			}
+		})
+	}
+}
+
+type redactFixtureURLAs struct{ link *url.Error }
+
+// Error returns a fixed message without the fixture URL.
+func (*redactFixtureURLAs) Error() string { return "fixture transport failure" }
+
+// As supplies the fixture URL error separately from the error tree.
+func (e *redactFixtureURLAs) As(target any) bool {
+	dst, ok := target.(**url.Error)
+	if !ok {
+		return false
+	}
+	*dst = e.link
+	return true
+}
+
+// TestScrubErrorHidesCustomURLAs checks that root and nested custom As methods stay opaque.
+func TestScrubErrorHidesCustomURLAs(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	c := &Client{apiKey: key}
+	node := &redactFixtureURLAs{link: &url.Error{Op: "Get", URL: "http://h/" + key}}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"root", node},
+		{"nested", errors.Join(errors.New("fixture sibling"), node)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertCustomURLAsHidden(t, c, "scrubError", c.scrubError(tc.err))
+			assertCustomURLAsHidden(t, c, "redactError", c.redactError(tc.err))
+		})
+	}
+}
+
+// assertCustomURLAsHidden checks wrapper identity, escaped key forms, and URL recovery.
+func assertCustomURLAsHidden(t *testing.T, c *Client, name string, got error) {
+	t.Helper()
+	if hiddenRedaction(got) == nil {
+		t.Errorf("%s returned %T; want opaque wrapper", name, got)
+	}
+	var link *url.Error
+	if errors.As(got, &link) && (link == nil || c.containsKey(link.Op) || c.containsKey(link.URL)) {
+		t.Errorf("%s exposed a nil or unsanitized URL error", name)
+	}
+	for _, format := range [...]string{"%v", "%+v", "%#v"} {
+		if c.containsKey(fmt.Sprintf(format, got)) {
+			t.Errorf("%s exposed the key with format %q", name, format)
+		}
+	}
+}
+
 type redactFixtureFormatter struct {
 	cause error
 	text  string
@@ -83,7 +186,8 @@ func TestScrubErrorHidesCustomFormatter(t *testing.T) {
 	const key = "fixture-key42"
 	c := &Client{apiKey: key}
 	sentinel := errors.New("fixture read failure")
-	unsafeFormatter := &redactFixtureFormatter{cause: sentinel, text: "fixture%2Dkey42"}
+	escapedKey := strings.Replace(key, "-", fmt.Sprintf("%%%02X", '-'), 1)
+	unsafeFormatter := &redactFixtureFormatter{cause: sentinel, text: escapedKey}
 	cases := []struct {
 		name string
 		err  error
@@ -937,9 +1041,10 @@ func TestRedactedErrorIsNodeMethod(t *testing.T) {
 func TestRedactErrorRootPathRedaction(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key42"
+	escapedKey := strings.Replace(key, "-", fmt.Sprintf("%%%02X", '-'), 1)
 	for _, tc := range []struct{ name, path string }{
 		{"literal", key},
-		{"percent encoded", "fixture%2Dkey42"},
+		{"percent encoded", escapedKey},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

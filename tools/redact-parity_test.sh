@@ -26,7 +26,7 @@ shared_source="$wrapper_and_span"$'\n\nfunc (c *Client) scrubText() {}'
 printf 'package alpha\n\n%s\n' "$shared_source" >first/redact.go
 printf 'package alpha\n\n// Traversal tests.\n' >first/redact_as_internal_test.go
 printf 'package unrelated\n' >unrelated/redact.go
-timeout 60 git add first unrelated
+timeout 60 git add first
 if [[ $# -eq 0 ]]; then
   expect_refusal 'absent exception' "$exception:1: stale exception" "${SUT[@]}"
 fi
@@ -88,3 +88,16 @@ expect_output 'same-line grouped declaration keeps the exception' 'redact-parity
 
 printf 'package standalone\n\ntype redactedError struct{}\nfunc broken(]\n' >"$exception"
 expect_refusal 'parse error in the exception' "$exception:4:" "${SUT[@]}"
+
+printf 'package standalone\n\n%s\n' "$wrapper_and_span" >"$exception"
+planted_rc=0
+
+printf 'package beta\n\n%s\n' "${shared_source//redactedError/otherError}" >second/redact.go
+(expect_refusal 'tracked copy without wrapper references' 'second/redact.go:3: differs' "${SUT[@]}") || planted_rc=1
+printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
+
+printf 'package unrelated\n\n%s\n' "$shared_source" >unrelated/redact.go
+printf 'package unrelated\n\n// Traversal tests.\n' >unrelated/redact_as_internal_test.go
+timeout 60 git add unrelated/redact.go
+(expect_refusal 'untracked parity test exists on disk' 'unrelated/redact_as_internal_test.go:1: missing file in git index' "${SUT[@]}") || planted_rc=1
+exit "$planted_rc"
