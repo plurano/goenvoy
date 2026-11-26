@@ -163,7 +163,9 @@ release-scripts-check: ## Release manifest, tagging, notes, publishing and relea
 	bash tools/release-publish_test.sh
 
 .PHONY: module-scripts-check
-module-scripts-check: ## Module discovery and per-module lint scripts: planted cases, then the repository
+module-scripts-check: ## Module discovery, per-module lint scripts, and test-comment claims: planted cases, then the repository
+	bash tools/test-claim-calls_test.sh
+	bash tools/test-claim-calls.sh
 	bash tools/module-dirs_test.sh
 	bash tools/golangci-modules_test.sh
 
