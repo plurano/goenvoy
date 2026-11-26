@@ -58,6 +58,9 @@
 //     every recorded node's fields without calling error methods. A method can print the key or
 //     write it into a recorded node's fields only on a later call, including after redaction returns.
 //     The check cannot see that later text or write.
+//   - A method call during the check can replace a recorded node's cause after it was read,
+//     for example by assigning to the Err field of a *url.Error. The field re-read only checks
+//     recorded nodes, so it cannot see the unvisited replacement.
 //   - Nested *url.Error with apikey value other than configured key.
 //   - XML or HTML character references and escape schemes other than percent and backslash-u.
 //   - For custom Is, Timeout or Temporary methods, the check uses the Unwrap tree read before the call.

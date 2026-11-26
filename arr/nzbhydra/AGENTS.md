@@ -58,6 +58,8 @@ API key passed as `apikey` query parameter.
   - Raw percent sign or backslash directly before key spelled across two or more escape layers
   - Check -> one `Unwrap` result and one `Error` text check per visited node, then method-free field re-read.
     Print key or write key into recorded node field only on call after re-read (including after redaction returns) -> unseen.
+  - Method call during check replaces recorded node cause after read (e.g., `*url.Error` `Err`) -> replacement unvisited.
+    Re-read checks recorded fields only -> replacement unseen.
   - Nested `*url.Error` with `apikey` value other than configured key
   - XML or HTML character references and escape schemes other than percent and backslash-u.
   - Custom `Is`, `Timeout` or `Temporary` -> check `Unwrap` tree read before call. Later `Unwrap` read or other path into package wrapper ->
