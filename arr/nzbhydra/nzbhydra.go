@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,16 +42,21 @@ type Client struct {
 
 // New creates an NZBHydra2 [Client] for the instance at baseURL with the given API key.
 // It returns an error if baseURL is not a valid HTTP/HTTPS URL.
+// API keys may be empty or use only ASCII letters, digits, and - . _ ~.
 func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
-	redactor := &Client{apiKey: apiKey}
 
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("nzbhydra: invalid base URL %q: %w", redactor.scrub(baseURL), redactor.redactError(err))
+		return nil, errors.New("nzbhydra: invalid base URL: must be http(s) with a host")
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("nzbhydra: invalid base URL %q: must be http(s) with a host", redactor.scrub(baseURL))
+		return nil, errors.New("nzbhydra: invalid base URL: must be http(s) with a host")
+	}
+
+	// Why: URL key spellings reduce to literal or percent-escaped unreserved bytes that the redactor already covers.
+	if !validAPIKey(apiKey) {
+		return nil, errors.New("nzbhydra: invalid API key: only letters, digits and - . _ ~ allowed")
 	}
 
 	c := &Client{
@@ -64,14 +70,24 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// APIError is returned when the API responds with a non-2xx status.
+// APIError reports a non-2xx response. StatusCode is the raw HTTP status: Go-syntax formatting (%#v),
+// reflection and encoding/json print it unscrubbed; only Error renders the scrubbed code.
 type APIError struct {
 	StatusCode int
 	Status     string
 	Body       string
+
+	statusText string
 }
 
+// Error returns the HTTP status and any response message.
 func (e *APIError) Error() string {
+	if e.statusText != "" {
+		if e.Body != "" {
+			return "nzbhydra: HTTP " + e.statusText + ": " + e.Body
+		}
+		return "nzbhydra: HTTP " + e.statusText
+	}
 	if e.Body != "" {
 		return fmt.Sprintf("nzbhydra: HTTP %d: %s", e.StatusCode, e.Body)
 	}
@@ -97,7 +113,12 @@ func (c *Client) doGet(ctx context.Context, u string) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &APIError{StatusCode: resp.StatusCode, Status: c.scrub(resp.Status), Body: c.scrub(string(data))}
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     c.scrubText(resp.Status),
+			Body:       c.scrubBody(string(data)),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	return data, nil
@@ -178,7 +199,12 @@ func (c *Client) postJSON(ctx context.Context, path string, body, v any) error {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &APIError{StatusCode: resp.StatusCode, Status: c.scrub(resp.Status), Body: c.scrub(string(respData))}
+		return &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     c.scrubText(resp.Status),
+			Body:       c.scrubBody(string(respData)),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	if v != nil {

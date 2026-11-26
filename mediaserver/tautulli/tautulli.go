@@ -3,6 +3,7 @@ package tautulli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,16 +46,21 @@ type Client struct {
 
 // New creates a Tautulli [Client] for the instance at baseURL with the given API key.
 // It returns an error if baseURL is not a valid HTTP/HTTPS URL.
+// API keys may be empty or use only ASCII letters, digits, and - . _ ~.
 func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
-	redactor := &Client{apiKey: apiKey}
 
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("tautulli: invalid base URL %q: %w", redactor.scrub(baseURL), redactor.redactError(err))
+		return nil, errors.New("tautulli: invalid base URL: must be http(s) with a host")
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("tautulli: invalid base URL %q: must be http(s) with a host", redactor.scrub(baseURL))
+		return nil, errors.New("tautulli: invalid base URL: must be http(s) with a host")
+	}
+
+	// Why: URL key spellings reduce to literal or percent-escaped unreserved bytes that the redactor already covers.
+	if !validAPIKey(apiKey) {
+		return nil, errors.New("tautulli: invalid API key: only letters, digits and - . _ ~ allowed")
 	}
 
 	c := &Client{
@@ -69,13 +75,23 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// APIError is returned when the API responds with a non-2xx status or an error result.
+// APIError reports a non-2xx response or an error result. StatusCode is the raw HTTP status: Go-syntax formatting (%#v) and
+// reflection print it unscrubbed (encoding/json skips it); only Error renders the scrubbed code.
 type APIError struct {
 	StatusCode int    `json:"-"`
 	RawBody    string `json:"-"`
+
+	statusText string
 }
 
+// Error returns the HTTP status and any response message.
 func (e *APIError) Error() string {
+	if e.statusText != "" {
+		if e.RawBody != "" {
+			return "tautulli: HTTP " + e.statusText + ": " + e.RawBody
+		}
+		return "tautulli: HTTP " + e.statusText
+	}
 	if e.RawBody != "" {
 		return fmt.Sprintf("tautulli: HTTP %d: %s", e.StatusCode, e.RawBody)
 	}
@@ -124,7 +140,11 @@ func (c *Client) get(ctx context.Context, cmd string, params url.Values) (json.R
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &APIError{StatusCode: resp.StatusCode, RawBody: c.scrub(string(body))}
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			RawBody:    c.scrubBody(string(body)),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	var r apiResponse
@@ -133,7 +153,11 @@ func (c *Client) get(ctx context.Context, cmd string, params url.Values) (json.R
 	}
 
 	if r.Response.Result != "success" {
-		return nil, &APIError{StatusCode: resp.StatusCode, RawBody: c.scrub(r.Response.Message)}
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			RawBody:    c.scrubBody(r.Response.Message),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	return r.Response.Data, nil
