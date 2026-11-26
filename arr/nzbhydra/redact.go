@@ -293,17 +293,28 @@ func (e *redactedError) Error() string { return e.msg }
 // RedactionBoundary marks a wrapper so sibling client modules stop at each other's wrappers.
 func (*redactedError) RedactionBoundary() {}
 
-// Is matches the hidden error without exposing it.
+// Is matches the hidden error within 4096 steps and 64 joined errors.
+// A custom Is pre-check spends steps from that same budget and requires at least 64 remaining.
+// Is calls the custom method only if its recorded Unwrap tree is safe and contains no package wrapper.
 func (e *redactedError) Is(target error) bool {
-	return e.walk(target, func(node error) walkAction {
+	return e.walk(target, func(node error, remaining int) (bool, int) {
 		// Why: visit nested wrappers within this walk's budget.
 		if hiddenRedaction(node) != nil || foreignRedaction(node) {
-			return walkDescend
+			return false, 0
 		}
-		if m, ok := node.(interface{ Is(error) bool }); ok && m.Is(target) {
-			return walkStop
+		method, ok := node.(interface{ Is(error) bool })
+		if !ok {
+			return false, 0
 		}
-		return walkDescend
+		if remaining < maxErrNodes {
+			return false, remaining
+		}
+		tree, unsafe := inspectErrorTree(node)
+		charge := len(tree.nodes)
+		if unsafe || (errorSlot{tree: &tree, index: 0}).hasPackageWrapper() {
+			return false, charge
+		}
+		return method.Is(target), charge
 	})
 }
 
@@ -323,17 +334,17 @@ type (
 	hiddenTemporaryClassifier = interface{ Temporary() bool }
 )
 
-// classifyHiddenError snapshots the hidden tree once and reports its first applicable bounded classification.
+// classifyHiddenError snapshots the starting wrapper in the operation's cache and reports the first applicable classification.
 func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	if e.unsafe {
 		return false
 	}
-	tree, unsafe := inspectErrorTree(e.err)
-	if unsafe {
+	var snapshots classificationSnapshots
+	snapshot := snapshots.inspect(e)
+	if snapshot.unsafe {
 		return false
 	}
-	var snapshots classificationSnapshots
-	return classifyTree(tree, e.key, &snapshots, classify)
+	return classifyTree(snapshot.tree, e.key, &snapshots, classify)
 }
 
 type errorTree struct {
@@ -559,8 +570,8 @@ const (
 	walkCauseOnly
 )
 
-// walk visits the hidden tree depth-first in errors.Is order, with shared limits on steps and joins.
-func (e *redactedError) walk(target error, visit func(error) walkAction) bool {
+// walk visits the hidden tree depth-first in errors.Is order and shares its step budget with the visitor.
+func (e *redactedError) walk(target error, visit func(error, int) (bool, int)) bool {
 	if isNilError(e.err) {
 		return false
 	}
@@ -579,10 +590,13 @@ func (e *redactedError) walk(target error, visit func(error) walkAction) bool {
 			}
 			joins++
 		}
-		if visitWalkNode(node, target, visit) == walkStop {
+		remaining := maxWalkSteps - steps - 1
+		matched, charge := visitWalkNode(node, target, remaining, visit)
+		if matched {
 			return true
 		}
-		stack = appendWalkChildren(stack, node, joined, maxWalkSteps-steps-1)
+		steps += charge
+		stack = appendWalkChildren(stack, node, joined, remaining-charge)
 	}
 	return false
 }
@@ -600,12 +614,12 @@ func appendWalkChildren(stack [][]error, node error, joined interface{ Unwrap() 
 	return stack
 }
 
-// visitWalkNode checks identity before applying the visitor.
-func visitWalkNode(node, target error, visit func(error) walkAction) walkAction {
+// visitWalkNode checks identity before applying the visitor and returns the visitor's extra step charge.
+func visitWalkNode(node, target error, remaining int, visit func(error, int) (bool, int)) (bool, int) {
 	if target != nil && node == target { //nolint:errorlint // compare this node without starting another traversal
-		return walkStop
+		return true, 0
 	}
-	return visit(node)
+	return visit(node, remaining)
 }
 
 // popWalkNode pops the next non-nil node from the top slice of stack.
@@ -669,8 +683,8 @@ func isNilError(err error) bool {
 }
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
-// It suppresses classification if the current tree is unsafe, preserves nil causes, and replaces unsafe causes with a fixed error.
-// For a safe immediate cause implementing Timeout or Temporary, the copy reads its tree and every same-key wrapper tree inside it once and uses them for both classifications.
+// It preserves nil causes, replaces an unsafe cause with a fixed opaque error, and suppresses classification when the parent tree is unsafe.
+// For a safe immediate cause implementing Timeout or Temporary, both classifications share the cause inspection and the snapshots of same-key wrappers it enters.
 // One classification counts every node it reads (the cause tree and each same-key wrapper tree it enters) once against 4096; entering a same-key wrapper with fewer than 64 left → false.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
@@ -781,10 +795,10 @@ func foreignRedaction(node error) bool {
 	return boundary && hiddenRedaction(node) == nil
 }
 
-// maxErrNodes bounds the error tree walk in carriesKey and the joined-error budget in walk.
+// maxErrNodes bounds each error tree inspection and the joined-error budget in walk.
 const maxErrNodes = 64
 
-// maxWalkSteps bounds the total nodes visited by identity search or classification.
+// maxWalkSteps bounds node visits and pre-check reads in identity search, and node reads in classification.
 const maxWalkSteps = 4096
 
 // redactedTreeMsg is the replacement message when an error tree exceeds maxErrNodes.
@@ -793,6 +807,11 @@ const redactedTreeMsg = "error tree too large: details redacted"
 // scrubError hides error trees that carry the API key, contain custom formatting or As, or exceed the traversal limit.
 func (c *Client) scrubError(err error) error {
 	carry, unsafe := c.checkErrorTree(err)
+	return c.scrubCheckedError(err, carry, unsafe)
+}
+
+// scrubCheckedError builds the result from the redaction and safety decisions already made for err.
+func (c *Client) scrubCheckedError(err error, carry, unsafe bool) error {
 	if !carry {
 		return err
 	}
@@ -811,10 +830,15 @@ func (c *Client) hideCause(err error) error {
 
 // hideURLCause sanitizes the cause and uses its single inspection for both classifications when safe.
 func (c *Client) hideURLCause(err error, unsafeParent bool) error {
+	tree, unsafe := inspectErrorTree(err)
+	return c.buildURLCause(err, tree, unsafe, unsafeParent)
+}
+
+// buildURLCause sanitizes a URL cause using the tree already observed by the caller.
+func (c *Client) buildURLCause(err error, tree errorTree, unsafe, unsafeParent bool) error {
 	if err == nil {
 		return nil
 	}
-	tree, unsafe := inspectErrorTree(err)
 	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey, unsafe: unsafe || unsafeParent}
 	cause := opaqueURLCause{hidden: hidden}
 	if unsafe {
@@ -841,22 +865,21 @@ func (c *Client) carriesKey(err error) bool {
 
 // checkErrorTree reports whether err needs redaction and whether its Error method is unsafe to call.
 func (c *Client) checkErrorTree(err error) (bool, bool) {
+	carry, unsafe, _ := c.inspectErrorRedaction(err)
+	return carry, unsafe
+}
+
+// inspectErrorRedaction reports whether err needs redaction, whether it is unsafe, and the tree it observed.
+func (c *Client) inspectErrorRedaction(err error) (bool, bool, errorTree) {
 	tree, unsafe := inspectErrorTree(err)
-	if unsafe {
-		return true, true
+	if unsafe || slices.ContainsFunc(tree.nodes, c.hasCustomFormattingOrAs) {
+		return true, unsafe, tree
 	}
-	if slices.ContainsFunc(tree.nodes, c.hasCustomFormattingOrAs) {
-		return true, false
-	}
-	for _, node := range tree.nodes {
-		if c.errorNodeNeedsRedaction(node) {
-			return true, false
-		}
-	}
-	return false, false
+	return slices.ContainsFunc(tree.nodes, c.errorNodeNeedsRedaction), false, tree
 }
 
 // inspectErrorTree records each node's children in one bounded breadth-first read without calling Error or classifiers.
+// An unsafe tree retains its bounded node count for accounting.
 func inspectErrorTree(err error) (errorTree, bool) {
 	if err == nil {
 		return errorTree{}, false
@@ -865,11 +888,13 @@ func inspectErrorTree(err error) (errorTree, bool) {
 	for i := 0; i < maxErrNodes && i < len(tree.nodes); i++ {
 		var unsafe bool
 		tree.nodes, unsafe = appendWrappedChildren(tree.nodes, tree.nodes[i])
+		end := min(len(tree.nodes), maxErrNodes)
+		tree.ends = append(tree.ends, end)
 		if unsafe {
 			// Why: formatting an oversized tree or a typed-nil node can be unsafe.
-			return errorTree{}, true
+			tree.nodes = tree.nodes[:end]
+			return tree, true
 		}
-		tree.ends = append(tree.ends, len(tree.nodes))
 	}
 	return tree, false
 }
@@ -1063,15 +1088,31 @@ func appendJoinChildren(queue, children []error, clipped bool) ([]error, bool) {
 func (c *Client) redactError(err error) error {
 	// Why: only the root can be a *url.Error to copy; errors.As would search the whole tree unbounded.
 	if uerr, ok := err.(*url.Error); ok && uerr != nil { //nolint:errorlint // root identity wanted; tree search is the defect
-		// Why: copy only when sanitizing changed the URL text or hid the cause; an untouched root keeps its identity for errors.Is.
-		// Why: a copy never mutates an error value net/http or a custom transport may share.
-		cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(uerr.URL))
-		if cleanOp != uerr.Op || cleanURL != uerr.URL || (uerr.Err != nil && c.carriesKey(uerr.Err)) {
-			// Why: the copy's fields are already sanitized, including its package-owned cause formatter.
-			return &url.Error{Op: cleanOp, URL: cleanURL, Err: c.hideCause(uerr.Err)}
-		}
+		return c.redactRootURL(uerr)
 	}
 	return c.scrubError(err)
+}
+
+// redactRootURL copies a URL error when its fields or cause require redaction.
+func (c *Client) redactRootURL(uerr *url.Error) error {
+	cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(uerr.URL))
+	changed := cleanOp != uerr.Op || cleanURL != uerr.URL
+	var carry, unsafe bool
+	var tree errorTree
+	if changed {
+		// Why: changed fields already require a copy, so there is no need to format nodes to decide.
+		tree, unsafe = inspectErrorTree(uerr.Err)
+	} else {
+		carry, unsafe, tree = c.inspectErrorRedaction(uerr.Err)
+	}
+	if changed || carry {
+		return &url.Error{Op: cleanOp, URL: cleanURL, Err: c.buildURLCause(uerr.Err, tree, unsafe, false)}
+	}
+	// Why: an unchanged URL root still counts toward the whole-tree inspection limit.
+	if len(tree.nodes) == maxErrNodes {
+		return c.scrubCheckedError(uerr, true, true)
+	}
+	return c.scrubCheckedError(uerr, uerr.Err != nil && c.errorNodeNeedsRedaction(uerr), false)
 }
 
 // redactURL redacts apikey query values or drops the query when parsing fails.
