@@ -1661,6 +1661,60 @@ func TestUnsafeTreeClassifications(t *testing.T) {
 	}
 }
 
+type redactURLClassifier struct {
+	redactClassifier
+	error
+}
+
+// TestUnsafeParentURLCopyIsUnclassified checks that a typed-nil sibling suppresses URL copy classification.
+func TestUnsafeParentURLCopyIsUnclassified(t *testing.T) {
+	t.Parallel()
+	const key = "plum"
+	original := &url.Error{
+		Op:  "Get " + key,
+		URL: "http://h/?apikey=" + key,
+		Err: redactURLClassifier{error: errors.New("dial " + key)},
+	}
+	tree := errors.Join((*redactNilTimeoutCause)(nil), original)
+	c := &Client{apiKey: key}
+	for _, tc := range [...]struct {
+		name  string
+		apply func(error) error
+	}{
+		{"redactError", c.redactError},
+		{"scrubError", c.scrubError},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			assertUnsafeParentURLCopy(subtest, c, tc.apply(tree), original)
+		})
+	}
+}
+
+// assertUnsafeParentURLCopy checks that the wrapper and its sanitized URL copy suppress classification.
+func assertUnsafeParentURLCopy(t *testing.T, c *Client, result error, original *url.Error) {
+	t.Helper()
+	got, ok := result.(*redactedError) //nolint:errorlint // require the wrapper itself
+	if !ok {
+		t.Fatal("expected an opaque wrapper")
+	}
+	var copied *url.Error
+	if !errors.As(got, &copied) || copied == nil || copied == original {
+		t.Fatal("expected a sanitized URL error copy")
+	}
+	if isNilError(copied.Err) {
+		t.Fatal("expected a non-nil copied cause")
+	}
+	if c.containsKey(copied.Op) || c.containsKey(copied.URL) || c.containsKey(copied.Err.Error()) {
+		t.Error("copied URL error exposed the key")
+	}
+	assertURLClassifications(t, got, copied, false)
+	var classifier interface{ Timeout() bool }
+	if got.As(&classifier) {
+		t.Error("As exposed a hidden timeout classifier")
+	}
+}
+
 type redactCountingTimeout struct{ calls int }
 
 // Error returns a fixed fixture message.
