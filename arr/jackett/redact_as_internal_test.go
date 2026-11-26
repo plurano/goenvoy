@@ -2334,9 +2334,16 @@ func TestURLCopySharesWrapperSnapshot(t *testing.T) {
 	if !errors.As(hidden, &copied) || copied == nil {
 		t.Fatal("expected a sanitized URL error copy")
 	}
-	assertClassifierValues(t, "copy", copied, true, true)
 	if count := flip.calls.Load(); count != 1 {
-		t.Errorf("wrapper Unwrap read %d times; want 1", count)
+		t.Fatalf("errors.As read wrapper Unwrap %d times; want 1", count)
+	}
+	flipped := flip.Unwrap()
+	if timeout, temporary := stdlibErrorClassifications(flipped); timeout || temporary {
+		t.Errorf("advanced cause classifications = (%t, %t); want (false, false)", timeout, temporary)
+	}
+	assertClassifierValues(t, "copy", copied, true, true)
+	if count := flip.calls.Load(); count != 2 {
+		t.Errorf("wrapper Unwrap read %d times after advance and copied classifiers; want 2", count)
 	}
 }
 
@@ -2684,20 +2691,23 @@ func assertSiblingModuleSearch(t *testing.T, root *redactedError, foreign *redac
 	if !answerWithinTwoSeconds(t, "foreign identity", func() bool { return errors.Is(root, foreign) }) {
 		t.Error("errors.Is did not recognize the foreign wrapper itself")
 	}
-	copied := answerWithinTwoSeconds(t, "URL recovery", func() *url.Error {
+	type urlRecovery struct {
+		found  bool
+		copied *url.Error
+	}
+	recovery := answerWithinTwoSeconds(t, "URL recovery", func() urlRecovery {
 		var recovered *url.Error
-		if !errors.As(root, &recovered) {
-			return nil
-		}
-		return recovered
+		found := errors.As(root, &recovered)
+		return urlRecovery{found: found, copied: recovered}
 	})
 	if visible == nil {
-		if copied != nil {
-			t.Error("errors.As recovered a URL through the foreign wrapper")
+		if recovery != (urlRecovery{}) {
+			t.Errorf("errors.As through the foreign wrapper = (%t, %p); want (false, nil)", recovery.found, recovery.copied)
 		}
 		return
 	}
-	if copied == nil || copied == visible || copied.URL != "http://h/REDACTED" || copied.Err != nil {
+	copied := recovery.copied
+	if !recovery.found || copied == nil || copied == visible || copied.URL != "http://h/REDACTED" || copied.Err != nil {
 		t.Error("errors.As did not recover a sanitized copy of the visible URL sibling")
 	}
 }
@@ -3094,6 +3104,101 @@ func TestClassificationWrapperEntryFloor(t *testing.T) {
 	}
 }
 
+// TestURLCopyClassificationEntryFloor checks that only inspected nodes count in either classification.
+func TestURLCopyClassificationEntryFloor(t *testing.T) {
+	t.Parallel()
+	// Why: the cause costs two reads, the join and its first child cost two, and depth - 1 links cost one each.
+	const depth = maxWalkSteps - maxErrNodes - 3
+	for _, tc := range [...]struct {
+		name  string
+		extra error
+		want  bool
+	}{
+		{name: "at entry floor", want: true},
+		{name: "below entry floor", extra: errors.New("unvisited sibling")},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			chain := sameKeyClassifierChain(depth)
+			cause := wrapWithOpError(wrapWithSameKey(errors.Join(chain, tc.extra)))
+			original := &url.Error{URL: "http://h/maple", Err: cause}
+			hidden := &redactedError{key: "maple", err: original}
+			var copied *url.Error
+			if !errors.As(hidden, &copied) || copied == nil || copied == original {
+				subtest.Fatal("expected a sanitized URL error copy")
+			}
+			assertClassifierValues(subtest, "copy", copied, tc.want, tc.want)
+		})
+	}
+}
+
+// TestClassificationChargesSharedWrapperOnce checks that wrapper identity determines the snapshot charge.
+func TestClassificationChargesSharedWrapperOnce(t *testing.T) {
+	t.Parallel()
+	// Why: the root join costs four reads, the shared snapshot costs one, and depth - 1 links cost one each.
+	const depth = maxWalkSteps - maxErrNodes - 4
+	for _, tc := range [...]struct {
+		name string
+		same bool
+	}{
+		{name: "shared wrapper", same: true},
+		{name: "distinct wrappers"},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			leaf := errors.New("fixture leaf")
+			first := wrapWithSameKey(leaf)
+			second := first
+			if !tc.same {
+				second = wrapWithSameKey(leaf)
+			}
+			joined := errors.Join(first, second, sameKeyClassifierChain(depth))
+			root := &redactedError{key: "maple", err: joined}
+			assertClassifierValues(subtest, tc.name, root, tc.same, tc.same)
+		})
+	}
+}
+
+// TestClassificationChargesStartingWrapperOnce checks the starting charge on a join with a self-reference.
+func TestClassificationChargesStartingWrapperOnce(t *testing.T) {
+	t.Parallel()
+	// Why: the starting join costs three reads and depth - 1 links cost one each before the final reservation.
+	const depth = maxWalkSteps - maxErrNodes - 2
+	for _, tc := range [...]struct {
+		name  string
+		extra error
+		want  bool
+	}{
+		{name: "starting wrapper re-entry", want: true},
+		{name: "below entry floor", extra: errors.New("unvisited sibling")},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			root := &redactedError{key: "maple"}
+			root.err = errors.Join(root, sameKeyClassifierChain(depth), tc.extra)
+			charge, snapshot := startHiddenClassification(root)
+			span, unsafe := charge.children(errorSlot{tree: &snapshot.tree, index: 1})
+			if unsafe || span.tree != &snapshot.tree {
+				subtest.Fatal("re-entry did not return the original snapshot")
+			}
+			// Why: dispatching the cycle repeats indefinitely, so continue from the pending sibling after one re-entry.
+			pending := errorTree{nodes: snapshot.tree.nodes[2:3], ends: []int{1}}
+			if got := classifyTree(pending, root.key, charge, hiddenTimeoutClassifier.Timeout); got != tc.want {
+				subtest.Errorf("pending sibling Timeout = %t; want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// sameKeyClassifierChain wraps a positive classifier in distinct same-key wrappers.
+func sameKeyClassifierChain(depth int) error {
+	leaf := trueClassifierLeaf()
+	for range depth {
+		leaf = wrapWithSameKey(leaf)
+	}
+	return leaf
+}
+
 type redactCountingUnwrap struct{ calls int }
 
 // Error returns a fixed counting fixture message.
@@ -3196,7 +3301,8 @@ func assertNilStdlibDelegateStops(t *testing.T) {
 		t.Errorf("Temporary classification = (%v, %t); want (%v, false)", action, got, walkStop)
 	}
 	var snapshots classificationSnapshots
-	if classifyTree(tree, "maple", &snapshots, hiddenTimeoutClassifier.Timeout) || classifyTree(tree, "maple", &snapshots, hiddenTemporaryClassifier.Temporary) {
+	charge := classificationCharge{snapshots: &snapshots, reads: len(tree.nodes)}
+	if classifyTree(tree, "maple", charge, hiddenTimeoutClassifier.Timeout) || classifyTree(tree, "maple", charge, hiddenTemporaryClassifier.Temporary) {
 		t.Error("classification reached the positive sibling after an absent delegate")
 	}
 }

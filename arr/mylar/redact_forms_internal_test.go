@@ -39,9 +39,10 @@ func TestRedactErrorRootIdentity(t *testing.T) {
 // assertRootIdentity checks the identity, cause, and text of a redacted root URL error.
 func assertRootIdentity(t *testing.T, c *Client, uerr *url.Error, sentinel error, keep bool) {
 	t.Helper()
-	op, rawURL, want := uerr.Op, uerr.URL, uerr.Err
+	op, want := uerr.Op, uerr.Err
+	fields := [2]string{op, uerr.URL}
 	got := c.redactError(uerr)
-	if uerr.Op != op || uerr.URL != rawURL {
+	if [2]string{uerr.Op, uerr.URL} != fields || uerr.Err != want { //nolint:errorlint // require the exact original cause
 		t.Error("redactError modified the input URL error")
 	}
 	if same := any(got) == any(uerr); same != keep {

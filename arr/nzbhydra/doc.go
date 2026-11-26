@@ -27,13 +27,14 @@
 // holds a package wrapper or is unsafe.
 // Classification reads each wrapper tree once within 64 nodes and classifies from that read, the starting wrapper included.
 // A same-key wrapper entered during classification is read once the same way.
-// One classification counts every node it reads (the cause tree and each same-key wrapper tree it enters) once against 4096; entering a same-key wrapper with fewer than 64 left → false.
+// Each classification charges the cause tree and each same-key wrapper tree once against 4096 nodes. A wrapper needs 64 nodes left before its first charge.
 // Unsafe tree → Timeout and Temporary false.
 // Package-owned URL causes end classification → opaque cause false, classified cause captured values.
 // Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.
 // URL copies keep nil causes. Typed-nil or unsafe causes become fixed opaque errors without classification.
 // Root URL copy → one cause inspection. Unsafe first read → fixed opaque cause.
 // Safe immediate cause implements Timeout or Temporary → read its tree and every same-key wrapper tree inside it once and use them for both classifications.
+// The once-only read covers the copy's classification snapshot; the errors.As search that selects the URL error reads the cause separately.
 //
 // Contract limits
 //

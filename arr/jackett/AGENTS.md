@@ -38,10 +38,11 @@ API key passed as `apikey` query parameter.
   holds a package wrapper or is unsafe.
 - Classification reads each wrapper tree once within 64 nodes and classifies from that read, the starting wrapper included.
 - A same-key wrapper entered during classification is read once the same way.
-- One classification counts every node it reads (the cause tree and each same-key wrapper tree it enters) once against 4096; entering a same-key wrapper with fewer than 64 left -> false.
+- Each classification charges cause tree and each same-key wrapper tree once against 4096 nodes; wrapper needs 64 nodes left before first charge.
 - Unsafe tree -> `Timeout` and `Temporary` false.
 - Package-owned URL causes end classification -> opaque cause false, classified cause captured values.
 - Safe immediate URL cause implements `Timeout` or `Temporary` -> read its tree and every same-key wrapper tree inside it once and use them for both classifications.
+- Once-only read covers copy classification snapshot; errors.As search selecting URL error reads cause separately.
 - Opaque `errors.As` -> copy first non-nil `*url.Error` within 64 breadth-first nodes, same cause handling as root.
 - Contract limits:
   - Raw percent sign or backslash directly before key spelled across two or more escape layers

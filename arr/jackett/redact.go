@@ -339,12 +339,11 @@ func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	if e.unsafe {
 		return false
 	}
-	var snapshots classificationSnapshots
-	snapshot := snapshots.inspect(e)
+	charge, snapshot := startHiddenClassification(e)
 	if snapshot.unsafe {
 		return false
 	}
-	return classifyTree(snapshot.tree, e.key, &snapshots, classify)
+	return classifyTree(snapshot.tree, e.key, charge, classify)
 }
 
 type errorTree struct {
@@ -358,6 +357,23 @@ type classificationSnapshot struct {
 }
 
 type classificationSnapshots map[*redactedError]*classificationSnapshot
+
+type classificationCharge struct {
+	snapshots *classificationSnapshots
+	charged   map[*redactedError]*classificationSnapshot
+	reads     int
+}
+
+// startHiddenClassification records the initial wrapper snapshot and its charge together.
+func startHiddenClassification(wrapper *redactedError) (classificationCharge, *classificationSnapshot) {
+	var snapshots classificationSnapshots
+	snapshot := snapshots.inspect(wrapper)
+	return classificationCharge{
+		snapshots: &snapshots,
+		charged:   map[*redactedError]*classificationSnapshot{wrapper: snapshot},
+		reads:     len(snapshot.tree.nodes),
+	}, snapshot
+}
 
 // inspect returns the first tree observed inside a wrapper during this operation.
 func (snapshots *classificationSnapshots) inspect(wrapper *redactedError) *classificationSnapshot {
@@ -392,14 +408,13 @@ func (slot errorSlot) children() errorSpan {
 	return errorSpan{tree: slot.tree, start: start, end: slot.tree.ends[slot.index]}
 }
 
-// classifyTree reports the first applicable classification in depth-first errors.Is order and charges each recorded node once.
-func classifyTree[T any](tree errorTree, key string, snapshots *classificationSnapshots, classify func(T) bool) bool {
+// classifyTree reports the first applicable classification in depth-first errors.Is order with its own read charge.
+func classifyTree[T any](tree errorTree, key string, charge classificationCharge, classify func(T) bool) bool {
 	if len(tree.nodes) == 0 {
 		return false
 	}
 	stack := []errorSpan{{tree: &tree, end: 1}}
-	reads := len(tree.nodes)
-	// Why: every pop dispatches a slot already charged by an inspection, so pops never exceed reads.
+	// Why: the loop guard bounds dispatch even when a charged snapshot is revisited.
 	for i := 0; i < maxWalkSteps && len(stack) > 0; i++ {
 		var slot errorSlot
 		stack, slot = popErrorSlot(stack)
@@ -410,11 +425,10 @@ func classifyTree[T any](tree errorTree, key string, snapshots *classificationSn
 		if action == walkCauseOnly {
 			stack = stack[:0]
 		}
-		children, read, unsafe := classificationChildren(slot, maxWalkSteps-reads, snapshots)
+		children, unsafe := charge.children(slot)
 		if unsafe {
 			return false
 		}
-		reads += read
 		if children.start < children.end {
 			stack = append(stack, children)
 		}
@@ -433,17 +447,25 @@ func popErrorSlot(stack []errorSpan) ([]errorSpan, errorSlot) {
 	return stack, slot
 }
 
-// classificationChildren returns the child span, snapshot read cost, and whether traversal must stop.
-func classificationChildren(slot errorSlot, remaining int, snapshots *classificationSnapshots) (errorSpan, int, bool) {
-	if wrapper, ok := slot.tree.nodes[slot.index].(*redactedError); ok { //nolint:errorlint // enter only the current package wrapper
-		if remaining < maxErrNodes {
-			return errorSpan{}, 0, true
-		}
-		snapshot := snapshots.inspect(wrapper)
-		read := len(snapshot.tree.nodes)
-		return errorSpan{tree: &snapshot.tree, end: min(1, read)}, read, snapshot.unsafe
+// children returns the child span and whether traversal must stop, charging each wrapper tree once.
+func (charge *classificationCharge) children(slot errorSlot) (errorSpan, bool) {
+	wrapper, ok := slot.tree.nodes[slot.index].(*redactedError) //nolint:errorlint // enter only the current package wrapper
+	if !ok {
+		return slot.children(), false
 	}
-	return slot.children(), 0, false
+	snapshot := charge.charged[wrapper]
+	if snapshot == nil {
+		if maxWalkSteps-charge.reads < maxErrNodes {
+			return errorSpan{}, true
+		}
+		snapshot = charge.snapshots.inspect(wrapper)
+		charge.reads += len(snapshot.tree.nodes)
+		if charge.charged == nil {
+			charge.charged = make(map[*redactedError]*classificationSnapshot)
+		}
+		charge.charged[wrapper] = snapshot
+	}
+	return errorSpan{tree: &snapshot.tree, end: min(1, len(snapshot.tree.nodes))}, snapshot.unsafe
 }
 
 // classifyNode returns the traversal action and classification for a single node.
@@ -685,7 +707,8 @@ func isNilError(err error) bool {
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
 // It preserves nil causes, replaces an unsafe cause with a fixed opaque error, and suppresses classification when the parent tree is unsafe.
 // For a safe immediate cause implementing Timeout or Temporary, both classifications share the cause inspection and the snapshots of same-key wrappers it enters.
-// One classification counts every node it reads (the cause tree and each same-key wrapper tree it enters) once against 4096; entering a same-key wrapper with fewer than 64 left → false.
+// The once-only read covers the copy's classification snapshot; the errors.As search that selects the URL error reads the cause separately.
+// Each classification charges the cause tree and each same-key wrapper tree once against 4096 nodes. A wrapper needs 64 nodes left before its first charge.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
 	if !ok {
@@ -753,13 +776,15 @@ func (e *classifiedURLCause) Temporary() bool { return e.temporary }
 
 // newClassifiedURLCause captures both results from shared snapshots under a synthetic URL root.
 func newClassifiedURLCause(cause opaqueURLCause, tree errorTree) *classifiedURLCause {
-	tree = tree.withURLRoot()
 	// Why: both passes visit prefixes of the same depth-first order, so the pop bound also bounds the shared cache.
 	var snapshots classificationSnapshots
+	// Why: each pass gets a copy of the starting charge with its own initially empty set.
+	charge := classificationCharge{snapshots: &snapshots, reads: len(tree.nodes)}
+	tree = tree.withURLRoot()
 	return &classifiedURLCause{
 		opaqueURLCause: cause,
-		timeout:        classifyTree(tree, cause.hidden.key, &snapshots, hiddenTimeoutClassifier.Timeout),
-		temporary:      classifyTree(tree, cause.hidden.key, &snapshots, hiddenTemporaryClassifier.Temporary),
+		timeout:        classifyTree(tree, cause.hidden.key, charge, hiddenTimeoutClassifier.Timeout),
+		temporary:      classifyTree(tree, cause.hidden.key, charge, hiddenTemporaryClassifier.Temporary),
 	}
 }
 
@@ -798,7 +823,7 @@ func foreignRedaction(node error) bool {
 // maxErrNodes bounds each error tree inspection and the joined-error budget in walk.
 const maxErrNodes = 64
 
-// maxWalkSteps bounds node visits and pre-check reads in identity search, and node reads in classification.
+// maxWalkSteps bounds node visits and pre-check reads in identity search, and dispatches and node reads in classification.
 const maxWalkSteps = 4096
 
 // redactedTreeMsg is the replacement message when an error tree exceeds maxErrNodes.
