@@ -152,13 +152,22 @@ package example
 
 // TestRedact checks that redactError(nil) returns nil.
 func TestRedact(t *testing.T) {
-	c.redactError(nil)
-	t.Log("escaped quote: \" // still a string", '"', '\'')
+	t.Log("// escaped quote: \" still a string", c.redactError(nil))
+	t.Log('"', '\'', carriesKey(nil))
 	// Check that carriesKey(nil) returns false.
-	carriesKey(nil)
 }
 GO
 expect_pass escaped_literals "${SUT[@]}" "$WORK/escaped_literals"
+
+track_fixture escaped_rune_refusal escaped_rune_refusal_test.go <<'GO'
+package example
+
+// TestRedact checks that redactError(nil) returns nil.
+func TestRedact(t *testing.T) {
+	t.Log("escaped quote: \" redactError(nil)")
+}
+GO
+expect_refusal escaped_rune_refusal 'escaped_rune_refusal_test.go:3: comment claims redactError(' "${SUT[@]}" "$WORK/escaped_rune_refusal"
 
 track_fixture block_comment block_comment_test.go <<'GO'
 package example
