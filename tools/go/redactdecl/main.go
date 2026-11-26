@@ -12,6 +12,7 @@ import (
 	"os"
 )
 
+// main runs the declaration check on the file arguments and exits with a nonzero status on error.
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
 		log.New(os.Stderr, "redactdecl: ", 0).Fatal(err)
