@@ -2031,10 +2031,34 @@ func TestDecodeLayerChargesRetainedStorage(t *testing.T) {
 // TestSpellingScanWorkBound checks an adversarial shared prefix and ordinary body spellings.
 func TestSpellingScanWorkBound(t *testing.T) {
 	t.Parallel()
-	longKey := &Client{apiKey: strings.Repeat("a", 4095) + "b"}
-	text := "%" + strings.Repeat("a", 1<<20)
-	if !answerWithinTwoSeconds(t, "matchesKeySpelling", func() bool { return longKey.matchesKeySpelling(text) }) {
-		t.Error("exhausted comparison budget did not hide the field")
+	// Why: the leading percent costs one comparison, then each of the N-K remaining starts costs K.
+	cases := []struct {
+		name      string
+		textLen   int
+		keyLen    int
+		want      bool
+		guardHang bool
+	}{
+		{name: "below budget", textLen: 88, keyLen: 9, want: false},                  // Why: 712 comparisons leave one of 713.
+		{name: "at budget", textLen: 89, keyLen: 9, want: true},                      // Why: 721 comparisons exhaust all 721.
+		{name: "long key", textLen: 9000, keyLen: 4096, want: true, guardHang: true}, // Why: 20086785 comparisons would exceed 76096.
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			client := &Client{apiKey: strings.Repeat("a", tc.keyLen-1) + "b"}
+			text := "%" + strings.Repeat("a", tc.textLen-1)
+			scan := func() bool { return client.matchesKeySpelling(text) }
+			var got bool
+			if tc.guardHang {
+				got = answerWithinTwoSeconds(subtest, "matchesKeySpelling", scan)
+			} else {
+				got = scan()
+			}
+			if got != tc.want {
+				subtest.Errorf("matchesKeySpelling with text length %d and key length %d = %t, want %t", tc.textLen, tc.keyLen, got, tc.want)
+			}
+		})
 	}
 	const word = "fixture"
 	key := strings.Repeat(word, 4) + "body"
