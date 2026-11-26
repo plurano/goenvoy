@@ -414,14 +414,16 @@ func TestCanonicalKeyProjection(t *testing.T) {
 func TestDecodeProjectionByteBudget(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key42"
-	// Why: 13 distinct projections total 187 bytes, plus 13 bytes per suffix byte.
-	const input = `%61 %255cu0061 \\u002561`
+	// Why: nine projections retain 171 parent bytes, plus nine bytes per suffix byte.
+	const input = `%61 \\u002561 %5cu0061`
 	const ordinary = `%61\u0062`
+	under := input + strings.Repeat("x", 4)
+	exact := under + "x"
 	c := &Client{apiKey: key}
 	for _, tc := range []struct{ name, text, want string }{
-		{"under budget", input, input},
-		{"exact budget", input + "x", input + "x"},
-		{"over budget", input + "xx", "REDACTED"},
+		{"under budget", under, under},
+		{"exact budget", exact, exact},
+		{"over budget", exact + "x", "REDACTED"},
 		{"ordinary mixed escapes", key + " " + ordinary, "REDACTED " + ordinary},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -590,9 +592,9 @@ func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 		{"timeout only", timeoutOnly},
 		{"temporary only", temporaryOnly},
 		{"nil", nil},
-		{"redacted cause", &redactedError{err: timeout, msg: "fixture hidden cause"}},
-		{"different classifier nodes", &redactedError{err: errors.Join(timeoutOnly, temporaryOnly)}},
-		{"nested URL commits to its cause", &redactedError{err: errors.Join(&url.Error{Err: timeoutOnly}, temporaryOnly)}},
+		{"redacted cause", &redactedError{err: timeout, msg: "fixture hidden cause", key: key}},
+		{"different classifier nodes", &redactedError{err: errors.Join(timeoutOnly, temporaryOnly), key: key}},
+		{"nested URL commits to its cause", &redactedError{err: errors.Join(&url.Error{Err: timeoutOnly}, temporaryOnly), key: key}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -600,18 +602,18 @@ func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 			original := &url.Error{Op: "Get", URL: "http://fixture.invalid/" + key, Err: tc.cause}
 			t.Run("As", func(t *testing.T) {
 				t.Parallel()
-				assertURLCopyClassifies(t, c.scrubError(errors.Join(original)), original, sentinel)
+				assertURLCopyClassifies(t, c.scrubError(errors.Join(original)), original, sentinel, key)
 			})
 			t.Run("redactError", func(t *testing.T) {
 				t.Parallel()
-				assertURLCopyClassifies(t, c.redactError(original), original, sentinel)
+				assertURLCopyClassifies(t, c.redactError(original), original, sentinel, key)
 			})
 		})
 	}
 }
 
 // assertURLCopyClassifies checks classification and sentinel identity through a sanitized copy.
-func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, sentinel error) {
+func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, sentinel error, key string) {
 	t.Helper()
 	var copyErr *url.Error
 	if !errors.As(got, &copyErr) || copyErr == original {
@@ -625,7 +627,7 @@ func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, senti
 		t.Error("errors.Is through the copy did not reach the sentinel")
 	}
 	fallback := &net.DNSError{IsTimeout: true, IsTemporary: true}
-	nested := &redactedError{err: errors.Join(copyErr, fallback)}
+	nested := &redactedError{err: errors.Join(copyErr, fallback), key: key}
 	if want := original.Timeout(); copyErr.Timeout() != want || nested.Timeout() != want {
 		t.Errorf("Timeout: copy=%v nested=%v original=%v", copyErr.Timeout(), nested.Timeout(), want)
 	}
@@ -1627,5 +1629,231 @@ func TestRedactedErrorIsNestedWrapper(t *testing.T) {
 				t.Error("errors.Is matched a different wrapper with the same contents")
 			}
 		})
+	}
+}
+
+// TestUnsafeTreeClassifications covers a classifier above a typed-nil descendant.
+func TestUnsafeTreeClassifications(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	var dns *net.DNSError
+	original := &url.Error{Op: "Get", URL: "http://h/?apikey=" + key, Err: &net.OpError{Op: "dial", Err: dns}}
+	tree := &net.OpError{Op: "read", Err: original}
+	c := &Client{apiKey: key}
+	for name, apply := range map[string]func(error) error{"redactError": c.redactError, "scrubError": c.scrubError} {
+		t.Run(name, func(subtest *testing.T) {
+			subtest.Parallel()
+			defer func() {
+				if recover() != nil {
+					subtest.Error("classification panicked on an unsafe tree")
+				}
+			}()
+			got, ok := apply(tree).(*redactedError) //nolint:errorlint // require the wrapper itself
+			if !ok {
+				subtest.Fatal("expected an opaque wrapper")
+			}
+			assertURLCauseViews(subtest, got, original, false)
+			var classifier interface{ Timeout() bool }
+			if got.As(&classifier) {
+				subtest.Error("As exposed a hidden timeout classifier")
+			}
+		})
+	}
+}
+
+type redactCountingTimeout struct{ calls int }
+
+// Error returns a fixed fixture message.
+func (*redactCountingTimeout) Error() string { return "fixture timeout" }
+
+// Timeout counts classification calls and reports a timeout.
+func (e *redactCountingTimeout) Timeout() bool {
+	e.calls++
+	return true
+}
+
+// TestOwnedURLCauseClassification checks that classification stops at package-owned URL causes.
+func TestOwnedURLCauseClassification(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	c := &Client{apiKey: key}
+	for name, want := range map[string]bool{"opaque": false, "classified": true} {
+		t.Run(name, func(subtest *testing.T) {
+			subtest.Parallel()
+			counted := &redactCountingTimeout{}
+			opaque := opaqueURLCause{hidden: &redactedError{msg: key, key: key, err: counted}}
+			var root error = &opaque
+			if want {
+				root = &classifiedURLCause{opaqueURLCause: opaque, timeout: true}
+			}
+			assertOwnedURLCauseClassification(subtest, c.scrubError(root), counted, want)
+		})
+	}
+}
+
+// assertOwnedURLCauseClassification checks captured classification and hidden identity.
+func assertOwnedURLCauseClassification(t *testing.T, result error, counted *redactCountingTimeout, want bool) {
+	t.Helper()
+	got, ok := result.(*redactedError) //nolint:errorlint // require the wrapper itself
+	if !ok {
+		t.Fatal("scrubError did not wrap the key-bearing cause")
+	}
+	if got.Timeout() != want || got.Temporary() {
+		t.Error("unexpected classification of package-owned cause")
+	}
+	if counted.calls != 0 {
+		t.Error("classification called the hidden cause")
+	}
+	if !errors.Is(got, counted) {
+		t.Error("errors.Is did not reach the hidden cause")
+	}
+}
+
+// TestURLNilCauseIsSafe checks the root and wrapper views of a URL error with no cause.
+func TestURLNilCauseIsSafe(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	root := &url.Error{Op: "Get", URL: "http://h/?apikey=" + key}
+	c := &Client{apiKey: key}
+	for name, apply := range map[string]func(error) error{"redactError": c.redactError, "scrubError": c.scrubError} {
+		t.Run(name, func(subtest *testing.T) {
+			subtest.Parallel()
+			got := apply(root)
+			assertNoKeyForms(subtest, got.Error(), key)
+			var copied *url.Error
+			if !errors.As(got, &copied) || copied == nil || copied == root || copied.Err != nil {
+				subtest.Fatal("expected a sanitized URL error copy with a nil cause")
+			}
+			assertNoKeyForms(subtest, copied.Error(), key)
+			assertURLClassifications(subtest, got, copied, false)
+		})
+	}
+}
+
+// TestForeignRedactionRemainsOpaque checks that a wrapper cannot recover a URL using a different key.
+func TestForeignRedactionRemainsOpaque(t *testing.T) {
+	t.Parallel()
+	const first, second = "cedar", "maple"
+	inner := &url.Error{
+		Op: first + second, URL: "https://example.invalid/" + second + "?apikey=" + first,
+		Err: &net.DNSError{Err: first + second, IsTimeout: true},
+	}
+	foreign := (&Client{apiKey: first}).scrubError(&redactCycleErr{text: "fixture outer", next: inner})
+	c := &Client{apiKey: second}
+	for name, apply := range map[string]func(error) error{"redactError": c.redactError, "scrubError": c.scrubError} {
+		t.Run(name, func(subtest *testing.T) {
+			subtest.Parallel()
+			assertForeignRedactionOpaque(subtest, apply(foreign), inner.Err, first, second)
+		})
+	}
+}
+
+// assertForeignRedactionOpaque checks that a foreign wrapper exposes only sanitized output and identity.
+func assertForeignRedactionOpaque(t *testing.T, got, target error, first, second string) {
+	t.Helper()
+	for _, output := range []string{got.Error(), fmt.Sprintf("%v", got), fmt.Sprintf("%+v", got), fmt.Sprintf("%#v", got)} {
+		if strings.Contains(output, first) || strings.Contains(output, second) {
+			t.Error("formatted error revealed a key")
+		}
+	}
+	var copied *url.Error
+	if errors.As(got, &copied) || copied != nil {
+		t.Error("errors.As recovered a URL across the foreign-key boundary")
+	}
+	var classifier interface{ Timeout() bool }
+	if !errors.As(got, &classifier) || classifier.Timeout() {
+		t.Error("classification crossed the foreign-key boundary")
+	}
+	if !errors.Is(got, target) {
+		t.Error("errors.Is did not preserve hidden identity")
+	}
+}
+
+// TestSpellingUsesASCIIHex checks control bytes, digit case, and the entire first-digit alphabet.
+func TestSpellingUsesASCIIHex(t *testing.T) {
+	t.Parallel()
+	const key, letterKey = "AB", "JB"
+	c, letters := &Client{apiKey: key}, &Client{apiKey: letterKey}
+	suffix := key[1:]
+	controls := string([]byte{0x14, 0x11})
+	for _, tc := range []struct {
+		text string
+		want bool
+	}{
+		{"%" + controls + suffix, false},
+		{fmt.Sprintf("%%%02x%s", key[0], suffix), true},
+		{fmt.Sprintf("%%%02x%s", strings.ToLower(key)[0], suffix), false},
+	} {
+		if c.matchesKeySpelling(tc.text) != tc.want {
+			t.Error("unexpected ASCII digit or control-byte match")
+		}
+	}
+	for _, format := range []string{"%%%02x%s", "%%%02X%s"} {
+		if !letters.matchesKeySpelling(fmt.Sprintf(format, letterKey[0], letterKey[1:])) {
+			t.Error("hex letter case did not match")
+		}
+	}
+	for _, keyByte := range []byte{key[0], 0xaf} {
+		assertASCIIHexAlphabet(t, keyByte)
+	}
+}
+
+// assertASCIIHexAlphabet checks every possible first byte of a hex spelling.
+func assertASCIIHexAlphabet(t *testing.T, keyByte byte) {
+	t.Helper()
+	digits := fmt.Sprintf("%02x", keyByte)
+	upper := strings.ToUpper(digits)
+	for first := range 256 {
+		text := string([]byte{byte(first & 0xff), digits[1]})
+		want := first == int(digits[0]) || first == int(upper[0])
+		if matchesHexByte(text, keyByte) != want {
+			t.Errorf("unexpected hex match for first byte %#02x", first)
+		}
+	}
+}
+
+// TestDecodeLayerChargesRetainedStorage checks the first layer of the exact-budget fixture.
+func TestDecodeLayerChargesRetainedStorage(t *testing.T) {
+	t.Parallel()
+	const input = `%61 %255cu0061 \\u002561` + "x"
+	c := &Client{apiKey: "fixture-key42"}
+	const exact = 3 * uint64(len(input))
+	for _, tc := range []struct {
+		name   string
+		budget uint64
+		redact bool
+	}{
+		{"exact storage", exact, false},
+		{"one byte short", exact - 1, true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			remaining := tc.budget
+			next, redact := c.decodeLayer([]string{input}, map[string]struct{}{input: {}}, &remaining)
+			if redact != tc.redact {
+				subtest.Errorf("redact = %t, want %t", redact, tc.redact)
+			}
+			if !tc.redact && (len(next) != 3 || remaining != 0) {
+				subtest.Errorf("retained %d projections with %d bytes uncharged", len(next), remaining)
+			}
+		})
+	}
+}
+
+// TestSpellingScanWorkBound checks an adversarial shared prefix and ordinary body spellings.
+func TestSpellingScanWorkBound(t *testing.T) {
+	t.Parallel()
+	longKey := &Client{apiKey: strings.Repeat("a", 4095) + "b"}
+	text := "%" + strings.Repeat("a", 1<<20)
+	if !answerWithinTwoSeconds(t, "matchesKeySpelling", func() bool { return longKey.matchesKeySpelling(text) }) {
+		t.Error("exhausted comparison budget did not hide the field")
+	}
+	const word = "fixture"
+	key := strings.Repeat(word, 4) + "body"
+	c := &Client{apiKey: key}
+	const body = `{"status":"fixture body","url":"/api?query=%20"}`
+	escaped := fmt.Sprintf("%%%02x%s", key[0], key[1:])
+	if c.matchesKeySpelling(body) || !c.matchesKeySpelling(body+escaped) {
+		t.Error("unexpected spelling scan result for an ordinary body")
 	}
 }

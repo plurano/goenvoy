@@ -17,13 +17,20 @@ API key passed as `apikey` query parameter.
 - URL copies from root and `errors.As` -> redact `apikey` query, then replace literal keys and check escaped forms. Unparseable URL or query -> drop query.
 - URL copy cause -> keep nil. Typed-nil or unsafe cause -> fixed opaque error with no classification. Safe cause -> scrubbed message.
 - `APIError.Status` + `APIError.Body` on non-2xx. Literal key -> inline `REDACTED`.
-- Decode percent-only, backslash-only, and mixed projections. Match literal, percent, and backslash-u spellings per key byte at each offset.
-- Key match, >16 new texts per layer, new text at layer 4, or retained projection bytes >8x input -> whole field `REDACTED`.
+- Decode percent-only, backslash-only, and mixed projections.
+- Match literal, percent, and backslash-u spellings per key byte. Hex digits -> ASCII only.
+- Spelling comparison limit -> `maxSpellingStepsFactor` (8) × text bytes plus key bytes.
+- Key match or spelling comparison limit -> whole field `REDACTED`.
+- More than 16 new projections per layer, new projection at layer 4, or retained storage above 8× input -> whole field `REDACTED`.
+- Retained projection storage -> charge parent length, matching builder growth.
 - Decode + request errors -> breadth-first walk, 64 nodes, single or joined `Unwrap`. Overflow or typed-nil node -> fixed message.
 - Key in `Error` text, direct `*url.Error` fields, or reflected leaves -> opaque wrapper, scrubbed message.
 - Reflection -> up to 1024 values per error node, start pointer only. Overflow or nested `fmt.Formatter` / `fmt.GoStringer` -> opaque wrapper.
 - Custom `fmt.Formatter`, `fmt.GoStringer`, or `As` method on error node -> opaque wrapper.
-- Opaque `errors.Is`, `Timeout`, and `Temporary` -> depth-first walk, 64 joined errors and 4096 nodes. Nested wrappers share `errors.Is` budget.
+- Wrapper with another captured key -> opaque boundary for classification and URL recovery.
+- Opaque identity and classification walks -> depth-first, 64 joined errors and 4096 nodes. Nested wrappers share `errors.Is` budget.
+- Unsafe tree -> `Timeout` and `Temporary` false on wrapper and URL copy.
+- Package-owned URL causes end classification -> opaque cause false, classified cause captured values.
 - Safe immediate URL cause implements `Timeout` or `Temporary` -> capture both answers in one walk.
 - Opaque `errors.As` -> copy first non-nil `*url.Error` within 64 breadth-first nodes, same cause handling as root.
 - Contract limits:

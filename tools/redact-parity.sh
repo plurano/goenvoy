@@ -12,7 +12,7 @@ from itertools import zip_longest
 from pathlib import Path
 
 
-PACKAGE = re.compile(rb"^[ \t]*package[ \t]+")
+PACKAGE = re.compile(rb"^([ \t]*)package[ \t]+[A-Za-z_\x80-\xff][A-Za-z_0-9\x80-\xff]*")
 WRAPPER = re.compile(rb"\bredactedError\b")
 EXCEPTIONS = {
     Path("downloadclient/sabnzbd/redact.go"): "Separate legacy redaction implementation.",
@@ -29,11 +29,12 @@ def read_source(path):
 
 
 def without_package(path, lines):
-    """Drop the package clause and preserve the original line numbers."""
-    index = next((i for i, (_, line) in enumerate(lines) if PACKAGE.match(line)), None)
-    if index is None:
-        raise ValueError(f"{path}:1: missing package clause")
-    return lines[:index] + lines[index + 1:]
+    """Remove the package clause tokens and preserve their line's other bytes."""
+    for index, (number, line) in enumerate(lines):
+        stripped, count = PACKAGE.subn(rb"\1", line, count=1)
+        if count:
+            return lines[:index] + [(number, stripped)] + lines[index + 1:]
+    raise ValueError(f"{path}:1: missing package clause")
 
 
 def compare(reference, baseline, candidate):

@@ -45,8 +45,11 @@ const maxDecodePasses = 4
 // maxDecodeProjections bounds the distinct new texts at each layer.
 const maxDecodeProjections = 16
 
-// maxDecodeBytesFactor bounds retained projection bytes relative to the input size.
+// maxDecodeBytesFactor bounds retained projection storage relative to the input size.
 const maxDecodeBytesFactor = 8
+
+// maxSpellingStepsFactor bounds spelling comparisons per input byte, plus one step per key byte.
+const maxSpellingStepsFactor = 8
 
 type escapeKinds uint8
 
@@ -80,7 +83,7 @@ func (c *Client) containsKey(text string) bool {
 	return len(frontier) != 0
 }
 
-// matchesKeySpelling checks every possible start for literal or single-layer key bytes.
+// matchesKeySpelling checks literal and single-layer key spellings and reports budget exhaustion as a match.
 func (c *Client) matchesKeySpelling(text string) bool {
 	key := c.apiKey
 	if strings.Contains(text, key) {
@@ -89,20 +92,22 @@ func (c *Client) matchesKeySpelling(text string) bool {
 	if !strings.ContainsAny(text, `%\`) {
 		return false
 	}
+	remaining := uint64(len(text))*maxSpellingStepsFactor + uint64(len(key))
 	for start := 0; start <= len(text)-len(key); start++ {
-		if matchesKeyAt(text[start:], key) {
+		if matchesKeyAt(text[start:], key, &remaining) || remaining == 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// matchesKeyAt checks whether the key starts at the first byte of text.
-func matchesKeyAt(text, key string) bool {
+// matchesKeyAt checks whether the key starts at the first byte of text within the shared budget.
+func matchesKeyAt(text, key string, remaining *uint64) bool {
 	for i := range len(key) {
-		if len(text) < len(key)-i {
+		if len(text) < len(key)-i || *remaining == 0 {
 			return false
 		}
+		*remaining--
 		size := keyByteSpellingLen(text, key[i])
 		if size == 0 {
 			return false
@@ -132,7 +137,15 @@ func keyByteSpellingLen(text string, want byte) int {
 // matchesHexByte compares a pair of hex digits to a byte without allocating.
 func matchesHexByte(text string, want byte) bool {
 	const digits = "0123456789abcdef"
-	return text[0]|0x20 == digits[want>>4] && text[1]|0x20 == digits[want&0xf]
+	return matchesHexDigit(text[0], digits[want>>4]) && matchesHexDigit(text[1], digits[want&0xf])
+}
+
+// matchesHexDigit compares an ASCII hex byte to a lowercase hex digit.
+func matchesHexDigit(got, want byte) bool {
+	if got >= 'A' && got <= 'F' {
+		got += 'a' - 'A'
+	}
+	return got == want
 }
 
 // decodeLayer collects unseen projections and reports a key match or exceeded budget.
@@ -145,7 +158,8 @@ func (c *Client) decodeLayer(frontier []string, seen map[string]struct{}, remain
 			if _, visited := seen[decoded]; visited {
 				continue
 			}
-			size := uint64(len(decoded))
+			// Why: the retained string shares the builder grown to the parent length.
+			size := uint64(len(text))
 			if size > *remainingBytes || len(next) == maxDecodeProjections || c.matchesKeySpelling(decoded) {
 				return nil, true
 			}
@@ -243,7 +257,8 @@ type redactedError struct {
 	// Why: no Unwrap method, so callers cannot reach text that holds the key.
 	err error
 	// Why: As uses the original key even if the client is replaced.
-	key string
+	key    string
+	unsafe bool
 }
 
 // Error returns the sanitized message.
@@ -263,12 +278,12 @@ func (e *redactedError) Is(target error) bool {
 	})
 }
 
-// Timeout reports whether the underlying error timed out.
+// Timeout reports whether the underlying error timed out and returns false for unsafe trees.
 func (e *redactedError) Timeout() bool {
 	return classifyHiddenError(e, hiddenTimeoutClassifier.Timeout)
 }
 
-// Temporary reports whether the hidden error is temporary.
+// Temporary reports whether the hidden error is temporary and returns false for unsafe trees.
 func (e *redactedError) Temporary() bool {
 	return classifyHiddenError(e, hiddenTemporaryClassifier.Temporary)
 }
@@ -279,40 +294,46 @@ type (
 	hiddenTemporaryClassifier = interface{ Temporary() bool }
 )
 
-// classifyHiddenError reports the first applicable classification within the walk budget.
+// classifyHiddenError reports the first applicable classification within the walk budget for a safe tree.
 func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
+	if e.unsafe {
+		return false
+	}
 	reported := false
 	e.walk(nil, func(node error) walkAction {
-		if unsafeURLCause(node) {
-			return walkStop
-		}
 		var action walkAction
-		action, reported = classifyNode(node, classify)
+		action, reported = classifyNode(node, e.key, classify)
 		return action
 	})
 	return reported
 }
 
-// unsafeURLCause reports whether a URL error's immediate cause is unsafe to classify.
-func unsafeURLCause(node error) bool {
-	uerr, ok := node.(*url.Error) //nolint:errorlint // classify only the current URL error
-	if !ok {
-		return false
-	}
-	_, unsafe := inspectErrorTree(uerr.Err)
-	return unsafe
-}
-
 // classifyNode returns the traversal action and classification for a single node.
-func classifyNode[T any](node error, classify func(T) bool) (walkAction, bool) {
-	if uerr, ok := node.(*url.Error); ok { //nolint:errorlint // a URL error classifies its immediate cause
+func classifyNode[T any](node error, key string, classify func(T) bool) (walkAction, bool) {
+	if hidden := hiddenRedaction(node); hidden != nil && (hidden.unsafe || hidden.key != key) {
+		return walkStop, false
+	}
+	switch cause := node.(type) { //nolint:errorlint // classify only the current node
+	case *redactedError:
+		return walkDescend, false
+	case *opaqueURLCause:
+		return walkStop, false
+	case *classifiedURLCause:
+		classifier, ok := node.(T)
+		return walkStop, ok && classify(classifier)
+	case *url.Error:
 		// Why: schedule the immediate cause so nested URL errors share the walk budget.
-		_, classifies := uerr.Err.(T)
+		_, classifies := cause.Err.(T)
 		if classifies {
 			return walkCauseOnly, false
 		}
 		return walkStop, false
 	}
+	return classifyExternalNode(node, classify)
+}
+
+// classifyExternalNode checks the classifier and As methods of an external node.
+func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction, bool) {
 	classifier, ok := node.(T)
 	if !ok {
 		as, hasAs := node.(interface{ As(any) bool })
@@ -376,13 +397,10 @@ func appendWalkChildren(stack [][]error, node error, joined interface{ Unwrap() 
 	return stack
 }
 
-// visitWalkNode checks identity before skipping method calls on nested redacted errors.
+// visitWalkNode checks identity before applying the visitor.
 func visitWalkNode(node, target error, visit func(error) walkAction) walkAction {
 	if target != nil && node == target { //nolint:errorlint // compare this node without starting another traversal
 		return walkStop
-	}
-	if _, hidden := node.(*redactedError); hidden { //nolint:errorlint // only this node is tested
-		return walkDescend
 	}
 	return visit(node)
 }
@@ -454,7 +472,7 @@ func isNilValue(value any) bool {
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
 // It preserves nil causes and replaces typed-nil or unsafe causes with a fixed, unclassified error.
-// If a safe immediate cause implements Timeout or Temporary, the copy captures both classifications
+// If the tree is safe and the immediate cause implements Timeout or Temporary, the copy captures both classifications
 // in one walk of up to 4096 nodes and 64 joined errors.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
@@ -467,9 +485,13 @@ func (e *redactedError) As(target any) bool {
 		if uerr, ok := queue[i].(*url.Error); ok && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
 			// Why: hand out a scrubbed copy, never the original that holds the key.
 			c := Client{apiKey: e.key}
-			*dst = &url.Error{Op: c.scrubText(uerr.Op), URL: c.scrubText(redactURL(uerr.URL)), Err: c.hideCause(uerr.Err)}
+			*dst = &url.Error{
+				Op: c.scrubText(uerr.Op), URL: c.scrubText(redactURL(uerr.URL)),
+				Err: c.hideURLCause(uerr.Err, e.unsafe),
+			}
 			return true
 		}
+		// Why: package wrappers expose no Unwrap, so URL recovery cannot cross into their hidden tree.
 		queue = appendWrapped(queue, queue[i])
 	}
 	return false
@@ -512,16 +534,16 @@ func (e *classifiedURLCause) Temporary() bool { return e.temporary }
 // newClassifiedURLCause captures both classifications in one URL-aware walk.
 func newClassifiedURLCause(cause opaqueURLCause) *classifiedURLCause {
 	copyCause := &classifiedURLCause{opaqueURLCause: cause}
-	probe := &redactedError{err: &url.Error{Err: cause.hidden.err}}
+	probe := &redactedError{err: &url.Error{Err: cause.hidden.err}, key: cause.hidden.key}
 	timeoutDone, temporaryDone := false, false
 	probe.walk(nil, func(node error) walkAction {
 		timeoutAction, temporaryAction := walkDescend, walkDescend
 		if !timeoutDone {
-			timeoutAction, copyCause.timeout = classifyNode(node, hiddenTimeoutClassifier.Timeout)
+			timeoutAction, copyCause.timeout = classifyNode(node, probe.key, hiddenTimeoutClassifier.Timeout)
 			timeoutDone = timeoutAction == walkStop
 		}
 		if !temporaryDone {
-			temporaryAction, copyCause.temporary = classifyNode(node, hiddenTemporaryClassifier.Temporary)
+			temporaryAction, copyCause.temporary = classifyNode(node, probe.key, hiddenTemporaryClassifier.Temporary)
 			temporaryDone = temporaryAction == walkStop
 		}
 		switch {
@@ -561,29 +583,39 @@ const redactedTreeMsg = "error tree too large: details redacted"
 
 // scrubError hides error trees that carry the API key, contain custom formatting or As, or exceed the traversal limit.
 func (c *Client) scrubError(err error) error {
-	carry, tooLarge := c.checkErrorTree(err)
+	carry, unsafe := c.checkErrorTree(err)
 	if !carry {
 		return err
 	}
-	if tooLarge {
-		return &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
+	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey, unsafe: unsafe}
+	if !unsafe {
+		hidden.msg = c.scrubText(err.Error())
 	}
-	return &redactedError{msg: c.scrubText(err.Error()), err: err, key: c.apiKey}
+	return hidden
 }
 
 // hideCause keeps nil causes and replaces typed-nil or unsafe causes with a fixed, unclassified error.
 // It scrubs safe causes and captures their classifications when applicable.
 func (c *Client) hideCause(err error) error {
+	return c.hideURLCause(err, false)
+}
+
+// hideURLCause sanitizes the cause and suppresses classification for unsafe trees.
+func (c *Client) hideURLCause(err error, unsafeParent bool) error {
 	if err == nil {
 		return nil
 	}
-	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
+	_, unsafe := inspectErrorTree(err)
+	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey, unsafe: unsafe || unsafeParent}
 	cause := opaqueURLCause{hidden: hidden}
-	if _, unsafe := inspectErrorTree(err); unsafe {
+	if unsafe {
 		// Why: retain bounded identity matching without exposing a live classifier.
 		return &cause
 	}
 	hidden.msg = c.scrubText(err.Error())
+	if hidden.unsafe {
+		return &cause
+	}
 	_, timesOut := err.(hiddenTimeoutClassifier)
 	_, temporary := err.(hiddenTemporaryClassifier)
 	if timesOut || temporary {
@@ -604,7 +636,7 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 	if unsafe {
 		return true, true
 	}
-	if slices.ContainsFunc(queue, hasCustomFormattingOrAs) {
+	if slices.ContainsFunc(queue, c.hasCustomFormattingOrAs) {
 		return true, false
 	}
 	for _, node := range queue {
@@ -635,10 +667,10 @@ func inspectErrorTree(err error) ([]error, bool) {
 	return queue, false
 }
 
-// hasCustomFormattingOrAs reports whether an external node controls formatting or errors.As.
-func hasCustomFormattingOrAs(node error) bool {
-	if hiddenRedaction(node) != nil {
-		return false
+// hasCustomFormattingOrAs reports whether a node outside the current key's wrappers controls formatting or errors.As.
+func (c *Client) hasCustomFormattingOrAs(node error) bool {
+	if hidden := hiddenRedaction(node); hidden != nil {
+		return hidden.key != c.apiKey
 	}
 	_, formats := node.(fmt.Formatter)
 	_, goStrings := node.(fmt.GoStringer)

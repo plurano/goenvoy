@@ -56,6 +56,15 @@ fi
 printf 'package beta\n\ntype redactedError struct{ key string }\n' >second/redact.go
 expect_refusal 'implementation drift' 'second/redact.go:3: differs' "${SUT[@]}"
 
+printf 'package mylar; var extra = 1\n\n%s\n' "$shared_source" >second/redact.go
+inline_rc=0
+inline_output="$("${SUT[@]}" 2>&1)" || inline_rc=$?
+if [[ $inline_rc -ne 1 || $inline_output != *'second/redact.go:1: differs'* ]]; then
+  printf 'FAIL inline package declaration drift: checker rc=%d\n%s\n' "$inline_rc" "$inline_output" >&2
+  exit 1
+fi
+echo "ok   inline package declaration drift: refused (checker rc=$inline_rc)"
+
 printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
 printf 'package beta\n\n// Traversal tests.' >second/redact_as_internal_test.go
 expect_refusal 'test drift at the final newline' 'second/redact_as_internal_test.go:3: differs' "${SUT[@]}"

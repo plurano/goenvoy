@@ -4,16 +4,23 @@
 // a Newznab-compatible search API plus statistics and history endpoints.
 // Authentication uses an API key passed as a query parameter.
 //
-// Key detection matches literal, percent, and backslash-u spellings per key byte at each offset.
-// Percent-only, backslash-only, and mixed projections use the same matcher.
-// Redaction triggers on key match, more than 16 new projections per layer,
-// new projection at layer four, or retained projection bytes above 8x input size.
+// Key matching → literal, percent, and backslash-u spellings per byte.
+// Hex digits → ASCII only.
+// Escape decoding → percent-only, backslash-only, and mixed projections.
+// Spelling comparison limit → maxSpellingStepsFactor (8) × text bytes plus key bytes.
+// Key match or spelling comparison limit → whole-field redaction.
+// More than 16 new projections per layer, new projection at layer four,
+// or retained storage above 8× input → whole-field redaction.
+// Retained projection storage → charge parent length, matching builder growth.
 // Error redaction scans up to 64 nodes for structural inspection and URL recovery.
 // Key in Error text, direct URL error fields, or reflected leaves → opaque wrapper.
 // Reflection checks up to 1024 values per node and follows only the start pointer.
 // Overflow or a nested fmt.Formatter or fmt.GoStringer → opaque wrapper.
 // Custom formatting or As on an error node → opaque wrapper.
+// Wrapper with another captured key → opaque boundary for classification and URL recovery.
 // Forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
+// Unsafe tree → Timeout and Temporary false on wrapper and URL copy.
+// Package-owned URL causes end classification → opaque cause false, classified cause captured values.
 // Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.
 // URL copies keep nil causes. Typed-nil or unsafe causes become fixed opaque errors without classification.
 // Safe immediate cause implements Timeout or Temporary → both classifications captured in one walk.
