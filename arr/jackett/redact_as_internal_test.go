@@ -1003,8 +1003,9 @@ func TestRedactedErrorAsOpRedaction(t *testing.T) {
 // TestRedactedErrorAsEscapedURL checks that a joined URL error exposes a sanitized URL.
 func TestRedactedErrorAsEscapedURL(t *testing.T) {
 	t.Parallel()
-	c := &Client{apiKey: "fixture"}
-	inner := &url.Error{Op: "Get", URL: `http://h/\u0066ixture`, Err: errors.New("transport failure")}
+	const key = "fixture"
+	c := &Client{apiKey: key}
+	inner := &url.Error{Op: "Get", URL: "http://h/" + testUnicodeEscape(key[0]) + key[1:], Err: errors.New("transport failure")}
 	got := c.redactError(errors.Join(errors.New("other failure"), inner))
 
 	var uerr *url.Error
@@ -2313,6 +2314,115 @@ func TestForeignRedactionBehindStdlibDelegates(t *testing.T) {
 	}
 }
 
+var (
+	_ interface{ RedactionBoundary() } = (*redactedError)(nil)
+	_ interface{ RedactionBoundary() } = (*opaqueURLCause)(nil)
+	_ interface{ RedactionBoundary() } = (*classifiedURLCause)(nil)
+)
+
+type redactBoundaryCalls struct{ message, match, recover, timeout, temporary, marker int }
+
+type redactCountingBoundary struct {
+	cause    *redactedError
+	sentinel error
+	calls    redactBoundaryCalls
+}
+
+// Error counts message calls and returns the foreign fixture's text.
+func (e *redactCountingBoundary) Error() string {
+	e.calls.message++
+	return "cedar boundary"
+}
+
+// Is counts identity hooks and recognizes the fixture sentinel.
+func (e *redactCountingBoundary) Is(target error) bool {
+	e.calls.match++
+	return e.calls.match == 1 && (target == e.sentinel || errors.Is(e.cause, target))
+}
+
+// As counts recovery hooks and forwards the first one to the hidden cause.
+func (e *redactCountingBoundary) As(target any) bool {
+	e.calls.recover++
+	return e.calls.recover == 1 && e.cause.As(target)
+}
+
+// Timeout counts classifier calls and forwards the first one to the hidden cause.
+func (e *redactCountingBoundary) Timeout() bool {
+	e.calls.timeout++
+	return e.calls.timeout == 1 && e.cause.Timeout()
+}
+
+// Temporary counts classifier calls and forwards the first one to the hidden cause.
+func (e *redactCountingBoundary) Temporary() bool {
+	e.calls.temporary++
+	return e.calls.temporary == 1 && e.cause.Temporary()
+}
+
+// RedactionBoundary marks the fixture and counts any invocation of the marker.
+func (e *redactCountingBoundary) RedactionBoundary() { e.calls.marker++ }
+
+// TestSiblingModuleRedactionBoundary checks that marked wrappers remain opaque across a cycle.
+func TestSiblingModuleRedactionBoundary(t *testing.T) {
+	t.Parallel()
+	const key = "maple"
+	for _, tc := range [...]struct {
+		name     string
+		delegate bool
+		url      *url.Error
+	}{
+		{name: "cycle"},
+		{name: "cycle with visible URL sibling", url: &url.Error{Op: "Get", URL: "http://h/" + key}},
+		{name: "cycle behind external classifier", delegate: true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			link := &redactCycleErr{}
+			root := &redactedError{key: key, err: link}
+			foreign := &redactCountingBoundary{cause: root, sentinel: errors.New("foreign sentinel")}
+			forward := &redactForwardingDelegate{err: foreign}
+			link.next = foreign
+			if tc.delegate {
+				link.next = forward
+			}
+			if tc.url != nil {
+				link.next = errors.Join(foreign, tc.url)
+			}
+			assertBoundedClassifications(subtest, root, false, false)
+			assertSiblingModuleSearch(subtest, root, foreign, tc.url)
+			if foreign.calls != (redactBoundaryCalls{}) || forward.timeoutCalls != 0 || forward.temporaryCalls != 0 {
+				subtest.Errorf("boundary calls = %+v; forwarding calls = (%d, %d); want zero", foreign.calls, forward.timeoutCalls, forward.temporaryCalls)
+			}
+		})
+	}
+}
+
+// assertSiblingModuleSearch checks identity and URL recovery without invoking the marked wrapper.
+func assertSiblingModuleSearch(t *testing.T, root *redactedError, foreign *redactCountingBoundary, visible *url.Error) {
+	t.Helper()
+	if answerWithinTwoSeconds(t, "foreign sentinel", func() bool { return errors.Is(root, foreign.sentinel) }) {
+		t.Error("errors.Is called the foreign wrapper's identity hook")
+	}
+	if !answerWithinTwoSeconds(t, "foreign identity", func() bool { return errors.Is(root, foreign) }) {
+		t.Error("errors.Is did not recognize the foreign wrapper itself")
+	}
+	copied := answerWithinTwoSeconds(t, "URL recovery", func() *url.Error {
+		var recovered *url.Error
+		if !errors.As(root, &recovered) {
+			return nil
+		}
+		return recovered
+	})
+	if visible == nil {
+		if copied != nil {
+			t.Error("errors.As recovered a URL through the foreign wrapper")
+		}
+		return
+	}
+	if copied == nil || copied == visible || copied.URL != "http://h/REDACTED" || copied.Err != nil {
+		t.Error("errors.As did not recover a sanitized copy of the visible URL sibling")
+	}
+}
+
 // assertRecoverableForeignURL verifies that the first-key wrapper can recover a sanitized URL copy.
 func assertRecoverableForeignURL(t *testing.T, foreign error, original *url.Error, key string) {
 	t.Helper()
@@ -2641,21 +2751,23 @@ func stdlibErrorClassifications(err error) (bool, bool) {
 // TestRedactedErrorStdlibDelegateBudget checks classifier chains at and beyond both limits.
 func TestRedactedErrorStdlibDelegateBudget(t *testing.T) {
 	t.Parallel()
+	// Why: each wrapper costs two steps and the final tree costs two per node through the true leaf.
+	const walkDepth = maxWalkSteps/2 - (maxErrNodes - 1)
 	for _, tc := range [...]struct {
 		name  string
+		cause error
 		depth int
 		wrap  func(error) error
 		want  bool
 	}{
-		{"at structural limit", maxErrNodes - 1, wrapWithOpError, true},
-		{"over structural limit", maxErrNodes, wrapWithOpError, false},
-		// Why: depth wrappers followed by one leaf place the leaf at visit depth + 1.
-		{"at walk budget", maxWalkSteps - 1, wrapWithSameKey, true},
-		{"over walk budget", maxWalkSteps, wrapWithSameKey, false},
+		{"at structural limit", trueClassifierLeaf(), maxErrNodes - 1, wrapWithOpError, true},
+		{"over structural limit", trueClassifierLeaf(), maxErrNodes, wrapWithOpError, false},
+		{"at walk budget", walkBudgetTail(false), walkDepth, wrapWithSameKey, true},
+		{"over walk budget", walkBudgetTail(true), walkDepth, wrapWithSameKey, false},
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
-			var cause error = &net.DNSError{IsTimeout: true, IsTemporary: true}
+			cause := tc.cause
 			for range tc.depth {
 				cause = tc.wrap(cause)
 			}
@@ -2670,7 +2782,75 @@ func wrapWithOpError(err error) error { return &net.OpError{Op: "read", Err: err
 // wrapWithSameKey adds a same-key wrapper to the fixture tree.
 func wrapWithSameKey(err error) error { return &redactedError{key: "maple", err: err} }
 
-// TestClassifyStdlibNilDelegates checks that absent delegates stop before scheduling children.
+// trueClassifierLeaf returns a leaf answering true to both classifiers.
+func trueClassifierLeaf() error { return &net.DNSError{IsTimeout: true, IsTemporary: true} }
+
+// walkBudgetTail builds a terminal tree with one extra inspection-only node in the over-budget case.
+func walkBudgetTail(over bool) error {
+	leaves := make([]error, 0, maxErrNodes-1)
+	for range maxErrNodes - 3 {
+		leaves = append(leaves, errors.New("fixture leaf"))
+	}
+	leaves = append(leaves, trueClassifierLeaf())
+	if over {
+		leaves = append(leaves, errors.New("unvisited sibling"))
+	}
+	return errors.Join(leaves...)
+}
+
+type redactCountingUnwrap struct{ calls int }
+
+// Error returns a fixed counting fixture message.
+func (*redactCountingUnwrap) Error() string { return "counting leaf" }
+
+// Unwrap counts a read and ends the branch.
+func (e *redactCountingUnwrap) Unwrap() error {
+	e.calls++
+	return nil
+}
+
+// wideRedactionChain puts the next wrapper before the counting leaves in depth-first order.
+func wideRedactionChain(depth int, leaf *redactCountingUnwrap) *redactedError {
+	root := &redactedError{key: "maple", err: trueClassifierLeaf()}
+	for range depth {
+		children := make([]error, maxErrNodes-4)
+		children[0] = root
+		for i := 1; i < len(children); i++ {
+			children[i] = leaf
+		}
+		root = &redactedError{key: "maple", err: errors.Join(children...)}
+	}
+	return root
+}
+
+// TestClassificationChargesInspections checks that each classifier budgets wide wrapper reads.
+func TestClassificationChargesInspections(t *testing.T) {
+	t.Parallel()
+	for _, tc := range [...]struct {
+		name     string
+		depth    int
+		classify func(*redactedError) bool
+		want     bool
+	}{
+		{"wide Timeout", 2 * maxWalkSteps / maxErrNodes, (*redactedError).Timeout, false},
+		{"wide Temporary", 2 * maxWalkSteps / maxErrNodes, (*redactedError).Temporary, false},
+		{"small timeout tree", 2, (*redactedError).Timeout, true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			leaf := &redactCountingUnwrap{}
+			root := wideRedactionChain(tc.depth, leaf)
+			if got := tc.classify(root); got != tc.want {
+				subtest.Errorf("classification = %t; want %t", got, tc.want)
+			}
+			if leaf.calls == 0 || leaf.calls > maxWalkSteps {
+				subtest.Errorf("classification read %d counting leaves; want 1–%d", leaf.calls, maxWalkSteps)
+			}
+		})
+	}
+}
+
+// TestClassifyStdlibNilDelegates checks that absent delegates stop before the next recorded node.
 func TestClassifyStdlibNilDelegates(t *testing.T) {
 	t.Parallel()
 	for _, tc := range [...]struct {
@@ -2683,15 +2863,27 @@ func TestClassifyStdlibNilDelegates(t *testing.T) {
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
-			node := &net.OpError{Op: "read", Err: tc.cause}
-			slot := errorSlot{tree: &errorTree{nodes: []error{node}, ends: []int{1}}}
-			if action, got := classifyNode(slot, "maple", hiddenTimeoutClassifier.Timeout); action != walkStop || got {
-				subtest.Errorf("Timeout classification = (%v, %t); want (%v, false)", action, got, walkStop)
-			}
-			if action, got := classifyNode(slot, "maple", hiddenTemporaryClassifier.Temporary); action != walkStop || got {
-				subtest.Errorf("Temporary classification = (%v, %t); want (%v, false)", action, got, walkStop)
-			}
+			assertNilStdlibDelegateStops(subtest, tc.cause)
 		})
+	}
+}
+
+// assertNilStdlibDelegateStops checks a missing delegate with a positive sibling still pending.
+func assertNilStdlibDelegateStops(t *testing.T, cause error) {
+	t.Helper()
+	node := &net.OpError{Op: "read", Err: cause}
+	leaf := trueClassifierLeaf()
+	// Why: the absent delegate has no child; a positive sibling remains pending when classification stops.
+	tree := errorTree{nodes: []error{errors.Join(node, leaf), node, leaf}, ends: []int{3, 3, 3}}
+	slot := errorSlot{tree: &tree, index: 1}
+	if action, got := classifyNode(slot, "maple", hiddenTimeoutClassifier.Timeout); action != walkStop || got {
+		t.Errorf("Timeout classification = (%v, %t); want (%v, false)", action, got, walkStop)
+	}
+	if action, got := classifyNode(slot, "maple", hiddenTemporaryClassifier.Temporary); action != walkStop || got {
+		t.Errorf("Temporary classification = (%v, %t); want (%v, false)", action, got, walkStop)
+	}
+	if classifyTree(tree, "maple", hiddenTimeoutClassifier.Timeout) || classifyTree(tree, "maple", hiddenTemporaryClassifier.Temporary) {
+		t.Error("classification reached the positive sibling after an absent delegate")
 	}
 }
 
@@ -2721,6 +2913,34 @@ func TestSpellingUsesASCIIHex(t *testing.T) {
 	}
 	for _, keyByte := range []byte{key[0], 0xaf} {
 		assertASCIIHexAlphabet(t, keyByte)
+	}
+}
+
+// TestMalformedEscapeAllocations checks unchanged text and a constant allocation count for invalid escapes.
+func TestMalformedEscapeAllocations(t *testing.T) { //nolint:paralleltest // AllocsPerRun requires serial execution.
+	client := &Client{apiKey: "maple"}
+	for _, tc := range [...]struct{ name, candidate string }{ //nolint:paralleltest // AllocsPerRun requires serial subtests.
+		{"percent", "%zz "},
+		{"backslash Unicode", `\u00zz `},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			many := strings.Repeat(tc.candidate, 64)
+			assertConstantEscapeAllocs(subtest, "scrubBody", client.scrubBody, tc.candidate, many)
+			assertConstantEscapeAllocs(subtest, "scrubText", client.scrubText, tc.candidate, many)
+		})
+	}
+}
+
+// assertConstantEscapeAllocs compares allocation counts and verifies that both inputs survive scrubbing.
+func assertConstantEscapeAllocs(t *testing.T, name string, scrub func(string) string, one, many string) {
+	t.Helper()
+	if scrub(one) != one || scrub(many) != many {
+		t.Errorf("%s changed key-free malformed escapes", name)
+	}
+	oneAllocs := testing.AllocsPerRun(100, func() { _ = scrub(one) })
+	manyAllocs := testing.AllocsPerRun(100, func() { _ = scrub(many) })
+	if oneAllocs != manyAllocs {
+		t.Errorf("%s allocated %.0f times for one candidate and %.0f times for 64", name, oneAllocs, manyAllocs)
 	}
 }
 

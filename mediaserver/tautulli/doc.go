@@ -23,6 +23,7 @@
 // Overflow or a nested fmt.Formatter or fmt.GoStringer → opaque wrapper.
 // Custom formatting or As on an error node → opaque wrapper.
 // Wrapper with another captured key → opaque boundary for classification and URL recovery.
+// Wrapper of another goenvoy client (RedactionBoundary method) → opaque boundary: classification false; its Is, As, Timeout and Temporary not called.
 // Forwarded identity search visits up to 4096 nodes and 64 joined errors.
 // Stdlib classifier delegation (*net.OpError, *os.SyscallError, *fs.PathError, *url.Error) → followed during classification.
 // Classification skips custom As methods and continues into their Unwrap tree.
@@ -30,7 +31,7 @@
 // holds a package wrapper or is unsafe.
 // Classification reads each wrapper tree once within 64 nodes and classifies from that read.
 // A same-key wrapper entered during classification is read once the same way.
-// All reads of one classification share a budget of 4096 visited nodes.
+// One classification counts popped nodes and every node its inspections read against 4096; entering a same-key wrapper with fewer than 64 left → false.
 // Unsafe tree → Timeout and Temporary false.
 // Package-owned URL causes end classification → opaque cause false, classified cause captured values.
 // Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.

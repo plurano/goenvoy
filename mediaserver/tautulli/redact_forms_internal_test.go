@@ -249,10 +249,12 @@ func TestAPIErrorBodyEscapedForms(t *testing.T) {
 func TestAPIErrorBodyEscapeLayers(t *testing.T) {
 	t.Parallel()
 	const key = "fixture"
+	percentAfterUnicode := testUnicodeEscape('%') + testPercentEscape(key[0])[1:] + key[1:]
+	beyondLimit := testLayeredPercentEscape(key[0], maxDecodePasses+1) + key[1:]
 	cases := []struct{ name, body, want string }{
-		{"percent after Unicode", `{"error":"\u002566ixture"}`, "REDACTED"},
+		{"percent after Unicode", `{"error":"` + percentAfterUnicode + `"}`, "REDACTED"},
 		{"key-free mixed escapes", `{"error":"\u002566able"}`, `{"error":"\u002566able"}`},
-		{"key beyond limit", `{"error":"%2525252566ixture"}`, "REDACTED"},
+		{"percent layers beyond limit", `{"error":"` + beyondLimit + `"}`, "REDACTED"},
 		{"still changing at limit", `{"error":"%25252561ble"}`, "REDACTED"},
 		{"stable at limit", `{"error":"%252561ble"}`, `{"error":"%252561ble"}`},
 	}
@@ -267,9 +269,12 @@ func TestAPIErrorBodyEscapeLayers(t *testing.T) {
 // TestAPIErrorBodyScrubKeepsEscapedKey checks redaction when inline replacement leaves an escaped key.
 func TestAPIErrorBodyScrubKeepsEscapedKey(t *testing.T) {
 	t.Parallel()
+	const splitKey, slashKey = `ab`, `a\`
+	splitUnicode := `{"x":"\u00` + splitKey + `","y":"` + testUnicodeEscape(splitKey[0]) + testUnicodeEscape(splitKey[1]) + `"}`
+	slashUnicode := `{"v":"` + slashKey[:1] + `\\` + testUnicodeEscape(slashKey[0]) + testUnicodeEscape(slashKey[1]) + `"}`
 	cases := []struct{ name, key, body, want string }{
-		{"split unicode escape", `ab`, `{"x":"\u00ab","y":"\u0061\u0062"}`, "REDACTED"},
-		{"escaped backslash before encoded key", `a\`, `{"v":"a\\\u0061\u005c"}`, "REDACTED"},
+		{"split unicode escape", splitKey, splitUnicode, "REDACTED"},
+		{"escaped backslash before encoded key", slashKey, slashUnicode, "REDACTED"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -277,6 +282,21 @@ func TestAPIErrorBodyScrubKeepsEscapedKey(t *testing.T) {
 			assertAPIErrorEscapedBody(t, tc.key, tc.body, tc.want)
 		})
 	}
+}
+
+// testUnicodeEscape spells a fixture byte as an ASCII Unicode escape.
+func testUnicodeEscape(b byte) string { return fmt.Sprintf(`\u%04x`, b) }
+
+// testPercentEscape spells a fixture byte as a percent escape.
+func testPercentEscape(b byte) string { return fmt.Sprintf("%%%02x", b) }
+
+// testLayeredPercentEscape re-encodes the leading percent sign for each additional layer.
+func testLayeredPercentEscape(b byte, layers int) string {
+	spelling := testPercentEscape(b)
+	for range layers - 1 {
+		spelling = testPercentEscape(spelling[0]) + spelling[1:]
+	}
+	return spelling
 }
 
 // TestAPIErrorBodyMalformedEscapes checks escaped keys and malformed response bodies.

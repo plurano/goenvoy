@@ -205,11 +205,12 @@ func writePercentEscape(out *strings.Builder, text string) int {
 	if len(text) < 3 {
 		return 0
 	}
-	value, err := strconv.ParseUint(text[1:3], 16, 8)
-	if err != nil {
+	high, highOK := hexNibble(text[1])
+	low, lowOK := hexNibble(text[2])
+	if !highOK || !lowOK {
 		return 0
 	}
-	out.WriteByte(byte(value))
+	out.WriteByte(high<<4 | low)
 	return 3
 }
 
@@ -252,8 +253,29 @@ func bodyHex4(text string) (rune, bool) {
 	if len(text) < 6 || text[0:2] != `\u` {
 		return 0, false
 	}
-	value, err := strconv.ParseUint(text[2:6], 16, 16)
-	return rune(value), err == nil
+	var value rune
+	for i := 2; i < 6; i++ {
+		digit, ok := hexNibble(text[i])
+		if !ok {
+			return 0, false
+		}
+		value = value<<4 | rune(digit)
+	}
+	return value, true
+}
+
+// hexNibble returns the value of an ASCII hex digit.
+func hexNibble(b byte) (byte, bool) {
+	switch {
+	case '0' <= b && b <= '9':
+		return b - '0', true
+	case 'a' <= b && b <= 'f':
+		return b - 'a' + 10, true
+	case 'A' <= b && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 type redactedError struct {
@@ -268,11 +290,14 @@ type redactedError struct {
 // Error returns the sanitized message.
 func (e *redactedError) Error() string { return e.msg }
 
+// RedactionBoundary marks a wrapper so sibling client modules stop at each other's wrappers.
+func (*redactedError) RedactionBoundary() {}
+
 // Is matches the hidden error without exposing it.
 func (e *redactedError) Is(target error) bool {
 	return e.walk(target, func(node error) walkAction {
 		// Why: visit nested wrappers within this walk's budget.
-		if hiddenRedaction(node) != nil {
+		if hiddenRedaction(node) != nil || foreignRedaction(node) {
 			return walkDescend
 		}
 		if m, ok := node.(interface{ Is(error) bool }); ok && m.Is(target) {
@@ -341,9 +366,11 @@ func classifyTree[T any](tree errorTree, key string, classify func(T) bool) bool
 	}
 	// Why: classify the tree that passed inspection.
 	stack := []errorSpan{{tree: &tree, end: 1}}
-	for steps := 0; steps < maxWalkSteps && len(stack) > 0; steps++ {
+	// Why: inspections and popped slots draw from the same budget.
+	for steps := len(tree.nodes); steps < maxWalkSteps && len(stack) > 0; {
 		var slot errorSlot
 		stack, slot = popErrorSlot(stack)
+		steps++
 		action, reported := classifyNode(slot, key, classify)
 		if action == walkStop {
 			return reported
@@ -351,10 +378,11 @@ func classifyTree[T any](tree errorTree, key string, classify func(T) bool) bool
 		if action == walkCauseOnly {
 			stack = stack[:0]
 		}
-		children, unsafe := classificationChildren(slot)
+		children, read, unsafe := classificationChildren(slot, maxWalkSteps-steps)
 		if unsafe {
 			return false
 		}
+		steps += read
 		if children.start < children.end {
 			stack = append(stack, children)
 		}
@@ -373,19 +401,22 @@ func popErrorSlot(stack []errorSpan) ([]errorSpan, errorSlot) {
 	return stack, slot
 }
 
-// classificationChildren enters a same-key redacted wrapper or returns the slot's recorded children.
-func classificationChildren(slot errorSlot) (errorSpan, bool) {
+// classificationChildren returns the child span, inspection cost, and whether traversal must stop.
+func classificationChildren(slot errorSlot, remaining int) (errorSpan, int, bool) {
 	if wrapper, ok := slot.tree.nodes[slot.index].(*redactedError); ok { //nolint:errorlint // enter only the current package wrapper
+		if remaining < maxErrNodes {
+			return errorSpan{}, 0, true
+		}
 		tree, unsafe := inspectErrorTree(wrapper.err)
-		return errorSpan{tree: &tree, end: min(1, len(tree.nodes))}, unsafe
+		return errorSpan{tree: &tree, end: min(1, len(tree.nodes))}, len(tree.nodes), unsafe
 	}
-	return slot.children(), false
+	return slot.children(), 0, false
 }
 
 // classifyNode returns the traversal action and classification for a single node.
 func classifyNode[T any](slot errorSlot, key string, classify func(T) bool) (walkAction, bool) {
 	node := slot.tree.nodes[slot.index]
-	if blocksHiddenClassification(node, key) {
+	if blocksHiddenClassification(node, key) || foreignRedaction(node) {
 		return walkStop, false
 	}
 	switch node.(type) { //nolint:errorlint // classify only the current node
@@ -453,7 +484,8 @@ func (slot errorSlot) hasPackageWrapper() bool {
 	count := 1
 	for i := 0; i < maxErrNodes && i < count; i++ {
 		current := errorSlot{tree: slot.tree, index: queue[i]}
-		if hiddenRedaction(slot.tree.nodes[current.index]) != nil {
+		node := slot.tree.nodes[current.index]
+		if hiddenRedaction(node) != nil || foreignRedaction(node) {
 			return true
 		}
 		children := current.children()
@@ -617,7 +649,7 @@ func isNilError(err error) bool {
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
 // It suppresses classification if the current tree is unsafe, preserves nil causes, and replaces unsafe causes with a fixed error.
 // For a safe immediate cause implementing Timeout or Temporary, the copy reads its tree once and classifies from that read.
-// Each classification visits up to 4096 nodes across the cause and any same-key wrapper trees it enters.
+// One classification counts popped nodes and every node its inspections read against 4096; entering a same-key wrapper with fewer than 64 left → false.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
 	if !ok {
@@ -658,6 +690,9 @@ type opaqueURLCause struct{ hidden *redactedError }
 
 // Error returns the sanitized cause message.
 func (e *opaqueURLCause) Error() string { return e.hidden.Error() }
+
+// RedactionBoundary marks a wrapper so sibling client modules stop at each other's wrappers.
+func (*opaqueURLCause) RedactionBoundary() {}
 
 // Is matches the hidden cause.
 func (e *opaqueURLCause) Is(target error) bool { return e.hidden.Is(target) }
@@ -714,6 +749,12 @@ func hiddenRedaction(node error) *redactedError {
 	default:
 		return nil
 	}
+}
+
+// foreignRedaction reports whether node is a redaction boundary from another module.
+func foreignRedaction(node error) bool {
+	_, boundary := node.(interface{ RedactionBoundary() })
+	return boundary && hiddenRedaction(node) == nil
 }
 
 // maxErrNodes bounds the error tree walk in carriesKey and the joined-error budget in walk.
