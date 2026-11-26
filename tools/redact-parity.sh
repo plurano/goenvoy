@@ -12,7 +12,8 @@ from itertools import zip_longest
 from pathlib import Path
 
 
-PACKAGE = re.compile(rb"^([ \t]*)package[ \t]+[A-Za-z_\x80-\xff][A-Za-z_0-9\x80-\xff]*")
+PACKAGE = re.compile(rb"([ \t]*)package(?=[ \t]|/\*)")
+PACKAGE_NAME = re.compile(rb"[ \t]*[A-Za-z_\x80-\xff][A-Za-z_0-9\x80-\xff]*")
 COMMENT_PREFIX = re.compile(rb"[ \t]*(/\*|//)")
 WRAPPER = re.compile(rb"\bredactedError\b")
 EXCEPTIONS = {
@@ -30,20 +31,25 @@ def read_source(path):
 
 
 def without_package(path, lines):
-    """Remove the package clause tokens and preserve their line's other bytes."""
+    """Remove the first code line's package clause and preserve surrounding bytes."""
     in_block = False
     for index, (number, line) in enumerate(lines):
         offset, in_block = after_leading_comments(line, in_block)
-        if offset is not None:
-            stripped, count = PACKAGE.subn(rb"\1", line[offset:], count=1)
-            if count:
-                return lines[:index] + [(number, line[:offset] + stripped)] + lines[index + 1:]
+        if offset is None or not line[offset:].strip(b" \t\r\n"):
+            continue
+        clause = PACKAGE.match(line, offset)
+        if clause:
+            name_offset, _ = after_leading_comments(line, False, clause.end())
+            name = PACKAGE_NAME.match(line, name_offset) if name_offset is not None else None
+            if name:
+                stripped = line[:clause.end(1)] + line[name.end():]
+                return lines[:index] + [(number, stripped)] + lines[index + 1:]
+        raise ValueError(f"{path}:{number}: missing package clause")
     raise ValueError(f"{path}:1: missing package clause")
 
 
-def after_leading_comments(line, in_block):
+def after_leading_comments(line, in_block, offset=0):
     """Return the first position outside leading comments and the block state."""
-    offset = 0
     for _ in range(len(line) + 1):
         if in_block:
             end = line.find(b"*/", offset)

@@ -58,6 +58,7 @@ func TestScrubOverlappingKeySpellings(t *testing.T) {
 		{"percent before different Unicode digit", percentKey, percentPrefix + otherUnicode + suffix, false},
 		{"backslash before different Unicode digit", backslashKey, backslashPrefix + otherUnicode + suffix, false},
 		{"truncated final escape", percentKey, percentPrefix + mixed[:len(mixed)-1], false},
+		{"key in fixed placeholder", "ACT", "ACT", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -375,9 +376,27 @@ func TestScrubErrorHidesGoSyntax(t *testing.T) {
 	if called {
 		t.Error("Go-syntax formatting invoked the original GoString method")
 	}
-	plain := errors.New("fixture plain failure")
-	if got := c.scrubError(plain); any(got) != any(plain) {
-		t.Errorf("scrubError changed the identity of %T", plain)
+	for _, tc := range [...]struct{ name, key string }{
+		{"key-free error", key},
+		{"key in type name", "errors.errorString"},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			assertScrubErrorIdentity(subtest, tc.key)
+		})
+	}
+}
+
+// assertScrubErrorIdentity checks the original pointer and its errors.Is match.
+func assertScrubErrorIdentity(t *testing.T, key string) {
+	t.Helper()
+	original := errors.New("fixture failure")
+	got := (&Client{apiKey: key}).scrubError(original)
+	if any(got) != any(original) {
+		t.Errorf("scrubError changed the identity of %T", original)
+	}
+	if !errors.Is(got, original) {
+		t.Error("errors.Is lost the original error")
 	}
 }
 
@@ -1510,25 +1529,6 @@ func assertNilScrubResult(t *testing.T, got, input error, wantNil bool) {
 	}
 }
 
-// redactAsClassifier supplies classifiers through a custom As method.
-type redactAsClassifier struct{}
-
-// Error returns the fixture error text.
-func (redactAsClassifier) Error() string { return "classifier" }
-
-// As supplies the requested classifier.
-func (redactAsClassifier) As(target any) bool {
-	switch dst := target.(type) {
-	case *interface{ Timeout() bool }:
-		*dst = redactClassifier{}
-		return true
-	case *interface{ Temporary() bool }:
-		*dst = redactClassifier{}
-		return true
-	}
-	return false
-}
-
 // redactClassifier answers both classification methods.
 type redactClassifier struct{}
 
@@ -1538,18 +1538,25 @@ func (redactClassifier) Timeout() bool { return true }
 // Temporary reports a temporary error.
 func (redactClassifier) Temporary() bool { return true }
 
-type redactAsFixedClassifier struct {
+// redactAsClassifier records calls that request a classifier through As.
+type redactAsClassifier struct {
 	classifier interface {
 		Timeout() bool
 		Temporary() bool
 	}
+	cause error
+	calls int
 }
 
 // Error returns the fixture error text.
-func (redactAsFixedClassifier) Error() string { return "fixed classifier" }
+func (*redactAsClassifier) Error() string { return "fixture classifier" }
+
+// Unwrap returns the fixture's visible cause.
+func (e *redactAsClassifier) Unwrap() error { return e.cause }
 
 // As supplies the fixed classifier for either classification method.
-func (e redactAsFixedClassifier) As(target any) bool {
+func (e *redactAsClassifier) As(target any) bool {
+	e.calls++
 	switch dst := target.(type) {
 	case *interface{ Timeout() bool }:
 		*dst = e.classifier
@@ -1562,6 +1569,18 @@ func (e redactAsFixedClassifier) As(target any) bool {
 	}
 }
 
+// redactNonErrorClassifier delegates to a wrapper without implementing error.
+type redactNonErrorClassifier struct{ cause *redactedError }
+
+// Unwrap returns the package wrapper.
+func (c redactNonErrorClassifier) Unwrap() error { return c.cause }
+
+// Timeout reports the package wrapper's timeout classification.
+func (c redactNonErrorClassifier) Timeout() bool { return c.cause.Timeout() }
+
+// Temporary reports the package wrapper's temporary classification.
+func (c redactNonErrorClassifier) Temporary() bool { return c.cause.Temporary() }
+
 // TestRedactedErrorClassifiers checks custom As and URL errors with nil and non-nil causes.
 func TestRedactedErrorClassifiers(t *testing.T) {
 	t.Parallel()
@@ -1571,7 +1590,7 @@ func TestRedactedErrorClassifiers(t *testing.T) {
 		cause error
 		want  bool
 	}{
-		{"custom As", redactAsClassifier{}, true},
+		{"custom As skipped", &redactAsClassifier{classifier: redactClassifier{}}, false},
 		{"typed nil URL cause", &url.Error{Op: "Get", URL: "http://h/", Err: (*net.DNSError)(nil)}, false},
 		{"URL cause", &url.Error{Op: "Get", URL: "http://h/", Err: &net.DNSError{IsTimeout: true, IsTemporary: true}}, true},
 	}
@@ -1628,7 +1647,7 @@ func TestRedactedErrorURLImmediateCause(t *testing.T) {
 		want  bool
 	}{
 		{"ordinary wrapper", fmt.Errorf("fixture: %w", timeout), false},
-		{"custom As", redactAsClassifier{}, false},
+		{"custom As skipped", &redactAsClassifier{classifier: redactClassifier{}}, false},
 		{"direct DNS error", timeout, true},
 		{"redacted cause", &redactedError{err: timeout}, true},
 		{"URL cause", &url.Error{Err: timeout}, true},
@@ -1850,6 +1869,79 @@ func TestUnsafeTreeClassifications(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSameKeyWrapperRechecksCurrentTree checks direct, nested, and copied classifications after mutation.
+func TestSameKeyWrapperRechecksCurrentTree(t *testing.T) {
+	t.Parallel()
+	const key = "maple"
+	client := &Client{apiKey: key}
+	leaf := &net.DNSError{Err: key, IsTimeout: true, IsTemporary: true}
+	inner := hiddenRedaction(hiddenRedacted(t, key, leaf))
+	children := make([]error, maxErrNodes-1)
+	children[0] = inner
+	padding := errors.New(key)
+	for index := 1; index < len(children); index++ {
+		children[index] = padding
+	}
+	outer := hiddenRedaction(hiddenRedacted(t, key, errors.Join(children...)))
+	inner.err = errors.Join((*net.DNSError)(nil), leaf)
+	cycle := &redactedError{key: key}
+	cycle.err = cycle
+	for _, tc := range [...]struct {
+		name   string
+		cause  *redactedError
+		viaURL bool
+	}{
+		{"direct wrapper", inner, false},
+		{"enclosing wrapper at inspection limit", outer, false},
+		{"sanitized URL copy", inner, true},
+		{"self-referencing wrapper", cycle, false},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			if tc.viaURL {
+				assertErrorClassifications(subtest, copyClassificationURL(subtest, client, tc.cause), false, false)
+				return
+			}
+			assertBoundedClassifications(subtest, tc.cause, false, false)
+		})
+	}
+}
+
+// TestURLCopyUsesIndependentClassifierWalks checks that a timeout delegate cannot discard the temporary sibling.
+func TestURLCopyUsesIndependentClassifierWalks(t *testing.T) {
+	t.Parallel()
+	const key = "maple"
+	client := &Client{apiKey: key}
+	sentinel := errors.New("fixture failure")
+	timeout := &fs.PathError{Err: &redactTimeoutCause{redactFixtureCause{sentinel}}}
+	temporary := redactTemporaryCause{redactFixtureCause{sentinel}}
+	for _, tc := range [...]struct {
+		name string
+		tree error
+	}{
+		{"timeout delegate before temporary sibling", errors.Join(timeout, temporary)},
+		{"temporary sibling before timeout delegate", errors.Join(temporary, timeout)},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			cause := &redactedError{key: key, err: tc.tree}
+			assertErrorClassifications(subtest, cause, true, true)
+			assertErrorClassifications(subtest, copyClassificationURL(subtest, client, cause), true, true)
+		})
+	}
+}
+
+// copyClassificationURL recovers a sanitized URL error for comparison with its original cause.
+func copyClassificationURL(t *testing.T, client *Client, cause error) *url.Error {
+	t.Helper()
+	original := &url.Error{Op: "Get", URL: "http://h/" + client.apiKey, Err: cause}
+	var copied *url.Error
+	if !errors.As(client.scrubError(original), &copied) || copied == nil || copied == original {
+		t.Fatal("expected a sanitized URL error copy")
+	}
+	return copied
 }
 
 type redactURLClassifier struct {
@@ -2281,30 +2373,41 @@ func assertBoundedClassifications(t *testing.T, hidden *redactedError, wantTimeo
 	}
 }
 
-// TestRedactedErrorAsSuppliedClassifiers checks the boundary for wrappers supplied by custom As methods.
+// TestRedactedErrorAsSuppliedClassifiers checks that classification skips custom As methods.
 func TestRedactedErrorAsSuppliedClassifiers(t *testing.T) {
 	t.Parallel()
 	client := &Client{apiKey: "maple"}
 	foreign := hiddenRedacted(t, "cedar", &net.DNSError{Err: "cedar", IsTimeout: true})
-	sameKey := &redactedError{key: "maple", err: &net.DNSError{IsTimeout: true}}
+	leaf := &net.DNSError{IsTimeout: true, IsTemporary: true}
+	sameKey := &redactedError{key: "maple", err: leaf}
 	delegate := &redactTLSPermanentError{err: hiddenRedaction(foreign)}
 	for _, tc := range [...]struct {
-		name  string
-		cause error
-		want  bool
+		name string
+		hook *redactAsClassifier
+		want bool
 	}{
-		{"op error with foreign wrapper", redactAsFixedClassifier{&net.OpError{Err: foreign}}, false},
-		{"foreign delegate", redactAsFixedClassifier{delegate}, false},
-		{"op error with foreign delegate", redactAsFixedClassifier{&net.OpError{Err: delegate}}, false},
-		{"op error with typed nil", redactAsFixedClassifier{&net.OpError{Err: (*redactedError)(nil)}}, false},
-		{"same-key wrapper", redactAsFixedClassifier{sameKey}, false},
-		{"custom classifier", redactAsClassifier{}, true},
+		{"op error with foreign wrapper", &redactAsClassifier{classifier: &net.OpError{Err: foreign}}, false},
+		{"foreign delegate", &redactAsClassifier{classifier: delegate}, false},
+		{"op error with foreign delegate", &redactAsClassifier{classifier: &net.OpError{Err: delegate}}, false},
+		{"op error with typed nil", &redactAsClassifier{classifier: &net.OpError{Err: (*redactedError)(nil)}}, false},
+		{"same-key wrapper", &redactAsClassifier{classifier: sameKey}, false},
+		{"non-error delegate", &redactAsClassifier{classifier: redactNonErrorClassifier{cause: sameKey}}, false},
+		{"custom classifier skipped", &redactAsClassifier{classifier: redactClassifier{}}, false},
+		{"walk continues into Unwrap", &redactAsClassifier{classifier: redactClassifier{}, cause: leaf}, true},
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()
-			got := client.scrubError(tc.cause)
+			defer func() {
+				if recover() != nil {
+					subtest.Error("classification panicked")
+				}
+			}()
+			got := client.scrubError(tc.hook)
 			assertOpaqueError(subtest, client, tc.name, got)
 			assertErrorClassifications(subtest, got, tc.want, tc.want)
+			if tc.hook.calls != 0 {
+				subtest.Errorf("custom As called %d times during classification", tc.hook.calls)
+			}
 		})
 	}
 }

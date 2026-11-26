@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exercise discovery, comparison, and diagnostics against tracked fixture files.
-# Pass an absolute checker path to replay the leading comment and missing scrubText cases.
+# Pass an absolute checker path to replay the package clause and missing scrubText cases.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +48,17 @@ printf '%s package beta\n\n%s\n' "$leading_comment" "$shared_source" >second/red
 expect_output 'leading block comment is preserved before different package clauses' 'redact-parity: 2 redaction copies match' "${SUT[@]}"
 printf '%s package beta\n\n%s\n' "${leading_comment/package other/package another}" "$shared_source" >second/redact.go
 expect_refusal 'package-like text differs inside a leading block comment' 'second/redact.go:3: differs' "${SUT[@]}"
+
+printf "package alpha\nvar fixture = \`\n\n\`\n%s\n" "$shared_source" >first/redact.go
+printf "\nvar fixture = \`\npackage beta\n\`\n%s\n" "$shared_source" >second/redact.go
+expect_refusal 'raw string cannot supply the package clause' 'second/redact.go:2: missing package clause' "${SUT[@]}"
+
+printf 'package /* comment */ alpha\n\n%s\n' "$shared_source" >first/redact.go
+printf 'package /* other */ beta\n\n%s\n' "$shared_source" >second/redact.go
+expect_output 'same-line comments inside package clauses' 'redact-parity: 2 redaction copies match' "${SUT[@]}"
+printf 'package /*\ncomment */ beta\n\n%s\n' "$shared_source" >second/redact.go
+expect_refusal 'package clause cannot continue on the next line' 'second/redact.go:1: missing package clause' "${SUT[@]}"
+
 printf 'package alpha\n\n%s\n' "$shared_source" >first/redact.go
 printf 'package beta\n\n%s\n' "$shared_source" >second/redact.go
 

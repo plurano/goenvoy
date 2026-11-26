@@ -18,15 +18,17 @@
 // Custom formatting or As on an error node → opaque wrapper.
 // Wrapper with another captured key → opaque boundary for classification and URL recovery.
 // Forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
-// Stdlib classifier delegation (*net.OpError, *os.SyscallError, *fs.PathError, *url.Error) → followed inside that walk; As-supplied package or stdlib wrapper → false.
+// Stdlib classifier delegation (*net.OpError, *os.SyscallError, *fs.PathError, *url.Error) → followed inside that walk.
+// Classification skips custom As methods and continues into their Unwrap tree.
 // External Timeout or Temporary method → false when its Unwrap tree (64 nodes)
-// holds a package wrapper or is unsafe. Also applies to an As-supplied classifier.
+// holds a package wrapper or is unsafe.
 // Wrapper and URL copy → inspect the current tree within 64 nodes.
+// Classification entering a same-key wrapper → inspect that wrapper's current tree within 64 nodes.
 // Unsafe tree → Timeout and Temporary false.
 // Package-owned URL causes end classification → opaque cause false, classified cause captured values.
 // Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.
 // URL copies keep nil causes. Typed-nil or unsafe causes become fixed opaque errors without classification.
-// Safe immediate cause implements Timeout or Temporary → both classifications captured in one walk.
+// Safe immediate cause implements Timeout or Temporary → one walk per classification.
 //
 // Contract limits
 //
@@ -34,8 +36,9 @@
 //   - Error method prints key only on later call.
 //   - Nested *url.Error with apikey value other than configured key.
 //   - XML or HTML character references and escape schemes other than percent and backslash-u.
-//   - Custom Timeout, Temporary or As methods that reach a package wrapper
-//     outside their Unwrap tree.
+//   - Custom Timeout or Temporary methods that reach a package wrapper outside their Unwrap tree.
+//   - Key that also occurs in key-independent text (REDACTED placeholder, fixed messages, Go-syntax
+//     type names, field names or pointer addresses) → that text stays because it carries no key-derived bytes.
 //
 // Usage:
 //

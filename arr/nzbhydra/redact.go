@@ -306,6 +306,11 @@ func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	if _, unsafe := inspectErrorTree(e.err); unsafe {
 		return false
 	}
+	return classifyWalk(e, classify)
+}
+
+// classifyWalk reports the first applicable classification in a bounded walk.
+func classifyWalk[T any](e *redactedError, classify func(T) bool) bool {
 	reported := false
 	e.walk(nil, func(node error) walkAction {
 		var action walkAction
@@ -320,8 +325,12 @@ func classifyNode[T any](node error, key string, classify func(T) bool) (walkAct
 	if blocksHiddenClassification(node, key) {
 		return walkStop, false
 	}
-	switch node.(type) { //nolint:errorlint // classify only the current node
+	switch wrapper := node.(type) { //nolint:errorlint // classify only the current node
 	case *redactedError:
+		// Why: the hidden tree can change after the wrapper was constructed.
+		if _, unsafe := inspectErrorTree(wrapper.err); unsafe {
+			return walkStop, false
+		}
 		return walkDescend, false
 	case *opaqueURLCause:
 		return walkStop, false
@@ -351,22 +360,14 @@ func classifyStdlibNode[T any](node error, classifier T, classify func(T) bool) 
 	return walkStop, false
 }
 
-// classifyExternalNode checks the classifier and As methods of an external node.
+// classifyExternalNode checks the classification method of an external node.
 func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction, bool) {
 	classifier, ok := node.(T)
-	if ok {
-		if reachesPackageWrapper(node) {
-			return walkStop, false
-		}
-		return walkStop, classify(classifier)
-	}
-	as, hasAs := node.(interface{ As(any) bool })
-	if !hasAs || !as.As(&classifier) || isNilValue(classifier) {
+	if !ok {
+		// Why: an As hook runs code outside the walked tree.
 		return walkDescend, false
 	}
-	// Why: wrappers supplied by As live outside this walk and cannot share its budget.
-	if supplied, isError := any(classifier).(error); isError && (hiddenRedaction(supplied) != nil ||
-		isStdlibClassifier(supplied) || reachesPackageWrapper(supplied)) {
+	if reachesPackageWrapper(node) {
 		return walkStop, false
 	}
 	return walkStop, classify(classifier)
@@ -527,15 +528,10 @@ func trimNilErrors(errs []error) []error {
 
 // isNilError reports whether err is nil or holds a nil pointer, map, slice, function, channel, or interface.
 func isNilError(err error) bool {
-	return isNilValue(err)
-}
-
-// isNilValue reports whether value is nil or holds a nil pointer, map, slice, function, channel, or interface.
-func isNilValue(value any) bool {
-	if value == nil {
+	if err == nil {
 		return true
 	}
-	v := reflect.ValueOf(value)
+	v := reflect.ValueOf(err)
 	if slices.Contains([]reflect.Kind{reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice}, v.Kind()) {
 		return v.IsNil()
 	}
@@ -544,8 +540,8 @@ func isNilValue(value any) bool {
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
 // It suppresses classification if the current tree is unsafe, preserves nil causes, and replaces unsafe causes with a fixed error.
-// If the tree is safe and the immediate cause implements Timeout or Temporary, the copy captures both classifications
-// in one walk of up to 4096 nodes and 64 joined errors.
+// If the tree is safe and the immediate cause implements Timeout or Temporary, the copy uses one walk per classifier.
+// Each walk visits up to 4096 nodes and 64 joined errors.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
 	if !ok {
@@ -608,31 +604,14 @@ func (e *classifiedURLCause) Timeout() bool { return e.timeout }
 // Temporary reports whether the cause was temporary when copied.
 func (e *classifiedURLCause) Temporary() bool { return e.temporary }
 
-// newClassifiedURLCause captures both classifications in one URL-aware walk.
+// newClassifiedURLCause captures a structurally inspected cause with one URL-aware walk per classifier.
 func newClassifiedURLCause(cause opaqueURLCause) *classifiedURLCause {
-	copyCause := &classifiedURLCause{opaqueURLCause: cause}
 	probe := &redactedError{err: &url.Error{Err: cause.hidden.err}, key: cause.hidden.key}
-	timeoutDone, temporaryDone := false, false
-	probe.walk(nil, func(node error) walkAction {
-		timeoutAction, temporaryAction := walkDescend, walkDescend
-		if !timeoutDone {
-			timeoutAction, copyCause.timeout = classifyNode(node, probe.key, hiddenTimeoutClassifier.Timeout)
-			timeoutDone = timeoutAction == walkStop
-		}
-		if !temporaryDone {
-			temporaryAction, copyCause.temporary = classifyNode(node, probe.key, hiddenTemporaryClassifier.Temporary)
-			temporaryDone = temporaryAction == walkStop
-		}
-		switch {
-		case timeoutDone && temporaryDone:
-			return walkStop
-		case timeoutAction == walkCauseOnly || temporaryAction == walkCauseOnly:
-			return walkCauseOnly
-		default:
-			return walkDescend
-		}
-	})
-	return copyCause
+	return &classifiedURLCause{
+		opaqueURLCause: cause,
+		timeout:        classifyWalk(probe, hiddenTimeoutClassifier.Timeout),
+		temporary:      classifyWalk(probe, hiddenTemporaryClassifier.Temporary),
+	}
 }
 
 // hiddenRedaction returns the package-owned wrapper behind node, if any.
