@@ -15,6 +15,8 @@
 // Retained projection storage → charge parent length, matching builder growth.
 // Error redaction scans up to 64 nodes for structural inspection and URL recovery.
 // Key in Error text, direct URL error fields, or reflected leaves → opaque wrapper.
+// After the check, one method-free re-read of recorded node fields (URL error Op and URL,
+// reflected visible values) → key found → opaque wrapper.
 // Reflection checks up to 1024 values per node and follows only the start pointer.
 // Overflow or a nested fmt.Formatter or fmt.GoStringer → opaque wrapper.
 // Custom formatting or As on an error node → opaque wrapper.
@@ -45,7 +47,10 @@
 // Contract limits
 //
 //   - Raw percent sign or backslash directly before key spelled across two or more escape layers.
-//   - Error method prints key only on later call.
+//   - The check reads Unwrap results and checks Error text once per visited node, then re-reads
+//     every recorded node's fields without calling error methods. A method can print the key or
+//     write it into a recorded node's fields only on a later call, including after redaction returns.
+//     The check cannot see that later text or write.
 //   - Nested *url.Error with apikey value other than configured key.
 //   - XML or HTML character references and escape schemes other than percent and backslash-u.
 //   - For custom Is, Timeout or Temporary methods, the check uses the Unwrap tree read before the call.

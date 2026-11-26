@@ -883,7 +883,9 @@ func (c *Client) buildURLCause(err error, tree errorTree, unsafe, unsafeParent b
 // checkErrorTree reports whether err needs redaction and whether its Error method is unsafe to call.
 func (c *Client) checkErrorTree(err error) (bool, bool) {
 	tree, unsafe := inspectErrorTree(err)
-	return c.errorTreeNeedsRedaction(tree, unsafe), unsafe
+	// Why: a later Error call may change fields on a node already checked.
+	carry := c.errorTreeNeedsRedaction(tree, unsafe) || slices.ContainsFunc(tree.nodes, c.errorNodeFieldsNeedRedaction)
+	return carry, unsafe
 }
 
 // errorTreeNeedsRedaction checks an observed tree without calling methods on unsafe nodes.
@@ -937,10 +939,21 @@ func (c *Client) errorNodeNeedsRedaction(node error) bool {
 	if c.ownsWrapper(node) {
 		return false
 	}
-	if uerr, ok := node.(*url.Error); ok && (c.containsKey(uerr.Op) || c.containsKey(uerr.URL)) { //nolint:errorlint // inspect only this node's fields
-		return true
+	return c.urlErrorFieldsNeedRedaction(node) || c.containsKey(node.Error()) || c.reflectedErrorNeedsRedaction(reflect.ValueOf(node))
+}
+
+// errorNodeFieldsNeedRedaction checks the fields of a recorded node without invoking error methods.
+func (c *Client) errorNodeFieldsNeedRedaction(node error) bool {
+	if c.ownsWrapper(node) {
+		return false
 	}
-	return c.containsKey(node.Error()) || c.reflectedErrorNeedsRedaction(reflect.ValueOf(node))
+	return c.urlErrorFieldsNeedRedaction(node) || c.reflectedErrorNeedsRedaction(reflect.ValueOf(node))
+}
+
+// urlErrorFieldsNeedRedaction checks the operation and URL of a direct URL error.
+func (c *Client) urlErrorFieldsNeedRedaction(node error) bool {
+	uerr, ok := node.(*url.Error) //nolint:errorlint // inspect only this node's fields
+	return ok && (c.containsKey(uerr.Op) || c.containsKey(uerr.URL))
 }
 
 // maxReflectedValues bounds the number of values inspected for each error node.
@@ -1153,8 +1166,14 @@ func (c *Client) redactRootURL(uerr *url.Error) error {
 		return &url.Error{Op: cleanOp, URL: cleanURL, Err: c.buildURLCause(cause, tree, unsafe, false)}
 	}
 	observed := &url.Error{Op: op, URL: rawURL, Err: cause}
-	carry := cause != nil && c.errorNodeNeedsRedaction(observed)
-	if uerr.Op != op || uerr.URL != rawURL || !sameErrorValue(cause, uerr.Err) {
+	return c.finishRootURLCheck(uerr, observed, tree)
+}
+
+// finishRootURLCheck checks the observed root's text, then re-reads cause fields and the live root.
+func (c *Client) finishRootURLCheck(uerr, observed *url.Error, tree errorTree) error {
+	carry := (observed.Err != nil && c.errorNodeNeedsRedaction(observed)) ||
+		slices.ContainsFunc(tree.nodes, c.errorNodeFieldsNeedRedaction)
+	if uerr.Op != observed.Op || uerr.URL != observed.URL || !sameErrorValue(observed.Err, uerr.Err) {
 		return c.scrubCheckedError(uerr, true, true)
 	}
 	return c.scrubCheckedError(uerr, carry, false)

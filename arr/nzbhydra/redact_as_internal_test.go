@@ -2214,6 +2214,131 @@ func TestRedactErrorRootURLChangedFields(t *testing.T) {
 	}
 }
 
+type redactNestedFieldWriter struct {
+	parent  *url.Error
+	detail  *redactNestedDetailError
+	at      int
+	reads   int
+	writeOp bool
+	wrote   bool
+}
+
+// Error writes the fixture key once at the requested call and returns clean text.
+func (e *redactNestedFieldWriter) Error() string {
+	e.reads++
+	if e.reads == e.at {
+		switch {
+		case e.detail != nil:
+			e.detail.Detail = "maple"
+		case e.writeOp:
+			e.parent.Op = "Get maple"
+		default:
+			e.parent.URL += "?apikey=maple"
+		}
+		e.wrote = true
+		e.parent, e.detail = nil, nil
+	}
+	return "clean cause"
+}
+
+type redactNestedDetailError struct {
+	Detail string
+	cause  error
+}
+
+// Error delegates to the cause without reading Detail.
+func (e *redactNestedDetailError) Error() string { return e.cause.Error() }
+
+// Unwrap returns the cause that can update Detail.
+func (e *redactNestedDetailError) Unwrap() error { return e.cause }
+
+type redactCountedCheckNode struct {
+	next                   error
+	textReads, unwrapReads int
+}
+
+// Error counts the text reads and returns fixed text.
+func (e *redactCountedCheckNode) Error() string {
+	e.textReads++
+	return "read failed"
+}
+
+// Unwrap counts the structural reads and returns the next node.
+func (e *redactCountedCheckNode) Unwrap() error {
+	e.unwrapReads++
+	return e.next
+}
+
+// TestRedactErrorNestedFieldChangedDuringCheck checks writes to already inspected nodes and unfired controls.
+func TestRedactErrorNestedFieldChangedDuringCheck(t *testing.T) {
+	t.Parallel()
+	for _, wrapper := range [...]struct {
+		name string
+		wrap func(error) error
+	}{
+		{"quiet", func(nested error) error { return &redactCountedCheckNode{next: nested} }},
+		{"errorf", func(nested error) error { return fmt.Errorf("read response: %w", nested) }},
+		{"root", func(nested error) error {
+			return &url.Error{Op: "Get", URL: "http://h/feed", Err: fmt.Errorf("x: %w", nested)}
+		}},
+		{"root live cause", func(nested error) error {
+			return &url.Error{Op: "Get", URL: "http://h/feed", Err: nested}
+		}},
+	} {
+		for _, field := range [...]string{"URL", "Op", "Detail"} {
+			t.Run(wrapper.name+"/"+field, func(subtest *testing.T) {
+				subtest.Parallel()
+				testNestedFieldChangeCalls(subtest, field, wrapper.wrap)
+			})
+		}
+	}
+}
+
+// testNestedFieldChangeCalls tries each call at which the writer might fire.
+func testNestedFieldChangeCalls(t *testing.T, field string, wrap func(error) error) {
+	t.Helper()
+	for at := 1; at <= 5; at++ {
+		t.Run("at="+strconv.Itoa(at), func(subtest *testing.T) {
+			subtest.Parallel()
+			writer := &redactNestedFieldWriter{at: at, writeOp: field == "Op"}
+			var nested error
+			if field == "Detail" {
+				writer.detail = &redactNestedDetailError{Detail: "clean detail", cause: writer}
+				nested = writer.detail
+			} else {
+				writer.parent = &url.Error{Op: "Get", URL: "http://h/feed", Err: writer}
+				nested = writer.parent
+			}
+			input := wrap(nested)
+			got := answerWithinTwoSeconds(subtest, "redactError", func() error {
+				return (&Client{apiKey: "maple"}).redactError(input)
+			})
+			assertNestedFieldChange(subtest, input, got, writer.wrote)
+		})
+	}
+}
+
+// assertNestedFieldChange checks identity, URL recovery, and all three formatting forms.
+func assertNestedFieldChange(t *testing.T, input, got error, wrote bool) {
+	t.Helper()
+	kept := got == input //nolint:errorlint // compare fixture pointer identities
+	if kept == wrote {
+		t.Errorf("redactError kept input = %t after write = %t; want kept = %t", kept, wrote, !wrote)
+	}
+	if !wrote {
+		return
+	}
+	var recovered *url.Error
+	if errors.As(got, &recovered) && (strings.Contains(recovered.Op, "maple") || strings.Contains(recovered.URL, "maple")) {
+		t.Error("errors.As exposed the fixture key in the recovered URL error")
+	}
+	for index, text := range [...]string{fmt.Sprint(got), fmt.Sprintf("%+v", got), fmt.Sprintf("%#v", got)} {
+		if strings.Contains(text, "maple") {
+			t.Errorf("format %d exposed the fixture key", index)
+		}
+	}
+}
+
 // assertChangedRootURL checks the fixed message and formatting, or exact identity for the control.
 func assertChangedRootURL(t *testing.T, got error, input *url.Error, keep bool) {
 	t.Helper()
@@ -2300,6 +2425,46 @@ func TestRedactErrorCleanRootURLNodeLimit(t *testing.T) {
 			got := client.redactError(input)
 			assertCleanRootURLNodeLimit(subtest, input, got, tc.nodes, calls, strings.Contains(tc.leaf, "maple"))
 		})
+	}
+}
+
+// TestRedactErrorCheckMethodCounts pins the call counts on clean trees.
+func TestRedactErrorCheckMethodCounts(t *testing.T) {
+	t.Parallel()
+	// Why: 7e87a4b checks each node's text and children once; the URL root reads its direct cause's text again.
+	const nodeTextReads, rootCauseTextReads, unwrapReads = 1, 2, 1
+	for _, tc := range [...]struct {
+		name     string
+		wrap     func(error) error
+		wantHead int
+	}{
+		{"scrub", func(head error) error { return head }, nodeTextReads},
+		{"root URL", func(head error) error {
+			return &url.Error{Op: "Get", URL: "http://h/feed", Err: head}
+		}, rootCauseTextReads},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			leaf := &redactCountedCheckNode{}
+			head := &redactCountedCheckNode{next: leaf}
+			input := tc.wrap(head)
+			got := answerWithinTwoSeconds(subtest, "redactError", func() error {
+				return (&Client{apiKey: "maple"}).redactError(input)
+			})
+			if got != input { //nolint:errorlint // compare fixture pointer identities
+				subtest.Error("redactError changed the identity of a clean chain")
+			}
+			assertCheckNodeReads(subtest, "head", head, tc.wantHead, unwrapReads)
+			assertCheckNodeReads(subtest, "leaf", leaf, nodeTextReads, unwrapReads)
+		})
+	}
+}
+
+// assertCheckNodeReads checks both method counts for one node.
+func assertCheckNodeReads(t *testing.T, name string, node *redactCountedCheckNode, wantText, wantUnwrap int) {
+	t.Helper()
+	if node.textReads != wantText || node.unwrapReads != wantUnwrap {
+		t.Errorf("%s Error and Unwrap reads = %d, %d; want %d, %d", name, node.textReads, node.unwrapReads, wantText, wantUnwrap)
 	}
 }
 

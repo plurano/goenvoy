@@ -29,6 +29,8 @@ API key passed as `apikey` query parameter against `/api/v2`.
 - Retained projection storage -> charge parent length, matching builder growth.
 - Decode + request errors -> breadth-first walk, 64 nodes, single or joined `Unwrap`. Overflow or typed-nil node -> fixed message.
 - Key in `Error` text, direct `*url.Error` fields, or reflected leaves -> opaque wrapper, scrubbed message.
+- After check, one method-free re-read of every recorded node's fields (URL error `Op` and `URL`,
+  reflected visible values) -> key found -> opaque wrapper.
 - Reflection -> up to 1024 values per error node, start pointer only. Overflow or nested `fmt.Formatter` / `fmt.GoStringer` -> opaque wrapper.
 - Custom `fmt.Formatter`, `fmt.GoStringer`, or `As` method on error node -> opaque wrapper.
 - Wrapper with this client's key at any position (root, wrapped chain, exported field such as a URL error cause) -> kept without another wrapper.
@@ -52,7 +54,8 @@ API key passed as `apikey` query parameter against `/api/v2`.
 - Opaque `errors.As` -> copy first non-nil `*url.Error` within 64 breadth-first nodes, same cause handling as root.
 - Contract limits:
   - Raw percent sign or backslash directly before key spelled across two or more escape layers
-  - `Error` method prints key only on later call
+  - Check -> one `Unwrap` result and one `Error` text check per visited node, then method-free field re-read.
+    Print key or write key into recorded node field only on call after re-read (including after redaction returns) -> unseen.
   - Nested `*url.Error` with `apikey` value other than configured key
   - XML or HTML character references and escape schemes other than percent and backslash-u.
   - Custom `Is`, `Timeout` or `Temporary` -> check `Unwrap` tree read before call. Later `Unwrap` read or other path into package wrapper ->
