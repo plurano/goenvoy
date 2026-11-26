@@ -22,17 +22,17 @@ import (
 func TestScrubOverlappingKeySpellings(t *testing.T) {
 	t.Parallel()
 	const (
-		percentKey   = "ab12"
-		backslashKey = "b12"
+		percentKey   = "ab-~"
+		backslashKey = "b-~"
 		otherDigit   = '3'
 	)
 	first, last := percentKey[2], percentKey[3]
 	upper := fmt.Sprintf("%%%02X%%%02X", first, last)
 	lower := fmt.Sprintf("%%%02x%%%02x", first, last)
-	unicodePair := fmt.Sprintf("\\u%04x\\u%04x", first, last)
-	mixed := fmt.Sprintf("%%%02X\\u%04x", first, last)
+	unicodePair := fmt.Sprintf("\\u%04X\\u%04X", first, last)
+	mixed := fmt.Sprintf("%%%02X\\u%04X", first, last)
 	otherPercent := fmt.Sprintf("%%%02X%%%02X", first, otherDigit)
-	otherUnicode := fmt.Sprintf("\\u%04x\\u%04x", first, otherDigit)
+	otherUnicode := fmt.Sprintf("\\u%04X\\u%04X", first, otherDigit)
 	percentPrefix := "prefix %" + percentKey[:2]
 	backslashPrefix := "prefix \\" + backslashKey[:1]
 	const suffix = " suffix"
@@ -104,20 +104,106 @@ func TestScrubErrorHidesCustomURLAs(t *testing.T) {
 	}
 }
 
-// assertCustomURLAsHidden checks wrapper identity, escaped key forms, and URL recovery.
+// assertCustomURLAsHidden checks that the custom As hook cannot supply a URL.
 func assertCustomURLAsHidden(t *testing.T, c *Client, name string, got error) {
+	t.Helper()
+	assertOpaqueError(t, c, name, got)
+	var link *url.Error
+	if errors.As(got, &link) {
+		t.Errorf("%s recovered a URL from a custom As hook", name)
+	}
+}
+
+// assertOpaqueError checks that the wrapper only prints sanitized text.
+func assertOpaqueError(t *testing.T, c *Client, name string, got error) {
 	t.Helper()
 	if hiddenRedaction(got) == nil {
 		t.Errorf("%s returned %T; want opaque wrapper", name, got)
 	}
-	var link *url.Error
-	if errors.As(got, &link) && (link == nil || c.containsKey(link.Op) || c.containsKey(link.URL)) {
-		t.Errorf("%s exposed a nil or unsanitized URL error", name)
-	}
-	for _, format := range [...]string{"%v", "%+v", "%#v"} {
+	for _, format := range [...]string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X"} {
 		if c.containsKey(fmt.Sprintf(format, got)) {
 			t.Errorf("%s exposed the key with format %q", name, format)
 		}
+	}
+}
+
+type redactFirstChild struct {
+	child *url.Error
+	calls int
+}
+
+// Error returns a message independent of the wrapped error.
+func (*redactFirstChild) Error() string { return "fixture transport failure" }
+
+// next returns the fixture child on the first call only.
+func (e *redactFirstChild) next() error {
+	e.calls++
+	if e.calls == 1 {
+		return e.child
+	}
+	return nil
+}
+
+type redactFirstSingle struct{ *redactFirstChild }
+
+// Unwrap returns the first child as a single wrapped error.
+func (e redactFirstSingle) Unwrap() error { return e.next() }
+
+type redactFirstJoin struct{ *redactFirstChild }
+
+// Unwrap returns the first child as a joined error.
+func (e redactFirstJoin) Unwrap() []error {
+	if first := e.next(); first != nil {
+		return []error{first}
+	}
+	return nil
+}
+
+// TestRedactErrorReadsUnwrapOnce checks that each walk inspects the first result from Unwrap.
+func TestRedactErrorReadsUnwrapOnce(t *testing.T) {
+	t.Parallel()
+	for _, tc := range [...]struct {
+		name string
+		wrap func(*redactFirstChild) error
+	}{
+		{"single", func(first *redactFirstChild) error { return redactFirstSingle{first} }},
+		{"join", func(first *redactFirstChild) error { return redactFirstJoin{first} }},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			const key = "plum"
+			c := &Client{apiKey: key}
+			link := &url.Error{Op: "Get", URL: "http://h/" + key, Err: errors.New("dial")}
+			for name, apply := range map[string]func(error) error{"scrubError": c.scrubError, "redactError": c.redactError} {
+				first := &redactFirstChild{child: link}
+				assertFirstChildHidden(subtest, c, name, apply(tc.wrap(first)), first)
+			}
+			first := &redactFirstChild{child: link}
+			got := &redactedError{err: tc.wrap(first), key: key}
+			var copied *url.Error
+			if !errors.As(got, &copied) || copied == nil || copied == link || c.containsKey(copied.URL) {
+				subtest.Error("errors.As did not sanitize the first child")
+			}
+			if first.calls != 1 {
+				subtest.Errorf("errors.As called Unwrap %d times; want 1", first.calls)
+			}
+		})
+	}
+}
+
+// assertFirstChildHidden checks opacity and the call count after each walk.
+func assertFirstChildHidden(t *testing.T, c *Client, name string, got error, first *redactFirstChild) {
+	t.Helper()
+	assertOpaqueError(t, c, name, got)
+	if first.calls != 1 {
+		t.Errorf("%s called Unwrap %d times; want 1", name, first.calls)
+	}
+	var copied *url.Error
+	if errors.As(got, &copied) {
+		t.Errorf("%s recovered a URL after Unwrap stopped returning children", name)
+	}
+	if first.calls != 2 {
+		t.Errorf("%s and errors.As called Unwrap %d times; want 2", name, first.calls)
 	}
 }
 
@@ -228,6 +314,30 @@ type redactFixtureReflectedError struct{ text string }
 
 // Error returns a message without the fixture text.
 func (redactFixtureReflectedError) Error() string { return "fixture reflection failure" }
+
+type redactStringPointerError string
+
+// Error returns a message independent of the pointed-to string.
+func (*redactStringPointerError) Error() string { return "fixture reflection failure" }
+
+// TestRedactErrorHidesStringPointer checks a root string pointee and key-free identity.
+func TestRedactErrorHidesStringPointer(t *testing.T) {
+	t.Parallel()
+	const key = "plum"
+	c := &Client{apiKey: key}
+	hidden, plain := redactStringPointerError(key), redactStringPointerError("pear")
+	for name, apply := range map[string]func(error) error{"scrubError": c.scrubError, "redactError": c.redactError} {
+		got := apply(&hidden)
+		assertOpaqueError(t, c, name, got)
+		var exposed *redactStringPointerError
+		if errors.As(got, &exposed) {
+			t.Errorf("%s exposed the original string pointer", name)
+		}
+		if apply(&plain) != &plain { //nolint:errorlint // require the exact pointer to pass through
+			t.Errorf("%s changed the identity of a key-free string pointer", name)
+		}
+	}
+}
 
 // TestScrubErrorHidesGoSyntax checks both ways that Go-syntax output can expose the key.
 func TestScrubErrorHidesGoSyntax(t *testing.T) {
@@ -420,16 +530,22 @@ func TestDecodeProjectionByteBudget(t *testing.T) {
 	under := input + strings.Repeat("x", 4)
 	exact := under + "x"
 	c := &Client{apiKey: key}
-	for _, tc := range []struct{ name, text, want string }{
-		{"under budget", under, under},
-		{"exact budget", exact, exact},
-		{"over budget", exact + "x", "REDACTED"},
-		{"ordinary mixed escapes", key + " " + ordinary, "REDACTED " + ordinary},
+	for _, tc := range []struct {
+		name, text, want string
+		contains         bool
+	}{
+		{"under budget", under, under, false},
+		{"exact budget", exact, exact, false},
+		{"over budget", exact + "x", "REDACTED", true},
+		{"ordinary mixed escapes", key + " " + ordinary, "REDACTED " + ordinary, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			if got := c.scrubText(tc.text); got != tc.want {
 				t.Error("unexpected text redaction")
+			}
+			if got := c.containsKey(tc.text); got != tc.contains {
+				t.Errorf("containsKey = %t; want %t", got, tc.contains)
 			}
 		})
 	}
@@ -538,6 +654,24 @@ func TestURLCopyUnsafeCause(t *testing.T) {
 			assertURLCauseViews(t, c.redactError(original), original, tc.timeout)
 			assertURLCauseViews(t, c.scrubError(errors.Join(original)), original, tc.timeout)
 		})
+	}
+}
+
+// TestURLCopyPreviouslyRedactedUnsafeCause checks classifiers on a reused unsafe wrapper and both URL copy paths.
+func TestURLCopyPreviouslyRedactedUnsafeCause(t *testing.T) {
+	t.Parallel()
+	const key = "plum"
+	c := &Client{apiKey: key}
+	var dns *net.DNSError
+	prior := hiddenRedaction(c.redactError(&net.OpError{Op: "dial", Err: dns}))
+	if prior == nil {
+		t.Fatal("expected a previously redacted cause")
+	}
+	original := &url.Error{Op: "Get", URL: "http://h/" + key, Err: prior}
+	assertURLCauseViews(t, c.redactError(original), original, false)
+	assertURLCauseViews(t, c.scrubError(errors.Join(original)), original, false)
+	if prior.Timeout() || prior.Temporary() {
+		t.Error("previously redacted cause reported a classification")
 	}
 }
 

@@ -482,7 +482,7 @@ func (e *redactedError) As(target any) bool {
 	// Why: bounded breadth-first walk over the hidden tree; errors.As on it would search unbounded.
 	queue := []error{e.err}
 	for i := 0; i < maxErrNodes && i < len(queue); i++ {
-		if uerr, ok := queue[i].(*url.Error); ok && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
+		if uerr, isURL := queue[i].(*url.Error); isURL && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
 			// Why: hand out a scrubbed copy, never the original that holds the key.
 			c := Client{apiKey: e.key}
 			*dst = &url.Error{
@@ -654,13 +654,10 @@ func inspectErrorTree(err error) ([]error, bool) {
 	}
 	queue := []error{err}
 	for i := 0; i < maxErrNodes && i < len(queue); i++ {
-		if unsafeErrorNode(queue[i], maxErrNodes-len(queue)) {
+		var unsafe bool
+		queue, unsafe = appendWrappedChildren(queue, queue[i])
+		if unsafe {
 			// Why: formatting an oversized tree or a typed-nil node can be unsafe.
-			return nil, true
-		}
-		queue = appendWrapped(queue, queue[i])
-		if len(queue) > maxErrNodes {
-			// Why: a tree past the bound is hidden unread; formatting a fan-out root can be exponential.
 			return nil, true
 		}
 	}
@@ -693,10 +690,7 @@ const maxReflectedValues = 1024
 func (c *Client) reflectedErrorNeedsRedaction(root reflect.Value) bool {
 	queue := []reflect.Value{root}
 	if root.Kind() == reflect.Pointer && !root.IsNil() {
-		elem := root.Elem()
-		if slices.Contains([]reflect.Kind{reflect.Array, reflect.Slice, reflect.Struct, reflect.Map}, elem.Kind()) {
-			queue = append(queue, elem)
-		}
+		queue = append(queue, root.Elem())
 	}
 	for i := 0; i < len(queue) && i < maxReflectedValues; i++ {
 		value := queue[i]
@@ -813,46 +807,44 @@ func (c *Client) reflectedBytesHaveKey(value reflect.Value) bool {
 	return c.containsKey(string(bytes))
 }
 
-// unsafeErrorNode reports whether err or a direct child is typed nil, or the join exceeds the remaining slots.
-func unsafeErrorNode(err error, remaining int) bool {
-	if isNilError(err) {
-		return true
-	}
-	if w := errors.Unwrap(err); w != nil {
-		return isNilError(w)
-	}
-	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok {
-		return false
-	}
-	children, clipped := boundedJoinChildren(joined, remaining)
-	if clipped {
-		return true
-	}
-	for _, child := range children {
-		if child != nil && isNilError(child) {
-			return true
-		}
-	}
-	return false
+// appendWrapped queues non-nil children for URL recovery, which can skip unsafe nodes.
+func appendWrapped(queue []error, err error) []error {
+	queue, _ = appendWrappedChildren(queue, err)
+	return queue
 }
 
-// appendWrapped appends non-nil wrapped errors while bounding queue growth.
-func appendWrapped(queue []error, err error) []error {
+// appendWrappedChildren reads children once, queues non-nil children, and reports typed nils or overflow.
+func appendWrappedChildren(queue []error, err error) ([]error, bool) {
 	if len(queue) > maxErrNodes || isNilError(err) {
-		// Why: carriesKey already treats this tree as too large; a typed-nil node has no children.
-		return queue
+		return queue, true
 	}
-	if w := errors.Unwrap(err); !isNilError(w) {
-		return append(queue, w)
+	remaining := maxErrNodes - len(queue)
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children, clipped := boundedJoinChildren(joined, remaining)
+		return appendJoinChildren(queue, children, clipped)
 	}
-	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok {
-		return queue
+	child := errors.Unwrap(err)
+	switch {
+	case child == nil:
+		return queue, false
+	case isNilError(child):
+		return queue, true
+	case remaining == 0:
+		return append(queue, nil), true
+	default:
+		return append(queue, child), false
 	}
-	children, clipped := boundedJoinChildren(joined, maxErrNodes-len(queue))
+}
+
+// appendJoinChildren queues non-nil children and reports typed nils or a clipped join.
+func appendJoinChildren(queue, children []error, clipped bool) ([]error, bool) {
+	unsafe := clipped
 	for _, child := range children {
-		if !isNilError(child) {
+		switch {
+		case child == nil:
+		case isNilError(child):
+			unsafe = true
+		default:
 			queue = append(queue, child)
 		}
 	}
@@ -860,7 +852,7 @@ func appendWrapped(queue []error, err error) []error {
 		// Why: retain an overflow slot without reading the next child.
 		queue = append(queue, nil)
 	}
-	return queue
+	return queue, unsafe
 }
 
 // redactError sanitizes URL errors and hides error trees that may expose the API key.
