@@ -2272,12 +2272,15 @@ func (e *redactCountedCheckNode) Unwrap() error {
 	return e.next
 }
 
+const nestedFieldFixtureURL = "http://h/feed"
+
 type nestedFieldChangeCase struct {
-	field      string
-	setupCalls int
-	checkCalls int
-	wantURL    bool
+	field                    string
+	setupCalls, checkCalls   int
+	wantUnchanged, wantWrite nestedFieldURLFields
 }
+
+type nestedFieldURLFields struct{ op, url string }
 
 type nestedFieldWritePhase string
 
@@ -2287,21 +2290,26 @@ const (
 	nestedFieldNoWrite    nestedFieldWritePhase = "none"
 )
 
-// writePhase uses the call counts measured with the writer unfired.
-func (tc nestedFieldChangeCase) writePhase(at int) nestedFieldWritePhase {
+// expectedAt uses the call counts measured with the writer unfired.
+func (tc nestedFieldChangeCase) expectedAt(at int) (nestedFieldWritePhase, nestedFieldURLFields) {
 	switch {
 	case at <= tc.setupCalls:
-		return nestedFieldWriteSetup
+		return nestedFieldWriteSetup, tc.wantWrite
 	case at <= tc.setupCalls+tc.checkCalls:
-		return nestedFieldWriteCheck
+		return nestedFieldWriteCheck, tc.wantWrite
 	default:
-		return nestedFieldNoWrite
+		return nestedFieldNoWrite, tc.wantUnchanged
 	}
 }
 
 // TestRedactErrorNestedFieldChangedDuringCheck checks setup writes, inspection writes, and unfired controls.
 func TestRedactErrorNestedFieldChangedDuringCheck(t *testing.T) {
 	t.Parallel()
+	cleanNested := nestedFieldURLFields{"Get", nestedFieldFixtureURL}
+	redactedURL := nestedFieldURLFields{"Get", "http://h/feed?apikey=REDACTED"}
+	redactedOp := nestedFieldURLFields{"Get REDACTED", nestedFieldFixtureURL}
+	outer := nestedFieldURLFields{"Get", "http://h/outer"}
+	noURL := nestedFieldURLFields{}
 	for _, wrapper := range [...]struct {
 		name   string
 		wrap   func(error) error
@@ -2310,26 +2318,40 @@ func TestRedactErrorNestedFieldChangedDuringCheck(t *testing.T) {
 		{
 			"quiet",
 			func(nested error) error { return &redactCountedCheckNode{next: nested} },
-			[3]nestedFieldChangeCase{{"URL", 0, 2, true}, {"Op", 0, 2, true}, {"Detail", 0, 2, false}},
+			[3]nestedFieldChangeCase{
+				{"URL", 0, 2, cleanNested, redactedURL},
+				{"Op", 0, 2, cleanNested, redactedOp},
+				{"Detail", 0, 2, noURL, noURL},
+			},
 		},
 		{
 			"errorf",
 			func(nested error) error { return fmt.Errorf("read response: %w", nested) },
-			[3]nestedFieldChangeCase{{"URL", 1, 2, true}, {"Op", 1, 2, true}, {"Detail", 1, 2, false}},
+			[3]nestedFieldChangeCase{
+				{"URL", 1, 2, cleanNested, redactedURL},
+				{"Op", 1, 2, cleanNested, redactedOp},
+				{"Detail", 1, 2, noURL, noURL},
+			},
 		},
 		{
 			"root",
 			func(nested error) error {
-				return &url.Error{Op: "Get", URL: "http://h/feed", Err: fmt.Errorf("x: %w", nested)}
+				return &url.Error{Op: "Get", URL: "http://h/outer", Err: fmt.Errorf("x: %w", nested)}
 			},
-			[3]nestedFieldChangeCase{{"URL", 1, 2, true}, {"Op", 1, 2, true}, {"Detail", 1, 2, true}},
+			[3]nestedFieldChangeCase{
+				{"URL", 1, 2, outer, outer},
+				{"Op", 1, 2, outer, outer},
+				{"Detail", 1, 2, outer, outer},
+			},
 		},
 		{
 			"root live cause",
-			func(nested error) error {
-				return &url.Error{Op: "Get", URL: "http://h/feed", Err: nested}
+			func(nested error) error { return &url.Error{Op: "Get", URL: "http://h/outer", Err: nested} },
+			[3]nestedFieldChangeCase{
+				{"URL", 0, 3, outer, outer},
+				{"Op", 0, 3, outer, outer},
+				{"Detail", 0, 3, outer, outer},
 			},
-			[3]nestedFieldChangeCase{{"URL", 0, 3, true}, {"Op", 0, 3, true}, {"Detail", 0, 3, true}},
 		},
 	} {
 		for _, tc := range wrapper.fields {
@@ -2347,14 +2369,14 @@ func testNestedFieldChangeCalls(t *testing.T, tc nestedFieldChangeCase, wrap fun
 	for at := 1; at <= 5; at++ {
 		t.Run("at="+strconv.Itoa(at), func(subtest *testing.T) {
 			subtest.Parallel()
-			phase := tc.writePhase(at)
+			phase, wantFields := tc.expectedAt(at)
 			writer := &redactNestedFieldWriter{at: at, writeOp: tc.field == "Op"}
 			var nested error
 			if tc.field == "Detail" {
 				writer.detail = &redactNestedDetailError{Detail: "clean detail", cause: writer}
 				nested = writer.detail
 			} else {
-				writer.parent = &url.Error{Op: "Get", URL: "http://h/feed", Err: writer}
+				writer.parent = &url.Error{Op: "Get", URL: nestedFieldFixtureURL, Err: writer}
 				nested = writer.parent
 			}
 			input := wrap(nested)
@@ -2371,13 +2393,13 @@ func testNestedFieldChangeCalls(t *testing.T, tc nestedFieldChangeCase, wrap fun
 				subtest.Fatalf("after redactError: wrote = %t after %d total reads; want %t (phase %s)",
 					redactWrote, redactReads, phase != nestedFieldNoWrite, phase)
 			}
-			assertNestedFieldChange(subtest, input, got, phase, tc.wantURL)
+			assertNestedFieldChange(subtest, input, got, phase, wantFields)
 		})
 	}
 }
 
 // assertNestedFieldChange checks identity, URL recovery, and all three formatting forms.
-func assertNestedFieldChange(t *testing.T, input, got error, phase nestedFieldWritePhase, wantURL bool) {
+func assertNestedFieldChange(t *testing.T, input, got error, phase nestedFieldWritePhase, wantFields nestedFieldURLFields) {
 	t.Helper()
 	wrote := phase != nestedFieldNoWrite
 	if wrote && got == nil {
@@ -2387,7 +2409,7 @@ func assertNestedFieldChange(t *testing.T, input, got error, phase nestedFieldWr
 	if kept == wrote {
 		t.Errorf("redactError kept input = %t in phase %s; want %t", kept, phase, !wrote)
 	}
-	assertNestedFieldURL(t, got, wantURL)
+	assertNestedFieldURL(t, got, wantFields)
 	if !wrote {
 		return
 	}
@@ -2398,10 +2420,11 @@ func assertNestedFieldChange(t *testing.T, input, got error, phase nestedFieldWr
 	}
 }
 
-// assertNestedFieldURL checks the expected URL match and its sanitized fields.
-func assertNestedFieldURL(t *testing.T, got error, wantURL bool) {
+// assertNestedFieldURL checks the expected URL match and its exact fields.
+func assertNestedFieldURL(t *testing.T, got error, wantFields nestedFieldURLFields) {
 	t.Helper()
 	var recovered *url.Error
+	wantURL := wantFields.url != ""
 	if matched := errors.As(got, &recovered); matched != wantURL {
 		t.Fatalf("errors.As URL match = %t; want %t", matched, wantURL)
 	}
@@ -2411,8 +2434,9 @@ func assertNestedFieldURL(t *testing.T, got error, wantURL bool) {
 	if recovered == nil {
 		t.Fatal("errors.As matched a nil URL error")
 	}
-	if strings.Contains(recovered.Op, "maple") || strings.Contains(recovered.URL, "maple") {
-		t.Error("errors.As exposed the fixture key in the recovered URL error")
+	if recovered.Op != wantFields.op || recovered.URL != wantFields.url {
+		t.Errorf("errors.As recovered Op %q and URL %q; want Op %q and URL %q",
+			recovered.Op, recovered.URL, wantFields.op, wantFields.url)
 	}
 }
 
@@ -2505,6 +2529,14 @@ func TestRedactErrorCleanRootURLNodeLimit(t *testing.T) {
 	}
 }
 
+// TestRedactErrorNodeLimitContract pins the documented error inspection limit.
+func TestRedactErrorNodeLimitContract(t *testing.T) {
+	t.Parallel()
+	if maxErrNodes != 64 {
+		t.Errorf("maxErrNodes = %d; want 64", maxErrNodes)
+	}
+}
+
 // TestRedactErrorCleanRootURLReadLimit checks that typed nils spend the cause budget.
 func TestRedactErrorCleanRootURLReadLimit(t *testing.T) {
 	t.Parallel()
@@ -2515,10 +2547,10 @@ func TestRedactErrorCleanRootURLReadLimit(t *testing.T) {
 		cause func(int, *int) error
 		fixed bool
 	}{
-		{"64 reads in join", maxErrNodes - 2, typedNilRootJoin, true},
-		{"63 reads in join", maxErrNodes - 3, typedNilRootJoin, false},
-		{"64 reads in chain", maxErrNodes - 2, typedNilRootChain, true},
-		{"63 reads in chain", maxErrNodes - 3, typedNilRootChain, false},
+		{"64 reads in join", 62, typedNilRootJoin, true},
+		{"63 reads in join", 61, typedNilRootJoin, false},
+		{"64 reads in chain", 62, typedNilRootChain, true},
+		{"63 reads in chain", 61, typedNilRootChain, false},
 	} {
 		t.Run(tc.name, func(subtest *testing.T) {
 			subtest.Parallel()

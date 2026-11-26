@@ -84,8 +84,14 @@ func TestRedactErrorSameKeyWrapperOuterText(t *testing.T) {
 	inner := client.redactError(fmt.Errorf("fixture %s: %w", key, io.EOF))
 	input := fmt.Errorf("fixture %s: %w", key, inner)
 	got := client.redactError(input)
+	if got == nil {
+		t.Fatal("redactError returned nil for the key-bearing outer error")
+	}
 	if any(got) == any(input) {
 		t.Error("redactError kept the key-bearing outer error")
+	}
+	if text := got.Error(); text != "fixture REDACTED: fixture REDACTED: EOF" {
+		t.Errorf("redactError text = %q; want fixture REDACTED: fixture REDACTED: EOF", text)
 	}
 	for _, text := range [...]string{fmt.Sprint(got), fmt.Sprintf("%+v", got), fmt.Sprintf("%#v", got)} {
 		assertNoKeyForms(t, text, key)
@@ -172,6 +178,9 @@ func assertOwnedWrapperPositions(t *testing.T, client *Client, wrapped error, ke
 		t.Run(position.name, func(subtest *testing.T) {
 			subtest.Parallel()
 			got := client.redactError(position.input)
+			if got == nil {
+				subtest.Fatal("redactError returned nil for the wrapper position")
+			}
 			if same := any(got) == any(position.input); same != keep {
 				subtest.Errorf("same error value = %t; want %t", same, keep)
 			}
@@ -210,11 +219,11 @@ func testExternalFormatterPositions(t *testing.T) {
 }
 
 type redactIdempotentCase struct {
-	name, wantText string
-	input          error
-	wantURL        *url.Error
-	keep           bool
-	fixedCause     bool
+	name, wantText             string
+	input                      error
+	wantURL                    *url.Error
+	keep, fixedCause           bool
+	wantTimeout, wantTemporary bool
 }
 
 // TestRedactErrorIdempotent checks the first result and that a second pass keeps it.
@@ -246,9 +255,11 @@ func TestRedactErrorIdempotent(t *testing.T) {
 			wantURL: &url.Error{Op: "Get", URL: wrapperFixtureURL, Err: io.EOF},
 		},
 		{
-			name:    "URL copy with timeout",
-			input:   &url.Error{Op: "Get", URL: wrapperFixtureURL + "?apikey=maple", Err: timeout},
-			wantURL: &url.Error{Op: "Get", URL: wrapperFixtureRedactedURL, Err: io.EOF},
+			name:          "URL copy with timeout",
+			input:         &url.Error{Op: "Get", URL: wrapperFixtureURL + "?apikey=maple", Err: timeout},
+			wantURL:       &url.Error{Op: "Get", URL: wrapperFixtureRedactedURL, Err: io.EOF},
+			wantTimeout:   true,
+			wantTemporary: true,
 		},
 		{
 			name:       "URL with typed-nil cause",
@@ -270,7 +281,7 @@ func TestRedactErrorIdempotent(t *testing.T) {
 	}
 }
 
-// assertFirstRedaction checks first-pass identity, URL fields, and exact text.
+// assertFirstRedaction checks first-pass identity, URL recovery, and exact text.
 func assertFirstRedaction(t *testing.T, got error, tc redactIdempotentCase) {
 	t.Helper()
 	if same := any(got) == any(tc.input); same != tc.keep {
@@ -278,17 +289,26 @@ func assertFirstRedaction(t *testing.T, got error, tc redactIdempotentCase) {
 	}
 	wantText := tc.wantText
 	if tc.wantURL != nil {
-		copied, ok := got.(*url.Error) //nolint:errorlint // check the direct URL result
-		if !ok || copied == nil || copied.Op != tc.wantURL.Op || copied.URL != tc.wantURL.URL {
-			t.Fatalf("first redaction returned %T (%v); want Op %q and URL %q", got, got, tc.wantURL.Op, tc.wantURL.URL)
-		}
-		if tc.fixedCause {
-			assertObservedRootCause(t, copied.Err, true)
-		}
+		assertFirstRedactionURL(t, got, tc)
 		wantText = tc.wantURL.Error()
 	}
 	if got == nil || got.Error() != wantText {
 		t.Errorf("first redaction text = %v; want %q", got, wantText)
+	}
+}
+
+// assertFirstRedactionURL checks the first URL result's fields and classification.
+func assertFirstRedactionURL(t *testing.T, got error, tc redactIdempotentCase) {
+	t.Helper()
+	copied, ok := got.(*url.Error) //nolint:errorlint // check the direct URL result
+	if !ok || copied == nil || copied.Op != tc.wantURL.Op || copied.URL != tc.wantURL.URL {
+		t.Fatalf("first redaction returned %T (%v); want Op %q and URL %q", got, got, tc.wantURL.Op, tc.wantURL.URL)
+	}
+	if tc.fixedCause {
+		assertObservedRootCause(t, copied.Err, true)
+	}
+	if timedOut, temporary := copied.Timeout(), copied.Temporary(); timedOut != tc.wantTimeout || temporary != tc.wantTemporary {
+		t.Errorf("URL copy Timeout() = %t, Temporary() = %t; want %t, %t", timedOut, temporary, tc.wantTimeout, tc.wantTemporary)
 	}
 }
 
