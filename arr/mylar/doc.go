@@ -3,17 +3,25 @@
 // Mylar3 is an automated comic book downloader and manager.
 // Authentication uses an API key passed as a query parameter.
 //
-// Key detection matches literal, percent-encoded, or backslash-u key bytes at each offset
-// in input and in percent-only, backslash-only, and mixed decode projections.
-// It redacts on a key match, more than 16 new projections in a layer,
-// or a new projection at the fourth layer.
+// Key detection matches literal, percent, and backslash-u spellings per key byte at each offset.
+// Percent-only, backslash-only, and mixed projections use the same matcher.
+// Redaction triggers on key match, more than 16 new projections per layer,
+// new projection at layer four, or retained projection bytes above 8x input size.
 // Error redaction scans up to 64 nodes for structural inspection and URL recovery.
-// Errors with custom formatting or As methods, or with exposed keys in Go-syntax output, are wrapped.
-// Each forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
-// Root and errors.As URL copies parse and redact apikey query values before literal key replacement
-// and canonical check. Copies preserve nil and typed-nil causes and hide other causes.
-// Immediate cause implements Timeout or Temporary → both classifications captured within one such walk.
-// Contract limits — Raw percent sign or backslash directly before key spelled across two or more escape layers, typed-nil causes below immediate cause classify false, %#v inherits fmt recursion on self-referential values, formatting code emits key only on later call, nested *url.Error with apikey value other than configured key.
+// Key in Error text, direct URL error fields, or reflected leaves → opaque wrapper.
+// Reflection checks up to 1024 values per node and follows only the start pointer.
+// Overflow or a nested fmt.Formatter or fmt.GoStringer → opaque wrapper.
+// Custom formatting or As on an error node → opaque wrapper.
+// Forwarded identity or classification search visits up to 4096 nodes and 64 joined errors.
+// Root and errors.As URL copies redact apikey query values before literal replacement and canonical check.
+// URL copies keep nil causes. Typed-nil or unsafe causes become fixed opaque errors without classification.
+// Safe immediate cause implements Timeout or Temporary → both classifications captured in one walk.
+//
+// Contract limits
+//
+//   - Raw percent sign or backslash directly before key spelled across two or more escape layers.
+//   - Error method prints key only on later call.
+//   - Nested *url.Error with apikey value other than configured key.
 //
 // Usage:
 //

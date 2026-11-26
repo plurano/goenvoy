@@ -45,6 +45,9 @@ const maxDecodePasses = 4
 // maxDecodeProjections bounds the distinct new texts at each layer.
 const maxDecodeProjections = 16
 
+// maxDecodeBytesFactor bounds retained projection bytes relative to the input size.
+const maxDecodeBytesFactor = 8
+
 type escapeKinds uint8
 
 const (
@@ -65,8 +68,9 @@ func (c *Client) containsKey(text string) bool {
 	}
 	frontier := []string{text}
 	seen := map[string]struct{}{text: {}}
+	remainingBytes := uint64(len(text)) * maxDecodeBytesFactor
 	for pass := 0; pass < maxDecodePasses && len(frontier) != 0; pass++ {
-		next, redact := c.decodeLayer(frontier, seen)
+		next, redact := c.decodeLayer(frontier, seen, &remainingBytes)
 		if redact {
 			return true
 		}
@@ -131,8 +135,8 @@ func matchesHexByte(text string, want byte) bool {
 	return text[0]|0x20 == digits[want>>4] && text[1]|0x20 == digits[want&0xf]
 }
 
-// decodeLayer collects unseen projections and reports a key match or projection overflow.
-func (c *Client) decodeLayer(frontier []string, seen map[string]struct{}) ([]string, bool) {
+// decodeLayer collects unseen projections and reports a key match or exceeded budget.
+func (c *Client) decodeLayer(frontier []string, seen map[string]struct{}, remainingBytes *uint64) ([]string, bool) {
 	next := make([]string, 0, maxDecodeProjections)
 	for _, text := range frontier {
 		for _, kinds := range [...]escapeKinds{percentEscapes, backslashEscapes, percentEscapes | backslashEscapes} {
@@ -141,9 +145,11 @@ func (c *Client) decodeLayer(frontier []string, seen map[string]struct{}) ([]str
 			if _, visited := seen[decoded]; visited {
 				continue
 			}
-			if c.matchesKeySpelling(decoded) || len(next) == maxDecodeProjections {
+			size := uint64(len(decoded))
+			if size > *remainingBytes || len(next) == maxDecodeProjections || c.matchesKeySpelling(decoded) {
 				return nil, true
 			}
+			*remainingBytes -= size
 			seen[decoded] = struct{}{}
 			next = append(next, decoded)
 		}
@@ -277,11 +283,24 @@ type (
 func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	reported := false
 	e.walk(nil, func(node error) walkAction {
+		if unsafeURLCause(node) {
+			return walkStop
+		}
 		var action walkAction
 		action, reported = classifyNode(node, classify)
 		return action
 	})
 	return reported
+}
+
+// unsafeURLCause reports whether a URL error's immediate cause is unsafe to classify.
+func unsafeURLCause(node error) bool {
+	uerr, ok := node.(*url.Error) //nolint:errorlint // classify only the current URL error
+	if !ok {
+		return false
+	}
+	_, unsafe := inspectErrorTree(uerr.Err)
+	return unsafe
 }
 
 // classifyNode returns the traversal action and classification for a single node.
@@ -434,8 +453,8 @@ func isNilValue(value any) bool {
 }
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
-// The copy preserves nil and typed-nil causes and hides other causes.
-// If the immediate cause implements Timeout or Temporary, the copy captures both classifications
+// It preserves nil causes and replaces typed-nil or unsafe causes with a fixed, unclassified error.
+// If a safe immediate cause implements Timeout or Temporary, the copy captures both classifications
 // in one walk of up to 4096 nodes and 64 joined errors.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
@@ -552,16 +571,19 @@ func (c *Client) scrubError(err error) error {
 	return &redactedError{msg: c.scrubText(err.Error()), err: err, key: c.apiKey}
 }
 
-// hideCause wraps a URL error's immediate cause and preserves its classification results.
+// hideCause keeps nil causes and replaces typed-nil or unsafe causes with a fixed, unclassified error.
+// It scrubs safe causes and captures their classifications when applicable.
 func (c *Client) hideCause(err error) error {
-	if isNilError(err) {
-		return err
+	if err == nil {
+		return nil
 	}
 	hidden := &redactedError{msg: redactedTreeMsg, err: err, key: c.apiKey}
-	if _, tooLarge := c.checkErrorTree(err); !tooLarge {
-		hidden.msg = c.scrubText(err.Error())
-	}
 	cause := opaqueURLCause{hidden: hidden}
+	if _, unsafe := inspectErrorTree(err); unsafe {
+		// Why: retain bounded identity matching without exposing a live classifier.
+		return &cause
+	}
+	hidden.msg = c.scrubText(err.Error())
 	_, timesOut := err.(hiddenTimeoutClassifier)
 	_, temporary := err.(hiddenTemporaryClassifier)
 	if timesOut || temporary {
@@ -578,20 +600,9 @@ func (c *Client) carriesKey(err error) bool {
 
 // checkErrorTree reports whether err needs redaction and whether its Error method is unsafe to call.
 func (c *Client) checkErrorTree(err error) (bool, bool) {
-	if err == nil {
-		return false, false
-	}
-	queue := []error{err}
-	for i := 0; i < maxErrNodes && i < len(queue); i++ {
-		if unsafeErrorNode(queue[i], maxErrNodes-len(queue)) {
-			// Why: formatting an oversized tree or a typed-nil node can be unsafe.
-			return true, true
-		}
-		queue = appendWrapped(queue, queue[i])
-		if len(queue) > maxErrNodes {
-			// Why: a tree past the bound is hidden unread; formatting a fan-out root can be exponential.
-			return true, true
-		}
+	queue, unsafe := inspectErrorTree(err)
+	if unsafe {
+		return true, true
 	}
 	if slices.ContainsFunc(queue, hasCustomFormattingOrAs) {
 		return true, false
@@ -602,6 +613,26 @@ func (c *Client) checkErrorTree(err error) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+// inspectErrorTree collects nodes in breadth-first order without calling Error or classifiers.
+func inspectErrorTree(err error) ([]error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	queue := []error{err}
+	for i := 0; i < maxErrNodes && i < len(queue); i++ {
+		if unsafeErrorNode(queue[i], maxErrNodes-len(queue)) {
+			// Why: formatting an oversized tree or a typed-nil node can be unsafe.
+			return nil, true
+		}
+		queue = appendWrapped(queue, queue[i])
+		if len(queue) > maxErrNodes {
+			// Why: a tree past the bound is hidden unread; formatting a fan-out root can be exponential.
+			return nil, true
+		}
+	}
+	return queue, false
 }
 
 // hasCustomFormattingOrAs reports whether an external node controls formatting or errors.As.
@@ -615,12 +646,139 @@ func hasCustomFormattingOrAs(node error) bool {
 	return formats || goStrings || customAs
 }
 
-// errorNodeNeedsRedaction checks URL fields, error text, and Go-syntax output.
+// errorNodeNeedsRedaction checks URL fields, error text, and values visible to Go-syntax formatting.
 func (c *Client) errorNodeNeedsRedaction(node error) bool {
 	if uerr, ok := node.(*url.Error); ok && (c.containsKey(uerr.Op) || c.containsKey(uerr.URL)) { //nolint:errorlint // inspect only this node's fields
 		return true
 	}
-	return c.containsKey(node.Error()) || c.containsKey(fmt.Sprintf("%#v", node))
+	return c.containsKey(node.Error()) || c.reflectedErrorNeedsRedaction(reflect.ValueOf(node))
+}
+
+// maxReflectedValues bounds the number of values inspected for each error node.
+const maxReflectedValues = 1024
+
+// reflectedErrorNeedsRedaction checks visible values without invoking formatting methods.
+func (c *Client) reflectedErrorNeedsRedaction(root reflect.Value) bool {
+	queue := []reflect.Value{root}
+	if root.Kind() == reflect.Pointer && !root.IsNil() {
+		elem := root.Elem()
+		if slices.Contains([]reflect.Kind{reflect.Array, reflect.Slice, reflect.Struct, reflect.Map}, elem.Kind()) {
+			queue = append(queue, elem)
+		}
+	}
+	for i := 0; i < len(queue) && i < maxReflectedValues; i++ {
+		value := queue[i]
+		if i != 0 && hasReflectedFormatter(value) {
+			return true
+		}
+		queue = appendReflectedChildren(queue, value)
+		if queue == nil || c.reflectedValueHasKey(value) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasReflectedFormatter reports whether fmt would call formatting code for this value.
+func hasReflectedFormatter(value reflect.Value) bool {
+	if !value.CanInterface() || value.Kind() == reflect.Interface {
+		// Why: an interface's dynamic value is checked separately when visited.
+		return false
+	}
+	typ := value.Type()
+	return typ.Implements(reflect.TypeFor[fmt.Formatter]()) || typ.Implements(reflect.TypeFor[fmt.GoStringer]())
+}
+
+// appendReflectedChildren appends visible children, returning nil if they would exceed the bound.
+func appendReflectedChildren(queue []reflect.Value, value reflect.Value) []reflect.Value {
+	switch value.Kind() {
+	case reflect.Struct:
+		return appendReflectedValues(queue, value.NumField(), value.Field)
+	case reflect.Array, reflect.Slice:
+		return appendReflectedValues(queue, value.Len(), value.Index)
+	case reflect.Map:
+		return appendReflectedMap(queue, value)
+	case reflect.Interface:
+		if elem := value.Elem(); elem.IsValid() {
+			if len(queue) == maxReflectedValues {
+				return nil
+			}
+			return append(queue, elem)
+		}
+	case reflect.Invalid, reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.String,
+		reflect.Chan, reflect.Func, reflect.Pointer, reflect.UnsafePointer:
+		// Why: scalar values and nested pointers have no children visible to the walk.
+	}
+	return queue
+}
+
+// appendReflectedValues schedules an indexed set of children within the remaining budget.
+func appendReflectedValues(queue []reflect.Value, count int, at func(int) reflect.Value) []reflect.Value {
+	if count > maxReflectedValues-len(queue) {
+		return nil
+	}
+	for i := range count {
+		queue = append(queue, at(i))
+	}
+	return queue
+}
+
+// appendReflectedMap schedules map keys and values within the remaining budget.
+func appendReflectedMap(queue []reflect.Value, value reflect.Value) []reflect.Value {
+	count := value.Len()
+	if count > (maxReflectedValues-len(queue))/2 {
+		return nil
+	}
+	entries := value.MapRange()
+	for range count {
+		if !entries.Next() {
+			break
+		}
+		queue = append(queue, entries.Key(), entries.Value())
+	}
+	return queue
+}
+
+// reflectedValueHasKey checks scalar values and byte sequences for the key.
+func (c *Client) reflectedValueHasKey(value reflect.Value) bool {
+	var text string
+	switch value.Kind() {
+	case reflect.String:
+		text = value.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		text = strconv.FormatInt(value.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		text = "0x" + strconv.FormatUint(value.Uint(), 16)
+	case reflect.Float32, reflect.Float64:
+		text = strconv.FormatFloat(value.Float(), 'g', -1, value.Type().Bits())
+	case reflect.Complex64, reflect.Complex128:
+		text = strconv.FormatComplex(value.Complex(), 'g', -1, value.Type().Bits())
+	case reflect.Bool:
+		text = strconv.FormatBool(value.Bool())
+	case reflect.Array, reflect.Slice:
+		return c.reflectedBytesHaveKey(value)
+	case reflect.Invalid, reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer,
+		reflect.Struct, reflect.UnsafePointer:
+		return false
+	}
+	return c.containsKey(text)
+}
+
+// reflectedBytesHaveKey checks byte sequences as text after their length has been bounded.
+func (c *Client) reflectedBytesHaveKey(value reflect.Value) bool {
+	if value.Type().Elem().Kind() != reflect.Uint8 {
+		return false
+	}
+	if value.Kind() == reflect.Slice || value.CanAddr() {
+		return c.containsKey(string(value.Bytes()))
+	}
+	bytes := make([]byte, value.Len())
+	for i := range bytes {
+		bytes[i] = byte(value.Index(i).Uint() & 0xff)
+	}
+	return c.containsKey(string(bytes))
 }
 
 // unsafeErrorNode reports whether err or a direct child is typed nil, or the join exceeds the remaining slots.
@@ -681,7 +839,8 @@ func (c *Client) redactError(err error) error {
 		// Why: a copy never mutates an error value net/http or a custom transport may share.
 		cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(uerr.URL))
 		if cleanOp != uerr.Op || cleanURL != uerr.URL || (uerr.Err != nil && c.carriesKey(uerr.Err)) {
-			err = &url.Error{Op: cleanOp, URL: cleanURL, Err: c.hideCause(uerr.Err)}
+			// Why: the copy's fields are already sanitized, including its package-owned cause formatter.
+			return &url.Error{Op: cleanOp, URL: cleanURL, Err: c.hideCause(uerr.Err)}
 		}
 	}
 	return c.scrubError(err)

@@ -1,12 +1,16 @@
 package nzbhydra
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -253,6 +257,133 @@ func TestScrubErrorHidesGoSyntax(t *testing.T) {
 	}
 }
 
+type redactCycleFieldError struct{ fields map[string]any }
+
+// Error returns a message independent of the map.
+func (redactCycleFieldError) Error() string { return "fixture transport failure" }
+
+// TestScrubErrorReflectCycle isolates a self-referential map from the test runner.
+func TestScrubErrorReflectCycle(t *testing.T) {
+	t.Parallel()
+	const child = "redact-cycle-child"
+	if slices.Contains(os.Args[1:], child) {
+		assertReflectCycleHidden(t)
+		return
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test executable: %v", err)
+	}
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestScrubErrorReflectCycle$", "--", child)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(output), "fatal error: stack overflow") {
+			t.Fatal("scrubError overflowed the child stack")
+		}
+		t.Fatalf("cycle child: %v\n%s", err, output)
+	}
+}
+
+// assertReflectCycleHidden checks the child without risking the parent's stack.
+func assertReflectCycleHidden(t *testing.T) {
+	t.Helper()
+	debug.SetMaxStack(1 << 20)
+	fields := map[string]any{}
+	fields["cycle"] = fields
+	assertReflectedError(t, "fixture-key42", redactCycleFieldError{fields: fields}, true)
+}
+
+type redactReflectFieldError struct {
+	text      string
+	bytes     []byte
+	number    int
+	pointer   *struct{ text string }
+	Formatter any
+}
+
+// Error returns a message independent of the fields.
+func (*redactReflectFieldError) Error() string { return "fixture transport failure" }
+
+type redactNestedGoStringer struct{ called bool }
+
+// GoString records a call without exposing fixture data.
+func (e *redactNestedGoStringer) GoString() string {
+	e.called = true
+	return "fixture nested formatting"
+}
+
+// TestScrubErrorReflectFields checks leaf detection, pointer depth, and nested formatting.
+func TestScrubErrorReflectFields(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	const number = 42082
+	escaped := fmt.Sprintf("%%%02X%s", key[0], key[1:])
+	formatter := &redactNestedGoStringer{}
+	for _, tc := range []struct {
+		name, key string
+		err       *redactReflectFieldError
+		hide      bool
+	}{
+		{"escaped string", key, &redactReflectFieldError{text: escaped}, true},
+		{"byte slice", key, &redactReflectFieldError{bytes: []byte(key)}, true},
+		{"integer", strconv.Itoa(number), &redactReflectFieldError{number: number}, true},
+		{"nested formatter", key, &redactReflectFieldError{Formatter: formatter}, true},
+		{"key-free fields", key, &redactReflectFieldError{text: "fixture safe text", number: 1}, false},
+		{"nested pointer", key, &redactReflectFieldError{pointer: &struct{ text string }{text: key}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertReflectedError(t, tc.key, tc.err, tc.hide)
+			if tc.err.Formatter == formatter && formatter.called {
+				t.Error("scrubError invoked the nested GoString method")
+			}
+		})
+	}
+}
+
+type redactSliceFieldError struct{ fields []string }
+
+// Error returns a message independent of the slice.
+func (*redactSliceFieldError) Error() string { return "fixture transport failure" }
+
+// TestScrubErrorReflectValueBound checks the last allowed value and the first overflow.
+func TestScrubErrorReflectValueBound(t *testing.T) {
+	t.Parallel()
+	// Why: the root pointer, struct, and slice occupy three slots before the elements.
+	const bound = 1024 - 3
+	for _, tc := range []struct {
+		name  string
+		count int
+		hide  bool
+	}{
+		{"exactly 1024 values", bound, false},
+		{"one value over", bound + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			node := &redactSliceFieldError{fields: make([]string, tc.count)}
+			assertReflectedError(t, "fixture-key42", node, tc.hide)
+		})
+	}
+}
+
+// assertReflectedError checks opaque wrapping or exact identity.
+func assertReflectedError(t *testing.T, key string, original error, hide bool) {
+	t.Helper()
+	got := (&Client{apiKey: key}).scrubError(original)
+	if hide {
+		if hiddenRedaction(got) == nil {
+			t.Errorf("scrubError returned %T; want opaque wrapper", got)
+		}
+		return
+	}
+	if got != original { //nolint:errorlint // require the exact input to pass through
+		t.Error("scrubError changed the identity of a safe error")
+	}
+}
+
 // TestCanonicalKeyProjection checks escaped input across decoding projections and bounds.
 func TestCanonicalKeyProjection(t *testing.T) {
 	t.Parallel()
@@ -274,6 +405,29 @@ func TestCanonicalKeyProjection(t *testing.T) {
 			}
 			if got := c.scrubBody(tc.input); got != tc.want {
 				t.Error("unexpected body redaction")
+			}
+		})
+	}
+}
+
+// TestDecodeProjectionByteBudget checks the accumulated lengths of distinct decoded texts.
+func TestDecodeProjectionByteBudget(t *testing.T) {
+	t.Parallel()
+	const key = "fixture-key42"
+	// Why: 13 distinct projections total 187 bytes, plus 13 bytes per suffix byte.
+	const input = `%61 %255cu0061 \\u002561`
+	const ordinary = `%61\u0062`
+	c := &Client{apiKey: key}
+	for _, tc := range []struct{ name, text, want string }{
+		{"under budget", input, input},
+		{"exact budget", input + "x", input + "x"},
+		{"over budget", input + "xx", "REDACTED"},
+		{"ordinary mixed escapes", key + " " + ordinary, "REDACTED " + ordinary},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := c.scrubText(tc.text); got != tc.want {
+				t.Error("unexpected text redaction")
 			}
 		})
 	}
@@ -306,7 +460,8 @@ func TestDecodeLayerProjectionLimit(t *testing.T) {
 			for _, input := range tc.frontier {
 				seen[input] = struct{}{}
 			}
-			next, redact := c.decodeLayer(tc.frontier, seen)
+			remainingBytes := uint64(1024)
+			next, redact := c.decodeLayer(tc.frontier, seen, &remainingBytes)
 			if redact != tc.wantRedact || len(next) != tc.wantCount {
 				subtest.Errorf("decodeLayer returned %d projections and redact=%t, want %d and %t", len(next), redact, tc.wantCount, tc.wantRedact)
 			}
@@ -359,29 +514,61 @@ type redactNilTimeoutCause struct{ redactFixtureCause }
 // Timeout reports a timeout for the typed-nil fixture.
 func (e *redactNilTimeoutCause) Timeout() bool { return e == nil }
 
-// TestSanitizedURLCopyPreservesTypedNil checks nil-receiver classification and safe tree formatting.
-func TestSanitizedURLCopyPreservesTypedNil(t *testing.T) {
+// TestURLCopyUnsafeCause compares the root and errors.As copies with the wrapper's classification.
+func TestURLCopyUnsafeCause(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key42"
-	c, err := New("http://127.0.0.1", key)
-	if err != nil {
-		t.Fatal(err)
+	c := &Client{apiKey: key}
+	var dns *net.DNSError
+	for _, tc := range []struct {
+		name    string
+		cause   error
+		timeout bool
+	}{
+		{"wrapped-typed-nil-DNS", &net.OpError{Op: "dial", Err: dns}, false},
+		{"nil-safe-classifier", (*redactNilTimeoutCause)(nil), false},
+		{"typed-nil-DNS", dns, false},
+		{"non-nil-DNS", &net.DNSError{IsTimeout: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			original := &url.Error{Op: "Get", URL: "http://h/" + key, Err: tc.cause}
+			assertURLCauseViews(t, c.redactError(original), original, tc.timeout)
+			assertURLCauseViews(t, c.scrubError(errors.Join(original)), original, tc.timeout)
+		})
 	}
-	var cause *redactNilTimeoutCause
-	original := &url.Error{Op: "Get", URL: "http://fixture.invalid/" + key, Err: cause}
-	scrubbed := c.redactError(original)
-	if scrubbed.Error() != redactedTreeMsg {
-		t.Error("scrubError did not use the fixed message for a typed-nil cause")
-	}
+}
+
+// assertURLCauseViews checks the copied cause and both views of its classifiers.
+func assertURLCauseViews(t *testing.T, got error, original *url.Error, timeout bool) {
+	t.Helper()
 	var copied *url.Error
-	if !errors.As(scrubbed, &copied) || copied == original || copied == nil {
+	if !errors.As(got, &copied) || copied == nil || copied == original {
 		t.Fatal("expected a sanitized URL error copy")
 	}
-	if any(copied.Err) != any(cause) {
-		t.Errorf("copied cause = %T; want original typed-nil cause", copied.Err)
+	if isNilError(copied.Err) {
+		t.Fatal("expected a non-nil copied cause")
 	}
-	if !copied.Timeout() || copied.Timeout() != original.Timeout() || copied.Temporary() != original.Temporary() {
-		t.Error("copied classification differs from the original URL error")
+	if !timeout && copied.Err.Error() != redactedTreeMsg {
+		t.Error("unsafe copied cause did not use the fixed message")
+	}
+	assertURLClassifications(t, got, copied, timeout)
+}
+
+// assertURLClassifications compares the classifications of the copy and the returned error.
+func assertURLClassifications(t *testing.T, got error, copied *url.Error, timeout bool) {
+	t.Helper()
+	// Why: a DNSError timeout also classifies as temporary.
+	if copied.Timeout() != timeout || copied.Temporary() != timeout {
+		t.Error("unexpected copy classification")
+	}
+	var outerTimeout interface{ Timeout() bool }
+	if !errors.As(got, &outerTimeout) || outerTimeout.Timeout() != timeout {
+		t.Error("unexpected outer Timeout classification")
+	}
+	var outerTemporary interface{ Temporary() bool }
+	if !errors.As(got, &outerTemporary) || outerTemporary.Temporary() != timeout {
+		t.Error("unexpected outer Temporary classification")
 	}
 }
 
@@ -403,7 +590,6 @@ func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 		{"timeout only", timeoutOnly},
 		{"temporary only", temporaryOnly},
 		{"nil", nil},
-		{"typed nil", (*redactTimeoutCause)(nil)},
 		{"redacted cause", &redactedError{err: timeout, msg: "fixture hidden cause"}},
 		{"different classifier nodes", &redactedError{err: errors.Join(timeoutOnly, temporaryOnly)}},
 		{"nested URL commits to its cause", &redactedError{err: errors.Join(&url.Error{Err: timeoutOnly}, temporaryOnly)}},
@@ -431,9 +617,9 @@ func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, senti
 	if !errors.As(got, &copyErr) || copyErr == original {
 		t.Fatalf("expected a sanitized URL error copy, got %T", got)
 	}
-	if isNilError(original.Err) {
-		if any(copyErr.Err) != any(original.Err) {
-			t.Error("copy changed a nil or typed-nil cause")
+	if original.Err == nil {
+		if copyErr.Err != nil {
+			t.Error("copy changed a nil cause")
 		}
 	} else if !errors.Is(copyErr, sentinel) {
 		t.Error("errors.Is through the copy did not reach the sentinel")
@@ -1042,16 +1228,16 @@ func TestRedactErrorRootPathRedaction(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key42"
 	escapedKey := strings.Replace(key, "-", fmt.Sprintf("%%%02X", '-'), 1)
-	for _, tc := range []struct{ name, path string }{
-		{"literal", key},
-		{"percent encoded", escapedKey},
+	for _, tc := range []struct{ name, path, wantURL, wantError string }{
+		{"literal", key, "http://h/REDACTED", `Get "http://h/REDACTED": fixture transport failure`},
+		{"percent encoded", escapedKey, "REDACTED", `Get "REDACTED": fixture transport failure`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := &Client{apiKey: key}
 			original := &url.Error{
 				Op:  "Get",
-				URL: "http://h/" + tc.path + "?apikey=" + key,
+				URL: "http://h/" + tc.path,
 				Err: errors.New("fixture transport failure"),
 			}
 			got := c.redactError(original)
@@ -1059,8 +1245,11 @@ func TestRedactErrorRootPathRedaction(t *testing.T) {
 			if !errors.As(got, &copied) || copied == nil || copied == original {
 				t.Fatal("expected a sanitized URL error copy")
 			}
-			if c.containsKey(got.Error()) || c.containsKey(copied.URL) {
-				t.Error("copied URL error still contains the key")
+			if copied.URL != tc.wantURL {
+				t.Errorf("copied URL = %q; want %q", copied.URL, tc.wantURL)
+			}
+			if got.Error() != tc.wantError {
+				t.Errorf("Error() = %q; want %q", got.Error(), tc.wantError)
 			}
 		})
 	}
@@ -1397,28 +1586,17 @@ func TestRedactErrorRootURLHidesCause(t *testing.T) {
 	}
 }
 
-// TestRedactErrorRootURLNilCause checks that nil and typed-nil causes are preserved in a URL error copy.
+// TestRedactErrorRootURLNilCause checks that a nil interface cause is preserved in a URL error copy.
 func TestRedactErrorRootURLNilCause(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key"
-	for _, tc := range []struct {
-		name string
-		err  error
-	}{
-		{name: "nil"},
-		{name: "typed nil", err: (*rootURLFieldError)(nil)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			root := &url.Error{Op: "Get", URL: "http://h/?apikey=" + key, Err: tc.err}
-			var copied *url.Error
-			if !errors.As((&Client{apiKey: key}).redactError(root), &copied) || copied == root {
-				t.Fatal("redactError did not return a sanitized URL error copy")
-			}
-			if any(copied.Err) != any(tc.err) {
-				t.Errorf("copied cause = %T; want %T", copied.Err, tc.err)
-			}
-		})
+	root := &url.Error{Op: "Get", URL: "http://h/?apikey=" + key}
+	var copied *url.Error
+	if !errors.As((&Client{apiKey: key}).redactError(root), &copied) || copied == root {
+		t.Fatal("redactError did not return a sanitized URL error copy")
+	}
+	if copied.Err != nil {
+		t.Errorf("copied cause = %T; want nil", copied.Err)
 	}
 }
 

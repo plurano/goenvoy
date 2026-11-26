@@ -125,6 +125,7 @@ func TestScrub(t *testing.T) {
 		contains               bool
 	}{
 		{"literal", key, "before " + key + " after", "before REDACTED after", true},
+		{"repeated literal", key, key + ":" + key, "REDACTED:REDACTED", true},
 		{"percent encoded", key, "fixture%2Dkey42", "fixture%2Dkey42", true},
 		{"Unicode escaped", key, `fixture\u002dkey42`, `fixture\u002dkey42`, true},
 		{"absent", key, "plain error message", "plain error message", false},

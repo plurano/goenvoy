@@ -275,6 +275,9 @@ func TestDecodeBackslashEscapes(t *testing.T) {
 			if got := decodeEscapes(tc.input, backslashEscapes); got != tc.want {
 				t.Errorf("decodeEscapes(%q) = %q; want %q", tc.input, got, tc.want)
 			}
+			if got := decodeEscapes(tc.input, percentEscapes|backslashEscapes); got != tc.want {
+				t.Errorf("mixed decodeEscapes(%q) = %q; want %q", tc.input, got, tc.want)
+			}
 		})
 	}
 }
@@ -402,6 +405,7 @@ type hiddenCauseCase struct {
 	cause       error
 	sentinel    error
 	wantTimeout bool
+	wantFixed   bool
 }
 
 // TestRedactedErrorAsHidesCause checks that a recovered URL error copy wraps its cause in an opaque error.
@@ -415,8 +419,8 @@ func TestRedactedErrorAsHidesCause(t *testing.T) {
 		{name: "direct sentinel cause", cause: sentinel, sentinel: sentinel},
 		{name: "timeout cause", cause: &tokenCause{Token: key, timeout: true}, wantTimeout: true},
 		{name: "nil cause", cause: nil},
-		{name: "typed-nil cause", cause: (*tokenCause)(nil)},
-		{name: "wrapped typed-nil cause", cause: fmt.Errorf("wrap: %w", (*tokenCause)(nil))},
+		{name: "typed-nil cause", cause: (*tokenCause)(nil), wantFixed: true},
+		{name: "wrapped typed-nil cause", cause: fmt.Errorf("wrap: %w", (*tokenCause)(nil)), wantFixed: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -437,9 +441,9 @@ func assertHiddenURLCause(t *testing.T, c *Client, key string, tc hiddenCauseCas
 	if c.containsKey(uerr.Error()) || strings.Contains(uerr.Error(), key) {
 		t.Errorf("uerr.Error() leaked key: %s", uerr.Error())
 	}
-	if isNilError(tc.cause) {
-		if any(uerr.Err) != any(tc.cause) {
-			t.Errorf("copied cause = %T; want %T", uerr.Err, tc.cause)
+	if tc.cause == nil {
+		if uerr.Err != nil {
+			t.Errorf("copied cause = %T; want nil", uerr.Err)
 		}
 		return
 	}
@@ -452,6 +456,9 @@ func assertHiddenURLCause(t *testing.T, c *Client, key string, tc hiddenCauseCas
 // assertOpaqueURLCause checks that a non-nil URL error cause is opaque while preserving Is and Timeout.
 func assertOpaqueURLCause(t *testing.T, uerr *url.Error, tc hiddenCauseCase) {
 	t.Helper()
+	if tc.wantFixed && uerr.Err.Error() != redactedTreeMsg {
+		t.Error("unsafe copied cause did not use the fixed message")
+	}
 	if _, ok := uerr.Err.(*tokenCause); ok { //nolint:errorlint // verify direct type assertion on uerr.Err fails
 		t.Error("uerr.Err exposed *tokenCause")
 	}

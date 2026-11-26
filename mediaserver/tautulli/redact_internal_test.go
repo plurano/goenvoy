@@ -174,10 +174,13 @@ func assertRedactedTree(t *testing.T, err error, key string) {
 func TestScrub(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key42"
-	cases := []struct{ name, key, input, want string }{
-		{"empty key", "", "unchanged", "unchanged"},
-		{"absent key", key, "unchanged", "unchanged"},
-		{"repeated literal", key, key + ":" + key, "REDACTED:REDACTED"},
+	cases := []struct {
+		name, key, input, want string
+		contains               bool
+	}{
+		{"empty key", "", "unchanged", "unchanged", false},
+		{"absent key", key, "unchanged", "unchanged", false},
+		{"repeated literal", key, key + ":" + key, "REDACTED:REDACTED", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -185,6 +188,9 @@ func TestScrub(t *testing.T) {
 			c := &Client{apiKey: tc.key}
 			if got := c.scrub(tc.input); got != tc.want {
 				t.Errorf("scrub = %q, want %q", got, tc.want)
+			}
+			if got := c.containsKey(tc.input); got != tc.contains {
+				t.Errorf("containsKey = %t, want %t", got, tc.contains)
 			}
 		})
 	}
