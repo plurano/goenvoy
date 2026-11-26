@@ -166,6 +166,88 @@ func other() { helper() }
 GO
 expect_status bodyless 1 'bodyless_test.go:3: comment claims helper(' "${SUT[@]}" "$WORK/bodyless"
 
+track_fixture sig_chan_struct_inner sig_chan_struct_inner_test.go <<'GO'
+package example
+
+func waitDone(done chan struct{}) {
+	// checks missing()
+}
+GO
+expect_status sig_chan_struct_inner 1 'sig_chan_struct_inner_test.go:4: comment claims missing(' "${SUT[@]}" "$WORK/sig_chan_struct_inner"
+
+track_fixture sig_chan_struct sig_chan_struct_test.go <<'GO'
+package example
+
+// waitDone checks helper().
+func waitDone(done chan struct{}) {
+	helper()
+}
+GO
+expect_pass sig_chan_struct "${SUT[@]}" "$WORK/sig_chan_struct"
+
+track_fixture sig_interface_result sig_interface_result_test.go <<'GO'
+package example
+
+// mk checks helper().
+func mk() interface{ M() } {
+	helper()
+	return nil
+}
+GO
+expect_pass sig_interface_result "${SUT[@]}" "$WORK/sig_interface_result"
+
+track_fixture sig_type_param sig_type_param_test.go <<'GO'
+package example
+
+// pick checks helper().
+func pick[T interface{ ~int }](v T) {
+	helper()
+}
+
+// pickNested checks helper().
+func pickNested[T interface
+{
+	M(struct { V interface{ N() } })
+}](v T) {
+	helper()
+}
+GO
+expect_pass sig_type_param "${SUT[@]}" "$WORK/sig_type_param"
+
+track_fixture sig_struct_result_one_line sig_struct_result_one_line_test.go <<'GO'
+package example
+
+func external() struct{}
+
+// mk checks helper().
+func mk() struct{} { helper() }
+
+func externalInline() struct{}; var unrelated = func() {
+	// checks missing()
+}
+GO
+expect_pass sig_struct_result_one_line "${SUT[@]}" "$WORK/sig_struct_result_one_line"
+
+track_fixture sig_struct_result_missing sig_struct_result_missing_test.go <<'GO'
+package example
+
+// mk checks helper().
+func mk() struct{} { other() }
+GO
+expect_status sig_struct_result_missing 1 'sig_struct_result_missing_test.go:3: comment claims helper(' "${SUT[@]}" "$WORK/sig_struct_result_missing"
+
+track_fixture multi_line_params multi_line_params_test.go <<'GO'
+package example
+
+// multi checks helper().
+func multi(
+	a int,
+) {
+	helper()
+}
+GO
+expect_pass multi_line_params "${SUT[@]}" "$WORK/multi_line_params"
+
 track_fixture non_ascii non_ascii_test.go <<'GO'
 package example
 

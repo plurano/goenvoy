@@ -10,6 +10,8 @@ BEGIN {
   call_tail = "[[:blank:]]*(" type_args "[[:blank:]]*)?[(]"
   call_pattern = boundary selector call_tail
   declaration_pattern = "^[[:blank:]]*func([[:blank:]]+|[[:blank:]]*[(][^)]*[)][[:blank:]]*)" identifier
+  type_literal_keyword = boundary "(struct|interface)[[:space:]]*$"
+  signature_continuation_keyword = boundary "(chan|func|interface|map|struct)[[:space:]]*$"
 }
 
 function masked_width(pair,    ch) {
@@ -92,6 +94,7 @@ function finish_function(    i, name) {
   delete calls
   claim_count = 0
   in_function = 0
+  in_signature = 0
 }
 
 mask_end == "" && /^[[:blank:]]*\/\// {
@@ -99,9 +102,35 @@ mask_end == "" && /^[[:blank:]]*\/\// {
   next
 }
 
-function closing_brace(line,    limit, i, ch, end) {
+function within_type_literal(prefix) {
+  return signature_type_depth || prefix ~ type_literal_keyword ||
+    (after_type_literal_keyword && prefix !~ /[^[:space:]]/)
+}
+
+function signature_boundary(line,    limit, i, ch) {
   limit = length(line)
   for (i = 1; i <= limit; i++) {
+    ch = substr(line, i, 1)
+    if (ch == "{") {
+      if (!within_type_literal(substr(line, 1, i - 1))) return i
+      signature_type_depth++
+    } else if (ch == "}") {
+      signature_type_depth--
+    } else if (ch ~ /[([]/) {
+      signature_group_depth++
+    } else if (ch ~ /[])]/) {
+      signature_group_depth--
+    } else if (ch == ";" && !signature_type_depth) {
+      return i
+    }
+  }
+  if (line ~ /[^[:space:]]/) after_type_literal_keyword = line ~ type_literal_keyword
+  return 0
+}
+
+function closing_brace(line, start,    limit, i, ch, end) {
+  limit = length(line)
+  for (i = start; i <= limit; i++) {
     ch = substr(line, i, 1)
     if (ch == "{") {
       brace_depth++
@@ -112,16 +141,38 @@ function closing_brace(line,    limit, i, ch, end) {
   return end
 }
 
+function scope_end(line,    position) {
+  if (!in_signature) return closing_brace(line, 1)
+  position = signature_boundary(line)
+  if (position) {
+    if (substr(line, position, 1) == "{") {
+      in_signature = 0
+      return closing_brace(line, position)
+    }
+    # Why: later top-level code on the same line still contributes to brace depth.
+    closing_brace(line, position + 1)
+    return position
+  }
+  # Why: Go inserts a semicolon at the end of a complete signature without a body.
+  if (!signature_type_depth && !signature_group_depth &&
+      line ~ /([[:alnum:]_\200-\377]|[])}])[[:space:]]*$/ && line !~ signature_continuation_keyword) {
+    return length(line)
+  }
+  return 0
+}
+
 {
   code = code_only($0)
   # Why: function literals share the enclosing top-level declaration's claims and calls.
-  if (brace_depth == 0 && code ~ declaration_pattern) {
+  if (brace_depth == 0 && !in_signature && code ~ declaration_pattern) {
     if (in_function) finish_function()
     in_function = 1
+    in_signature = 1
+    signature_type_depth = signature_group_depth = after_type_literal_keyword = 0
     sub(declaration_pattern, "", code)
   }
 
-  end = closing_brace(code)
+  end = scope_end(code)
   if (in_function) {
     record_calls(end ? substr(code, 1, end) : code)
     if (end) finish_function()
