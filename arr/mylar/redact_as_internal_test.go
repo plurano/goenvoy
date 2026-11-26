@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -95,6 +97,7 @@ func TestScrubErrorHidesCustomURLAs(t *testing.T) {
 	}{
 		{"root", node},
 		{"nested", errors.Join(errors.New("fixture sibling"), node)},
+		{"key-bearing parent", fmt.Errorf("fixture %s: %w", key, node)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -121,8 +124,12 @@ func assertOpaqueError(t *testing.T, c *Client, name string, got error) {
 		t.Errorf("%s returned %T; want opaque wrapper", name, got)
 	}
 	for _, format := range [...]string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X"} {
-		if c.containsKey(fmt.Sprintf(format, got)) {
+		formatted := fmt.Sprintf(format, got)
+		if c.containsKey(formatted) {
 			t.Errorf("%s exposed the key with format %q", name, format)
+		}
+		if (format == "%x" || format == "%X") && formatted != fmt.Sprintf(format, got.Error()) {
+			t.Errorf("%s did not hex-format the sanitized message with %q", name, format)
 		}
 	}
 }
@@ -708,7 +715,7 @@ func assertURLClassifications(t *testing.T, got error, copied *url.Error, timeou
 	}
 }
 
-// TestSanitizedURLCopyClassifiesImmediateCause compares both URL-copy paths with the original URL error.
+// TestSanitizedURLCopyClassifiesImmediateCause checks both URL-copy paths and the original URL error.
 func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 	t.Parallel()
 	const key = "fixture-key42"
@@ -718,39 +725,40 @@ func TestSanitizedURLCopyClassifiesImmediateCause(t *testing.T) {
 	temporaryOnly := redactTemporaryCause{redactFixtureCause{sentinel}}
 	c := &Client{apiKey: key}
 	cases := []struct {
-		name  string
-		cause error
+		name                       string
+		cause                      error
+		wantTimeout, wantTemporary bool
 	}{
-		{"ordinary wrapper", fmt.Errorf("fixture wrapper: %w", timeout)},
-		{"DNS error", timeout},
-		{"timeout only", timeoutOnly},
-		{"temporary only", temporaryOnly},
-		{"nil", nil},
-		{"redacted cause", &redactedError{err: timeout, msg: "fixture hidden cause", key: key}},
-		{"different classifier nodes", &redactedError{err: errors.Join(timeoutOnly, temporaryOnly), key: key}},
-		{"nested URL commits to its cause", &redactedError{err: errors.Join(&url.Error{Err: timeoutOnly}, temporaryOnly), key: key}},
+		{"ordinary wrapper", fmt.Errorf("fixture wrapper: %w", timeout), false, false},
+		{"DNS error", timeout, true, true},
+		{"timeout only", timeoutOnly, true, false},
+		{"temporary only", temporaryOnly, false, true},
+		{"nil", nil, false, false},
+		{"redacted cause", &redactedError{err: timeout, msg: "fixture hidden cause", key: key}, true, true},
+		{"different classifier nodes", &redactedError{err: errors.Join(timeoutOnly, temporaryOnly), key: key}, true, true},
+		{"nested URL commits to its cause", &redactedError{err: errors.Join(&url.Error{Err: timeoutOnly}, temporaryOnly), key: key}, true, false},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
 			original := &url.Error{Op: "Get", URL: "http://fixture.invalid/" + key, Err: tc.cause}
-			t.Run("As", func(t *testing.T) {
-				t.Parallel()
-				assertURLCopyClassifies(t, c.scrubError(errors.Join(original)), original, sentinel, key)
+			subtest.Run("As", func(view *testing.T) {
+				view.Parallel()
+				assertURLCopyClassifies(view, c.scrubError(errors.Join(original)), original, sentinel, key, tc.wantTimeout, tc.wantTemporary)
 			})
-			t.Run("redactError", func(t *testing.T) {
-				t.Parallel()
-				assertURLCopyClassifies(t, c.redactError(original), original, sentinel, key)
+			subtest.Run("redactError", func(view *testing.T) {
+				view.Parallel()
+				assertURLCopyClassifies(view, c.redactError(original), original, sentinel, key, tc.wantTimeout, tc.wantTemporary)
 			})
 		})
 	}
 }
 
 // assertURLCopyClassifies checks classification and sentinel identity through a sanitized copy.
-func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, sentinel error, key string) {
+func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, sentinel error, key string, wantTimeout, wantTemporary bool) {
 	t.Helper()
 	var copyErr *url.Error
-	if !errors.As(got, &copyErr) || copyErr == original {
+	if !errors.As(got, &copyErr) || copyErr == nil || copyErr == original {
 		t.Fatalf("expected a sanitized URL error copy, got %T", got)
 	}
 	if original.Err == nil {
@@ -762,11 +770,23 @@ func assertURLCopyClassifies(t *testing.T, got error, original *url.Error, senti
 	}
 	fallback := &net.DNSError{IsTimeout: true, IsTemporary: true}
 	nested := &redactedError{err: errors.Join(copyErr, fallback), key: key}
-	if want := original.Timeout(); copyErr.Timeout() != want || nested.Timeout() != want {
-		t.Errorf("Timeout: copy=%v nested=%v original=%v", copyErr.Timeout(), nested.Timeout(), want)
+	assertClassifierValues(t, "copy", copyErr, wantTimeout, wantTemporary)
+	assertClassifierValues(t, "nested", nested, wantTimeout, wantTemporary)
+	assertClassifierValues(t, "original", original, wantTimeout, wantTemporary)
+}
+
+// assertClassifierValues checks both classifications on one view of the error.
+func assertClassifierValues(t *testing.T, name string, got interface {
+	Timeout() bool
+	Temporary() bool
+}, wantTimeout, wantTemporary bool,
+) {
+	t.Helper()
+	if timeout := got.Timeout(); timeout != wantTimeout {
+		t.Errorf("%s Timeout=%v, want %v", name, timeout, wantTimeout)
 	}
-	if want := original.Temporary(); copyErr.Temporary() != want || nested.Temporary() != want {
-		t.Errorf("Temporary: copy=%v nested=%v original=%v", copyErr.Temporary(), nested.Temporary(), want)
+	if temporary := got.Temporary(); temporary != wantTemporary {
+		t.Errorf("%s Temporary=%v, want %v", name, temporary, wantTemporary)
 	}
 }
 
@@ -1639,6 +1659,12 @@ func (redactWideJoin) Error() string { return "fixture wide join" }
 // Unwrap returns the fixture children, which may include nil slots.
 func (e redactWideJoin) Unwrap() []error { return e }
 
+// appendWrapped exposes the bounded queue to existing traversal tests.
+func appendWrapped(queue []error, err error) []error {
+	queue, _ = appendWrappedChildren(queue, err)
+	return queue
+}
+
 // TestRedactedErrorWalkWideJoin checks dense and sparse joins with a target beyond the budget.
 func TestRedactedErrorWalkWideJoin(t *testing.T) {
 	t.Parallel()
@@ -1800,6 +1826,62 @@ type redactURLClassifier struct {
 	error
 }
 
+type redactChangingJoin struct {
+	changed atomic.Bool
+	link    *url.Error
+	after   []error
+}
+
+// Error returns the fixture join message.
+func (*redactChangingJoin) Error() string { return "fixture changing join" }
+
+// Unwrap returns the URL alone until the test switches the fixture's children.
+func (e *redactChangingJoin) Unwrap() []error {
+	if e.changed.Load() {
+		return e.after
+	}
+	return []error{e.link}
+}
+
+// TestURLCopyUsesObservedUnsafeTree checks unsafe children seen during URL recovery.
+func TestURLCopyUsesObservedUnsafeTree(t *testing.T) {
+	t.Parallel()
+	const key = "maple"
+	client := &Client{apiKey: key}
+	original := &url.Error{
+		Op: "Get", URL: "https://example.invalid/" + key,
+		Err: &net.DNSError{IsTimeout: true, IsTemporary: true},
+	}
+	wide := make([]error, maxErrNodes+1)
+	child := errors.New("fixture sibling")
+	for i := range wide {
+		wide[i] = child
+	}
+	wide[0] = original
+	for _, tc := range [...]struct {
+		name  string
+		after []error
+		want  bool
+	}{
+		{"unchanged", nil, true},
+		{"typed nil", []error{(*redactNilTimeoutCause)(nil), original}, false},
+		{"overflow", wide, false},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			tree := &redactChangingJoin{link: original, after: tc.after}
+			got := client.scrubError(tree)
+			tree.changed.Store(tc.after != nil)
+			var copied *url.Error
+			if !errors.As(got, &copied) || copied == nil || copied == original {
+				subtest.Fatal("expected a sanitized URL error copy")
+			}
+			assertNoKeyForms(subtest, copied.Error(), key)
+			assertClassifierValues(subtest, "copy", copied, tc.want, tc.want)
+		})
+	}
+}
+
 // TestUnsafeParentURLCopyIsUnclassified checks that a typed-nil sibling suppresses URL copy classification.
 func TestUnsafeParentURLCopyIsUnclassified(t *testing.T) {
 	t.Parallel()
@@ -1936,6 +2018,44 @@ func TestForeignRedactionRemainsOpaque(t *testing.T) {
 	}
 }
 
+// TestForeignRedactionBehindStdlibDelegates checks the key boundary before stdlib classifier calls.
+func TestForeignRedactionBehindStdlibDelegates(t *testing.T) {
+	t.Parallel()
+	const first, second = "cedar", "maple"
+	dns := &net.DNSError{Err: first, IsTimeout: true}
+	foreign := (&Client{apiKey: first}).scrubError(dns)
+	client := &Client{apiKey: second}
+	for _, tc := range [...]struct {
+		name    string
+		wrapper error
+		target  error
+		want    bool
+	}{
+		{"op error", &net.OpError{Err: foreign}, dns, false},
+		{"op error with syscall", &net.OpError{Err: &os.SyscallError{Err: foreign}}, dns, false},
+		{"syscall error", &os.SyscallError{Err: foreign}, dns, false},
+		{"path error", &fs.PathError{Err: foreign}, dns, false},
+		{"safe op error", &net.OpError{Op: "dial " + second, Err: &net.DNSError{IsTimeout: true}}, nil, true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			assertStdlibDelegate(subtest, client.redactError(tc.wrapper), tc.target, first, second, tc.want)
+			assertStdlibDelegate(subtest, client.scrubError(tc.wrapper), tc.target, first, second, tc.want)
+		})
+	}
+}
+
+// assertStdlibDelegate checks normal classification or opacity at the foreign-key boundary.
+func assertStdlibDelegate(t *testing.T, got, target error, first, second string, want bool) {
+	t.Helper()
+	if !want {
+		assertForeignRedactionOpaque(t, got, target, first, second)
+		return
+	}
+	assertOpaqueError(t, &Client{apiKey: second}, "same-key stdlib wrapper", got)
+	assertErrorClassifications(t, got, true, true)
+}
+
 // assertForeignRedactionOpaque checks that a foreign wrapper exposes only sanitized output and identity.
 func assertForeignRedactionOpaque(t *testing.T, got, target error, first, second string) {
 	t.Helper()
@@ -1948,12 +2068,22 @@ func assertForeignRedactionOpaque(t *testing.T, got, target error, first, second
 	if errors.As(got, &copied) || copied != nil {
 		t.Error("errors.As recovered a URL across the foreign-key boundary")
 	}
-	var classifier interface{ Timeout() bool }
-	if !errors.As(got, &classifier) || classifier.Timeout() {
-		t.Error("classification crossed the foreign-key boundary")
-	}
+	assertErrorClassifications(t, got, false, false)
 	if !errors.Is(got, target) {
 		t.Error("errors.Is did not preserve hidden identity")
+	}
+}
+
+// assertErrorClassifications checks the classifiers errors.As finds for an error.
+func assertErrorClassifications(t *testing.T, got error, wantTimeout, wantTemporary bool) {
+	t.Helper()
+	var timeout interface{ Timeout() bool }
+	if !errors.As(got, &timeout) || timeout.Timeout() != wantTimeout {
+		t.Errorf("errors.As Timeout classifier missing or differs from %t", wantTimeout)
+	}
+	var temporary interface{ Temporary() bool }
+	if !errors.As(got, &temporary) || temporary.Temporary() != wantTemporary {
+		t.Errorf("errors.As Temporary classifier missing or differs from %t", wantTemporary)
 	}
 }
 
@@ -2021,7 +2151,10 @@ func TestDecodeLayerChargesRetainedStorage(t *testing.T) {
 			if redact != tc.redact {
 				subtest.Errorf("redact = %t, want %t", redact, tc.redact)
 			}
-			if !tc.redact && (len(next) != 3 || remaining != 0) {
+			switch {
+			case tc.redact && next != nil:
+				subtest.Error("over-budget decode retained a partial frontier")
+			case !tc.redact && (len(next) != 3 || remaining != 0):
 				subtest.Errorf("retained %d projections with %d bytes uncharged", len(next), remaining)
 			}
 		})

@@ -3,7 +3,10 @@ package jackett
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"net"
 	"net/url"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -310,7 +313,7 @@ func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 
 // classifyNode returns the traversal action and classification for a single node.
 func classifyNode[T any](node error, key string, classify func(T) bool) (walkAction, bool) {
-	if hidden := hiddenRedaction(node); hidden != nil && (hidden.unsafe || hidden.key != key) {
+	if blocksHiddenClassification(node, key) {
 		return walkStop, false
 	}
 	switch cause := node.(type) { //nolint:errorlint // classify only the current node
@@ -329,11 +332,14 @@ func classifyNode[T any](node error, key string, classify func(T) bool) (walkAct
 		}
 		return walkStop, false
 	}
-	return classifyExternalNode(node, classify)
+	return classifyExternalNode(node, key, classify)
 }
 
 // classifyExternalNode checks the classifier and As methods of an external node.
-func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction, bool) {
+func classifyExternalNode[T any](node error, key string, classify func(T) bool) (walkAction, bool) {
+	if !safeClassifierDelegation[T](node, key) {
+		return walkStop, false
+	}
 	classifier, ok := node.(T)
 	if !ok {
 		as, hasAs := node.(interface{ As(any) bool })
@@ -342,6 +348,52 @@ func classifyExternalNode[T any](node error, classify func(T) bool) (walkAction,
 		}
 	}
 	return walkStop, classify(classifier)
+}
+
+// maxClassifierDelegations bounds the number of wrapped errors a stdlib classifier may inspect.
+const maxClassifierDelegations = 8
+
+// safeClassifierDelegation checks each error a stdlib classifier would reach before it runs.
+func safeClassifierDelegation[T any](node error, key string) bool {
+	for step := 0; step <= maxClassifierDelegations; step++ {
+		if isNilError(node) || blocksHiddenClassification(node, key) {
+			return false
+		}
+		if _, classifies := node.(T); !classifies {
+			return true
+		}
+		node = classifierDelegate(node)
+		if node == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// classifierDelegate returns the error inspected by a known stdlib classifier.
+func classifierDelegate(node error) error {
+	switch wrapper := node.(type) { //nolint:errorlint // inspect only the current stdlib wrapper
+	case *net.OpError:
+		// Why: both OpError classifiers inspect the error inside a SyscallError directly.
+		if syscall, ok := wrapper.Err.(*os.SyscallError); ok && syscall != nil { //nolint:errorlint // match the direct wrapper tested by net.OpError
+			return syscall.Err
+		}
+		return wrapper.Err
+	case *os.SyscallError:
+		return wrapper.Err
+	case *fs.PathError:
+		return wrapper.Err
+	case *url.Error:
+		return wrapper.Err
+	default:
+		return nil
+	}
+}
+
+// blocksHiddenClassification reports whether a package wrapper is unsafe or belongs to another key.
+func blocksHiddenClassification(node error, key string) bool {
+	hidden := hiddenRedaction(node)
+	return hidden != nil && (hidden.unsafe || hidden.key != key)
 }
 
 type walkAction uint8
@@ -481,18 +533,22 @@ func (e *redactedError) As(target any) bool {
 	}
 	// Why: bounded breadth-first walk over the hidden tree; errors.As on it would search unbounded.
 	queue := []error{e.err}
+	unsafe := e.unsafe
 	for i := 0; i < maxErrNodes && i < len(queue); i++ {
 		if uerr, isURL := queue[i].(*url.Error); isURL && uerr != nil { //nolint:errorlint // first URL error of a bounded walk; errors.As is the unbounded search
 			// Why: hand out a scrubbed copy, never the original that holds the key.
 			c := Client{apiKey: e.key}
 			*dst = &url.Error{
 				Op: c.scrubText(uerr.Op), URL: c.scrubText(redactURL(uerr.URL)),
-				Err: c.hideURLCause(uerr.Err, e.unsafe),
+				Err: c.hideURLCause(uerr.Err, unsafe),
 			}
 			return true
 		}
 		// Why: package wrappers expose no Unwrap, so URL recovery cannot cross into their hidden tree.
-		queue = appendWrapped(queue, queue[i])
+		var unsafeNode bool
+		queue, unsafeNode = appendWrappedChildren(queue, queue[i])
+		// Why: overflow is unsafe under the same 64-node budget as inspectErrorTree, even if Unwrap changes after scrubbing.
+		unsafe = unsafe || unsafeNode
 	}
 	return false
 }
@@ -805,12 +861,6 @@ func (c *Client) reflectedBytesHaveKey(value reflect.Value) bool {
 		bytes[i] = byte(value.Index(i).Uint() & 0xff)
 	}
 	return c.containsKey(string(bytes))
-}
-
-// appendWrapped queues non-nil children for URL recovery, which can skip unsafe nodes.
-func appendWrapped(queue []error, err error) []error {
-	queue, _ = appendWrappedChildren(queue, err)
-	return queue
 }
 
 // appendWrappedChildren reads children once, queues non-nil children, and reports typed nils or overflow.
