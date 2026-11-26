@@ -70,14 +70,23 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// APIError is returned when the API responds with a non-2xx status.
+// APIError reports a non-2xx response. StatusCode holds the raw code and Error renders the scrubbed code.
 type APIError struct {
 	StatusCode int
 	Status     string
 	Body       string
+
+	statusText string
 }
 
+// Error returns the HTTP status and any response message.
 func (e *APIError) Error() string {
+	if e.statusText != "" {
+		if e.Body != "" {
+			return "nzbhydra: HTTP " + e.statusText + ": " + e.Body
+		}
+		return "nzbhydra: HTTP " + e.statusText
+	}
 	if e.Body != "" {
 		return fmt.Sprintf("nzbhydra: HTTP %d: %s", e.StatusCode, e.Body)
 	}
@@ -103,7 +112,12 @@ func (c *Client) doGet(ctx context.Context, u string) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &APIError{StatusCode: resp.StatusCode, Status: c.scrubText(resp.Status), Body: c.scrubBody(string(data))}
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     c.scrubText(resp.Status),
+			Body:       c.scrubBody(string(data)),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	return data, nil
@@ -184,7 +198,12 @@ func (c *Client) postJSON(ctx context.Context, path string, body, v any) error {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &APIError{StatusCode: resp.StatusCode, Status: c.scrubText(resp.Status), Body: c.scrubBody(string(respData))}
+		return &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     c.scrubText(resp.Status),
+			Body:       c.scrubBody(string(respData)),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	if v != nil {

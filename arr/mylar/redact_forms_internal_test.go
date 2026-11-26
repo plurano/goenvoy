@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -842,4 +847,151 @@ func TestCanonicalKeyRedaction(t *testing.T) {
 			assertAPIErrorEscapedBody(t, tc.key, tc.text, tc.want)
 		})
 	}
+}
+
+// TestAPIErrorStatusCodeEcho checks rendered redaction and raw status on errors returned by the client.
+func TestAPIErrorStatusCodeEcho(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ name, key, body, want string }{
+		{"echo_empty", "418", "", "HTTP REDACTED"},
+		{"echo_body", "418", "nope", "HTTP REDACTED: nope"},
+		{"different_key", "abc", "", "HTTP 418"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			c := statusCodeEchoClient(subtest, tc.key, tc.body, http.StatusTeapot)
+			ctx, cancel := context.WithTimeout(subtest.Context(), 5*time.Second)
+			defer cancel()
+			_, err := c.GetIndex(ctx)
+			assertStatusCodeEcho(subtest, err, http.StatusTeapot, tc.want)
+		})
+	}
+}
+
+// TestAPIErrorStatusCodeEchoCallerBuilt checks the raw status fallback for caller-built errors.
+func TestAPIErrorStatusCodeEchoCallerBuilt(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ name, body, want string }{
+		{"empty", "", "HTTP 500"},
+		{"body", "nope", "HTTP 500: nope"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			err := &APIError{StatusCode: http.StatusInternalServerError, Body: tc.body}
+			assertStatusCodeEcho(subtest, err, http.StatusInternalServerError, tc.want)
+		})
+	}
+}
+
+// statusCodeEchoClient starts a fixture server with the given status and body.
+func statusCodeEchoClient(t *testing.T, key, body string, code int) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(code)
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write fixture response: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c, err := New(srv.URL, key, WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatalf("create fixture client: %v", err)
+	}
+	return c
+}
+
+// assertStatusCodeEcho checks the error type, raw status, and complete rendered message.
+func assertStatusCodeEcho(t *testing.T, err error, code int, want string) {
+	t.Helper()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected APIError, got %v", err)
+	}
+	if apiErr.StatusCode != code {
+		t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, code)
+	}
+	if got, fullWant := err.Error(), "mylar: "+want; got != fullWant {
+		t.Errorf("Error() = %q, want %q", got, fullWant)
+	}
+}
+
+// TestAPIErrorLiteralsSetStatusText checks that package literals initialize the rendered status code.
+func TestAPIErrorLiteralsSetStatusText(t *testing.T) {
+	t.Parallel()
+	const maxEntries = 128
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read module directory: %v", err)
+	}
+	if len(entries) > maxEntries {
+		t.Fatalf("module directory exceeds %d entries", maxEntries)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files := token.NewFileSet()
+		for _, pos := range apiErrorLiteralsMissingStatusText(t, files, name, nil) {
+			t.Errorf("%s: APIError literal is missing statusText", files.Position(pos))
+		}
+	}
+}
+
+// TestAPIErrorLiteralsSetStatusTextFixture checks the scanner on both literal forms.
+func TestAPIErrorLiteralsSetStatusTextFixture(t *testing.T) {
+	t.Parallel()
+	const source = `package fixture
+var missing = &APIError{StatusCode: 418}
+var set = APIError{StatusCode: 418, statusText: "REDACTED"}
+`
+	files := token.NewFileSet()
+	positions := apiErrorLiteralsMissingStatusText(t, files, "fixture.go", source)
+	if len(positions) != 1 {
+		t.Fatalf("reported %d literals, want 1", len(positions))
+	}
+	if line := files.Position(positions[0]).Line; line != 2 {
+		t.Errorf("reported literal at line %d, want line 2", line)
+	}
+}
+
+// apiErrorLiteralsMissingStatusText finds APIError literals missing the rendered status code.
+func apiErrorLiteralsMissingStatusText(t *testing.T, files *token.FileSet, name string, source any) []token.Pos {
+	t.Helper()
+	const maxNodes = 100_000
+	parsed, err := parser.ParseFile(files, name, source, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", name, err)
+	}
+	var missing []token.Pos
+	nodes := 0
+	for node := range ast.Preorder(parsed) {
+		nodes++
+		if nodes > maxNodes {
+			t.Fatalf("%s exceeds %d AST nodes", name, maxNodes)
+		}
+		literal, ok := node.(*ast.CompositeLit)
+		if ok && isAPIErrorWithoutStatusText(literal) {
+			missing = append(missing, literal.Pos())
+		}
+	}
+	return missing
+}
+
+// isAPIErrorWithoutStatusText reports whether a literal names APIError and omits statusText.
+func isAPIErrorWithoutStatusText(literal *ast.CompositeLit) bool {
+	name, ok := literal.Type.(*ast.Ident)
+	if !ok || name.Name != "APIError" {
+		return false
+	}
+	return !slices.ContainsFunc(literal.Elts, func(element ast.Expr) bool {
+		field, keyed := element.(*ast.KeyValueExpr)
+		if !keyed {
+			return false
+		}
+		fieldName, named := field.Key.(*ast.Ident)
+		return named && fieldName.Name == "statusText"
+	})
 }

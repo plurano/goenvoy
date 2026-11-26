@@ -64,14 +64,23 @@ func New(baseURL, apiKey string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// APIError is returned when the API responds with a non-2xx status.
+// APIError reports a non-2xx response. StatusCode holds the raw code and Error renders the scrubbed code.
 type APIError struct {
 	StatusCode int    `json:"-"`
 	Status     string `json:"-"`
 	Body       string `json:"-"`
+
+	statusText string
 }
 
+// Error returns the HTTP status and any response message.
 func (e *APIError) Error() string {
+	if e.statusText != "" {
+		if e.Body != "" {
+			return "mylar: HTTP " + e.statusText + ": " + e.Body
+		}
+		return "mylar: HTTP " + e.statusText
+	}
 	if e.Body != "" {
 		return fmt.Sprintf("mylar: HTTP %d: %s", e.StatusCode, e.Body)
 	}
@@ -105,7 +114,12 @@ func (c *Client) get(ctx context.Context, cmd string, params url.Values, v any) 
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &APIError{StatusCode: resp.StatusCode, Status: c.scrubText(resp.Status), Body: c.scrubBody(string(data))}
+		return &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     c.scrubText(resp.Status),
+			Body:       c.scrubBody(string(data)),
+			statusText: c.scrubStatusCode(resp.StatusCode),
+		}
 	}
 
 	if v != nil {

@@ -19,7 +19,7 @@ API key passed as `apikey` query parameter against `/api/v2`.
 - Root URL copy -> one cause inspection. Unsafe first read -> fixed opaque cause.
 - Clean root whose Op, URL or cause field changes during inspection, or whose cause value is not comparable -> fixed message.
 - Unchanged root spends one of 64 reads: cause of 64 or more values read (typed-nil children included) -> fixed message, no cause text read.
-- `APIError.RawBody` on HTTP status errors + envelope message errors (`APIError.StatusCode` numeric). Literal key -> inline `REDACTED`.
+- `APIError.RawBody` + rendered status code on HTTP status errors + envelope message errors. Literal key -> inline `REDACTED`. `StatusCode` -> raw number.
 - Decode percent-only, backslash-only, and mixed projections.
 - Match literal, percent, and backslash-u spellings per key byte. Hex digits -> ASCII only.
 - Spelling comparison limit -> `maxSpellingStepsFactor` (8) × text bytes plus key bytes.

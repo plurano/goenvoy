@@ -34,6 +34,11 @@ func (c *Client) scrubBody(text string) string {
 	return c.scrubText(text)
 }
 
+// scrubStatusCode applies key redaction to the decimal HTTP status code.
+func (c *Client) scrubStatusCode(code int) string {
+	return c.scrubText(strconv.Itoa(code))
+}
+
 // scrubText applies inline redaction and hides text if decoding still reveals the key.
 func (c *Client) scrubText(text string) string {
 	text = c.scrub(text)
