@@ -62,20 +62,168 @@ func TestRedactErrorSameKeyWrapperIdentity(t *testing.T) {
 			if same := any(got) == any(input); same != tc.keep {
 				subtest.Errorf("same error value = %t; want %t", same, tc.keep)
 			}
-			assertSameKeyWrapperURL(subtest, got, tc.keep)
+			wantURL := ""
+			if tc.keep {
+				wantURL = wrapperFixtureRedactedURL
+			}
+			assertSameKeyWrapperURL(subtest, got, wantURL)
+		})
+	}
+}
+
+const (
+	wrapperFixtureURL         = "http://h/feed"
+	wrapperFixtureRedactedURL = wrapperFixtureURL + "?apikey=REDACTED"
+)
+
+type redactWrapperField struct{ Cause error }
+
+// Error returns fixture text independent of the wrapped error.
+func (*redactWrapperField) Error() string { return "fixture exported cause" }
+
+// Unwrap returns the cause also visible through reflection.
+func (e *redactWrapperField) Unwrap() error { return e.Cause }
+
+type redactWrapperTimeout struct {
+	redactFixtureCause
+	redactClassifier
+}
+
+// TestRedactErrorOwnedWrapperPositions checks each wrapper type, key, and position.
+func TestRedactErrorOwnedWrapperPositions(t *testing.T) {
+	t.Parallel()
+	client := &Client{apiKey: "maple"}
+	for _, key := range [...]string{"maple", "cedar"} {
+		t.Run(key, func(keyTest *testing.T) {
+			keyTest.Parallel()
+			owner := &Client{apiKey: key}
+			rawURL := wrapperFixtureURL + "?apikey=" + key
+			wrapped := owner.redactError(fmt.Errorf("fixture op: %w", &url.Error{Op: "Get", URL: rawURL, Err: io.EOF}))
+			timeout := redactWrapperTimeout{redactFixtureCause: redactFixtureCause{error: io.EOF}}
+			for _, wrapper := range [...]struct {
+				name, recoveredURL string
+				err                error
+			}{
+				{"redacted", wrapperFixtureRedactedURL, wrapped},
+				{"opaque URL cause", "", redactWrapperFixtureCause(keyTest, owner, rawURL, io.EOF)},
+				{"classified URL cause", "", redactWrapperFixtureCause(keyTest, owner, rawURL, timeout)},
+			} {
+				keyTest.Run(wrapper.name, func(wrapperTest *testing.T) {
+					wrapperTest.Parallel()
+					assertOwnedWrapperPositions(wrapperTest, client, wrapper.err, key == client.apiKey, wrapper.recoveredURL)
+				})
+			}
+		})
+	}
+	t.Run("external formatter", testExternalFormatterPositions)
+}
+
+// redactWrapperFixtureCause returns the sanitized cause of a URL error containing the owner's key.
+func redactWrapperFixtureCause(t *testing.T, owner *Client, rawURL string, cause error) error {
+	t.Helper()
+	input := &url.Error{Op: "Get", URL: rawURL, Err: cause}
+	copied, ok := owner.redactError(input).(*url.Error) //nolint:errorlint // require the direct URL copy
+	if !ok || copied == input || copied.URL != wrapperFixtureRedactedURL {
+		t.Fatal("redactError did not return a sanitized URL copy")
+	}
+	return copied.Err
+}
+
+// assertOwnedWrapperPositions checks identity and URL recovery at each wrapper position.
+func assertOwnedWrapperPositions(t *testing.T, client *Client, wrapped error, keep bool, recoveredURL string) {
+	t.Helper()
+	for _, position := range [...]struct {
+		name, wantURL string
+		input         error
+	}{
+		{"root", recoveredURL, wrapped},
+		{"wrapped chain", recoveredURL, fmt.Errorf("fixture again: %w", wrapped)},
+		{"URL cause", wrapperFixtureURL, &url.Error{Op: "Get", URL: wrapperFixtureURL, Err: wrapped}},
+		{"exported field", recoveredURL, &redactWrapperField{Cause: wrapped}},
+	} {
+		t.Run(position.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			got := client.redactError(position.input)
+			if same := any(got) == any(position.input); same != keep {
+				subtest.Errorf("same error value = %t; want %t", same, keep)
+			}
+			if keep {
+				assertSameKeyWrapperURL(subtest, got, position.wantURL)
+			}
+		})
+	}
+}
+
+// testExternalFormatterPositions checks that an external formatter remains opaque.
+func testExternalFormatterPositions(t *testing.T) {
+	t.Parallel()
+	client := &Client{apiKey: "maple"}
+	formatter := &redactFixtureFormatter{cause: io.EOF, text: "fixture maple formatting"}
+	reflected := &redactReflectFieldError{Formatter: formatter}
+	for _, tc := range [...]struct {
+		name  string
+		input error
+	}{
+		{"URL cause", &url.Error{Op: "Get", URL: wrapperFixtureURL, Err: formatter}},
+		{"exported field", &redactWrapperField{Cause: formatter}},
+		{"URL cause with reflected formatter", &url.Error{Op: "Get", URL: wrapperFixtureURL, Err: reflected}},
+		{"exported field with reflected formatter", &redactWrapperField{Cause: reflected}},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			got := client.redactError(tc.input)
+			if any(got) == any(tc.input) {
+				subtest.Error("redactError kept an error containing an external formatter")
+			}
+			assertNoKeyForms(subtest, fmt.Sprintf("%#v", got), "maple")
+		})
+	}
+}
+
+// TestRedactErrorIdempotent checks that a second pass keeps the first result.
+func TestRedactErrorIdempotent(t *testing.T) {
+	t.Parallel()
+	client := &Client{apiKey: "maple"}
+	foreign := (&Client{apiKey: "cedar"}).redactError(fmt.Errorf("fixture cedar: %w", io.EOF))
+	timeout := redactWrapperTimeout{redactFixtureCause: redactFixtureCause{error: io.EOF}}
+	var leaves [maxErrNodes]error
+	for index := range leaves {
+		leaves[index] = io.EOF
+	}
+	for _, tc := range [...]struct {
+		name  string
+		input error
+	}{
+		{"key in URL", &url.Error{Op: "Get", URL: wrapperFixtureURL + "?apikey=maple", Err: io.EOF}},
+		{"key in Op", &url.Error{Op: "Get maple", URL: wrapperFixtureURL, Err: io.EOF}},
+		{"key in error text", errors.New("fixture maple cause")},
+		{"key in joined error", errors.Join(io.EOF, errors.New("fixture maple cause"))},
+		{"clean error", io.EOF},
+		{"clean URL", &url.Error{Op: "Get", URL: wrapperFixtureURL, Err: io.EOF}},
+		{"URL copy with timeout", &url.Error{Op: "Get", URL: wrapperFixtureURL + "?apikey=maple", Err: timeout}},
+		{"URL with typed-nil cause", &url.Error{Op: "Get", URL: wrapperFixtureURL, Err: (*redactNilTimeoutCause)(nil)}},
+		{"over-limit tree", errors.Join(leaves[:]...)},
+		{"foreign-key wrapper", foreign},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			first := client.redactError(tc.input)
+			if second := client.redactError(first); any(second) != any(first) {
+				subtest.Errorf("second redaction returned %T; want the first %T value", second, first)
+			}
 		})
 	}
 }
 
 // assertSameKeyWrapperURL checks sanitized URL recovery across the wrapper.
-func assertSameKeyWrapperURL(t *testing.T, got error, want bool) {
+func assertSameKeyWrapperURL(t *testing.T, got error, wantURL string) {
 	t.Helper()
-	const cleanURL = "http://h/feed?apikey=REDACTED"
 	var exposed *url.Error
+	want := wantURL != ""
 	if found := errors.As(got, &exposed); found != want {
 		t.Errorf("errors.As found a URL error = %t; want %t", found, want)
-	} else if found && (exposed == nil || exposed.URL != cleanURL) {
-		t.Errorf("exposed URL error = %v; want URL %q", exposed, cleanURL)
+	} else if found && (exposed == nil || exposed.URL != wantURL) {
+		t.Errorf("exposed URL error = %v; want URL %q", exposed, wantURL)
 	}
 }
 

@@ -915,10 +915,16 @@ func inspectErrorTree(err error) (errorTree, bool) {
 	return tree, false
 }
 
+// ownsWrapper reports whether node is a package wrapper with this client's key.
+func (c *Client) ownsWrapper(node error) bool {
+	hidden := hiddenRedaction(node)
+	return hidden != nil && hidden.key == c.apiKey
+}
+
 // hasCustomFormattingOrAs reports whether a node outside the current key's wrappers controls formatting or errors.As.
 func (c *Client) hasCustomFormattingOrAs(node error) bool {
-	if hidden := hiddenRedaction(node); hidden != nil {
-		return hidden.key != c.apiKey
+	if c.ownsWrapper(node) {
+		return false
 	}
 	_, formats := node.(fmt.Formatter)
 	_, goStrings := node.(fmt.GoStringer)
@@ -928,7 +934,7 @@ func (c *Client) hasCustomFormattingOrAs(node error) bool {
 
 // errorNodeNeedsRedaction checks URL fields, error text, and values visible to Go-syntax formatting.
 func (c *Client) errorNodeNeedsRedaction(node error) bool {
-	if hidden := hiddenRedaction(node); hidden != nil && hidden.key == c.apiKey {
+	if c.ownsWrapper(node) {
 		return false
 	}
 	if uerr, ok := node.(*url.Error); ok && (c.containsKey(uerr.Op) || c.containsKey(uerr.URL)) { //nolint:errorlint // inspect only this node's fields
@@ -942,12 +948,13 @@ const maxReflectedValues = 1024
 
 // reflectedErrorNeedsRedaction checks visible values without invoking formatting methods.
 func (c *Client) reflectedErrorNeedsRedaction(root reflect.Value) bool {
-	queue := []reflect.Value{root}
-	if root.Kind() == reflect.Pointer && !root.IsNil() {
-		queue = append(queue, root.Elem())
-	}
+	queue := reflectedRootValues(root)
 	for i := 0; i < len(queue) && i < maxReflectedValues; i++ {
 		value := queue[i]
+		if i != 0 && c.ownsReflectedWrapper(value) {
+			// Why: this wrapper formats only its scrubbed message.
+			continue
+		}
 		if i != 0 && hasReflectedFormatter(value) {
 			return true
 		}
@@ -957,6 +964,23 @@ func (c *Client) reflectedErrorNeedsRedaction(root reflect.Value) bool {
 		}
 	}
 	return false
+}
+
+// reflectedRootValues seeds the walk, following only the starting pointer.
+func reflectedRootValues(root reflect.Value) []reflect.Value {
+	if root.Kind() == reflect.Pointer && !root.IsNil() {
+		return []reflect.Value{root, root.Elem()}
+	}
+	return []reflect.Value{root}
+}
+
+// ownsReflectedWrapper reports whether value is a visible, non-nil pointer to this client's wrapper.
+func (c *Client) ownsReflectedWrapper(value reflect.Value) bool {
+	if !value.CanInterface() || value.Kind() != reflect.Pointer || value.IsNil() {
+		return false
+	}
+	node, ok := value.Interface().(error)
+	return ok && c.ownsWrapper(node)
 }
 
 // hasReflectedFormatter reports whether fmt would call formatting code for this value.
@@ -1117,9 +1141,9 @@ func (c *Client) redactError(err error) error {
 
 // redactRootURL copies a URL error when its fields or cause require redaction.
 func (c *Client) redactRootURL(uerr *url.Error) error {
-	cause := uerr.Err
-	cleanOp, cleanURL := c.scrubText(uerr.Op), c.scrubText(redactURL(uerr.URL))
-	changed := cleanOp != uerr.Op || cleanURL != uerr.URL
+	op, rawURL, cause := uerr.Op, uerr.URL, uerr.Err
+	cleanOp, cleanURL := c.scrubText(op), c.scrubText(redactURL(rawURL))
+	changed := cleanOp != op || cleanURL != rawURL
 	tree, unsafe := inspectErrorTree(cause)
 	// Why: an unchanged URL root still counts toward the whole-tree inspection limit.
 	if !changed && len(tree.nodes) >= maxErrNodes {
@@ -1128,9 +1152,9 @@ func (c *Client) redactRootURL(uerr *url.Error) error {
 	if changed || c.errorTreeNeedsRedaction(tree, unsafe) {
 		return &url.Error{Op: cleanOp, URL: cleanURL, Err: c.buildURLCause(cause, tree, unsafe, false)}
 	}
-	observed := &url.Error{Op: uerr.Op, URL: uerr.URL, Err: cause}
+	observed := &url.Error{Op: op, URL: rawURL, Err: cause}
 	carry := cause != nil && c.errorNodeNeedsRedaction(observed)
-	if !sameErrorValue(cause, uerr.Err) {
+	if uerr.Op != op || uerr.URL != rawURL || !sameErrorValue(cause, uerr.Err) {
 		return c.scrubCheckedError(uerr, true, true)
 	}
 	return c.scrubCheckedError(uerr, carry, false)

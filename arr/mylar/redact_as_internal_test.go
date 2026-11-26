@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -2144,6 +2145,104 @@ func TestRedactErrorRootURLReplacedCause(t *testing.T) {
 				subtest.Errorf("replacement Error called %d times; want 0", calls)
 			}
 		})
+	}
+}
+
+type redactChangingRootFields struct {
+	parent     *url.Error
+	change     func(*url.Error)
+	onRootText bool
+	textReads  int
+}
+
+// Error changes the parent fields during the root text check when configured.
+func (e *redactChangingRootFields) Error() string {
+	e.textReads++
+	if e.onRootText && e.textReads == 2 {
+		e.applyChange()
+	}
+	return "fixture inspected cause"
+}
+
+// Unwrap changes the parent fields during structural inspection when configured.
+func (e *redactChangingRootFields) Unwrap() error {
+	if !e.onRootText {
+		e.applyChange()
+	}
+	return nil
+}
+
+// applyChange updates the parent fields once.
+func (e *redactChangingRootFields) applyChange() {
+	if e.parent != nil {
+		e.change(e.parent)
+		e.parent = nil
+	}
+}
+
+// TestRedactErrorRootURLChangedFields checks both callback stages and an unchanged control.
+func TestRedactErrorRootURLChangedFields(t *testing.T) {
+	t.Parallel()
+	const cleanOp, cleanURL = "Get", "http://h/feed"
+	changeURL := func(parent *url.Error) { parent.URL = cleanURL + "?apikey=maple" }
+	changeOp := func(parent *url.Error) { parent.Op = cleanOp + " maple" }
+	keepFields := func(parent *url.Error) { parent.Op, parent.URL = cleanOp, cleanURL }
+	client := &Client{apiKey: "maple"}
+	for _, tc := range [...]struct {
+		name       string
+		change     func(*url.Error)
+		onRootText bool
+		keep       bool
+	}{
+		{"URL during inspection", changeURL, false, false},
+		{"URL during root text", changeURL, true, false},
+		{"Op during inspection", changeOp, false, false},
+		{"Op during root text", changeOp, true, false},
+		{"unchanged fields", keepFields, true, true},
+	} {
+		t.Run(tc.name, func(subtest *testing.T) {
+			subtest.Parallel()
+			input := &url.Error{Op: cleanOp, URL: cleanURL}
+			cause := &redactChangingRootFields{parent: input, change: tc.change, onRootText: tc.onRootText}
+			input.Err = cause
+			got := client.redactError(input)
+			if cause.parent != nil || cause.textReads != 2 {
+				subtest.Errorf("change applied = %t, cause text reads = %d; want true, 2", cause.parent == nil, cause.textReads)
+			}
+			assertChangedRootURL(subtest, got, input, tc.keep)
+		})
+	}
+}
+
+// assertChangedRootURL checks the fixed message and formatting, or exact identity for the control.
+func assertChangedRootURL(t *testing.T, got error, input *url.Error, keep bool) {
+	t.Helper()
+	if keep {
+		if any(got) != input {
+			t.Error("redactError changed identity after assigning identical fields")
+		}
+		return
+	}
+	assertFixedRootURL(t, got)
+	for index, text := range [...]string{fmt.Sprint(got), fmt.Sprintf("%+v", got), fmt.Sprintf("%#v", got)} {
+		if strings.Contains(text, "maple") {
+			t.Errorf("format %d exposed the fixture key", index)
+		}
+	}
+}
+
+// TestURLErrorFieldSet pins the fields inspected before retaining a URL error.
+func TestURLErrorFieldSet(t *testing.T) {
+	t.Parallel()
+	typ := reflect.TypeFor[url.Error]()
+	fields := [...]string{"Op", "URL", "Err"}
+	if typ.NumField() != len(fields) {
+		t.Fatalf("url.Error has %d fields; want %d", typ.NumField(), len(fields))
+	}
+	for index, name := range fields {
+		if field := typ.Field(index); field.Name != name {
+			t.Errorf("url.Error field %d = %s; want %s", index, field.Name, name)
+		}
 	}
 }
 
