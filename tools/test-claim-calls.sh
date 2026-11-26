@@ -14,6 +14,7 @@ trap 'rm -f "$LIST"' EXIT
 git -C "$ROOT" ls-files -z --deduplicate -- '*_test.go' > "$LIST" || exit 2
 mapfile -d '' -t files < "$LIST"
 
+# Why: check the call claims in one Go test file and send diagnostics to stderr.
 scan_file() {
   CLAIM_PATH="$1" awk -f "$HERE/test-claim-calls.awk" "$ROOT/$1" >&2
 }

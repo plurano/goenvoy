@@ -17,6 +17,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Why: create a fixture repository and stage the test source read from stdin.
 track_fixture() {
   local name="$1" file="$2"
   git -C "$WORK" init -q "$name"
