@@ -39,20 +39,24 @@ func TestRedactErrorRootIdentity(t *testing.T) {
 // assertRootIdentity checks the identity, cause, and text of a redacted root URL error.
 func assertRootIdentity(t *testing.T, c *Client, uerr *url.Error, sentinel error, keep bool) {
 	t.Helper()
-	op, want := uerr.Op, uerr.Err
+	op, rawURL, want := uerr.Op, uerr.URL, uerr.Err
 	got := c.redactError(uerr)
+	if uerr.Op != op || uerr.URL != rawURL {
+		t.Error("redactError modified the input URL error")
+	}
 	if same := any(got) == any(uerr); same != keep {
 		t.Errorf("same error value = %v; want %v", same, keep)
 	}
-	// Why: a sanitized root stays a *url.Error copy, not a hidden wrapper, so callers keep Op, URL and Err.
-	if clean, ok := got.(*url.Error); !keep { //nolint:errorlint // require the root type directly
+	if keep {
+		if !errors.Is(got, uerr) {
+			t.Error("errors.Is lost the original root URL error")
+		}
+	} else {
+		clean, ok := got.(*url.Error) //nolint:errorlint // require the root type directly
 		if !ok || clean.Op != c.scrub(op) {
 			t.Fatalf("redacted root = %T; want a *url.Error copy with a scrubbed Op", got)
 		}
 		assertRedactedRootCause(t, clean, uerr, want)
-	}
-	if keep && !errors.Is(got, uerr) {
-		t.Error("errors.Is lost the original root URL error")
 	}
 	if !errors.Is(got, sentinel) {
 		t.Error("errors.Is lost the sentinel cause")

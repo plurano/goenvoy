@@ -164,8 +164,8 @@ func TestScrubBoundaries(t *testing.T) {
 	if original.URL != "?apikey=placeholder" {
 		t.Error("mutated original URL error")
 	}
-	var copied *url.Error
-	if !errors.As(result, &copied) || copied == nil {
+	copied, ok := result.(*url.Error) //nolint:errorlint // require the root type directly
+	if !ok || copied == nil {
 		t.Fatal("expected a sanitized URL error copy")
 	}
 	assertRedactedRootCause(t, copied, original, want)

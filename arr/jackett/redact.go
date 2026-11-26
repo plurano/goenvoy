@@ -332,12 +332,34 @@ func classifyHiddenError[T any](e *redactedError, classify func(T) bool) bool {
 	if unsafe {
 		return false
 	}
-	return classifyTree(tree, e.key, classify)
+	var snapshots classificationSnapshots
+	return classifyTree(tree, e.key, &snapshots, classify)
 }
 
 type errorTree struct {
 	nodes []error
 	ends  []int
+}
+
+type classificationSnapshot struct {
+	tree   errorTree
+	unsafe bool
+}
+
+type classificationSnapshots map[*redactedError]*classificationSnapshot
+
+// inspect returns the first tree observed inside a wrapper during this operation.
+func (snapshots *classificationSnapshots) inspect(wrapper *redactedError) *classificationSnapshot {
+	if snapshot, ok := (*snapshots)[wrapper]; ok {
+		return snapshot
+	}
+	tree, unsafe := inspectErrorTree(wrapper.err)
+	snapshot := &classificationSnapshot{tree: tree, unsafe: unsafe}
+	if *snapshots == nil {
+		*snapshots = make(classificationSnapshots)
+	}
+	(*snapshots)[wrapper] = snapshot
+	return snapshot
 }
 
 type errorSpan struct {
@@ -359,18 +381,17 @@ func (slot errorSlot) children() errorSpan {
 	return errorSpan{tree: slot.tree, start: start, end: slot.tree.ends[slot.index]}
 }
 
-// classifyTree reports the first applicable classification in depth-first errors.Is order.
-func classifyTree[T any](tree errorTree, key string, classify func(T) bool) bool {
+// classifyTree reports the first applicable classification in depth-first errors.Is order and charges each recorded node once.
+func classifyTree[T any](tree errorTree, key string, snapshots *classificationSnapshots, classify func(T) bool) bool {
 	if len(tree.nodes) == 0 {
 		return false
 	}
-	// Why: classify the tree that passed inspection.
 	stack := []errorSpan{{tree: &tree, end: 1}}
-	// Why: inspections and popped slots draw from the same budget.
-	for steps := len(tree.nodes); steps < maxWalkSteps && len(stack) > 0; {
+	reads := len(tree.nodes)
+	// Why: every pop dispatches a slot already charged by an inspection, so pops never exceed reads.
+	for i := 0; i < maxWalkSteps && len(stack) > 0; i++ {
 		var slot errorSlot
 		stack, slot = popErrorSlot(stack)
-		steps++
 		action, reported := classifyNode(slot, key, classify)
 		if action == walkStop {
 			return reported
@@ -378,11 +399,11 @@ func classifyTree[T any](tree errorTree, key string, classify func(T) bool) bool
 		if action == walkCauseOnly {
 			stack = stack[:0]
 		}
-		children, read, unsafe := classificationChildren(slot, maxWalkSteps-steps)
+		children, read, unsafe := classificationChildren(slot, maxWalkSteps-reads, snapshots)
 		if unsafe {
 			return false
 		}
-		steps += read
+		reads += read
 		if children.start < children.end {
 			stack = append(stack, children)
 		}
@@ -401,14 +422,15 @@ func popErrorSlot(stack []errorSpan) ([]errorSpan, errorSlot) {
 	return stack, slot
 }
 
-// classificationChildren returns the child span, inspection cost, and whether traversal must stop.
-func classificationChildren(slot errorSlot, remaining int) (errorSpan, int, bool) {
+// classificationChildren returns the child span, snapshot read cost, and whether traversal must stop.
+func classificationChildren(slot errorSlot, remaining int, snapshots *classificationSnapshots) (errorSpan, int, bool) {
 	if wrapper, ok := slot.tree.nodes[slot.index].(*redactedError); ok { //nolint:errorlint // enter only the current package wrapper
 		if remaining < maxErrNodes {
 			return errorSpan{}, 0, true
 		}
-		tree, unsafe := inspectErrorTree(wrapper.err)
-		return errorSpan{tree: &tree, end: min(1, len(tree.nodes))}, len(tree.nodes), unsafe
+		snapshot := snapshots.inspect(wrapper)
+		read := len(snapshot.tree.nodes)
+		return errorSpan{tree: &snapshot.tree, end: min(1, read)}, read, snapshot.unsafe
 	}
 	return slot.children(), 0, false
 }
@@ -648,8 +670,8 @@ func isNilError(err error) bool {
 
 // As sets target to a sanitized copy of the first non-nil *url.Error within 64 breadth-first nodes.
 // It suppresses classification if the current tree is unsafe, preserves nil causes, and replaces unsafe causes with a fixed error.
-// For a safe immediate cause implementing Timeout or Temporary, the copy reads its tree once and classifies from that read.
-// One classification counts popped nodes and every node its inspections read against 4096; entering a same-key wrapper with fewer than 64 left → false.
+// For a safe immediate cause implementing Timeout or Temporary, the copy reads its tree and every same-key wrapper tree inside it once and uses them for both classifications.
+// One classification counts every node it reads (the cause tree and each same-key wrapper tree it enters) once against 4096; entering a same-key wrapper with fewer than 64 left → false.
 func (e *redactedError) As(target any) bool {
 	dst, ok := target.(**url.Error)
 	if !ok {
@@ -715,13 +737,15 @@ func (e *classifiedURLCause) Timeout() bool { return e.timeout }
 // Temporary reports whether the cause was temporary when copied.
 func (e *classifiedURLCause) Temporary() bool { return e.temporary }
 
-// newClassifiedURLCause captures each classifier's result from the same inspected cause and a synthetic URL root.
+// newClassifiedURLCause captures both results from shared snapshots under a synthetic URL root.
 func newClassifiedURLCause(cause opaqueURLCause, tree errorTree) *classifiedURLCause {
 	tree = tree.withURLRoot()
+	// Why: both passes visit prefixes of the same depth-first order, so the pop bound also bounds the shared cache.
+	var snapshots classificationSnapshots
 	return &classifiedURLCause{
 		opaqueURLCause: cause,
-		timeout:        classifyTree(tree, cause.hidden.key, hiddenTimeoutClassifier.Timeout),
-		temporary:      classifyTree(tree, cause.hidden.key, hiddenTemporaryClassifier.Temporary),
+		timeout:        classifyTree(tree, cause.hidden.key, &snapshots, hiddenTimeoutClassifier.Timeout),
+		temporary:      classifyTree(tree, cause.hidden.key, &snapshots, hiddenTemporaryClassifier.Temporary),
 	}
 }
 
