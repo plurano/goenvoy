@@ -23,6 +23,32 @@ expect_refusal() {
   esac
 }
 
+# expect_status NAME STATUS NEEDLE CMD...: assert exact status, a diagnostic on stderr and empty stdout.
+expect_status() (
+  local name="$1" want_status="$2" needle="$3" output stderr status=0
+  shift 3
+  output="$(mktemp -d)" || exit 1
+  trap 'rm -rf -- "$output"' EXIT
+  ("$@") > "$output/stdout" 2> "$output/stderr" || status=$?
+  # Why: the final dot preserves trailing newlines during command substitution.
+  stderr="$(cat -- "$output/stderr" && printf '.')" || exit 1
+  stderr="${stderr%.}"
+  if [[ "$status" != "$want_status" ]]; then
+    printf 'FAIL %s: got status %s, want %s\n%s\n' "$name" "$status" "$want_status" "$stderr" >&2
+    exit 1
+  fi
+  if [[ -s "$output/stdout" ]]; then
+    printf 'FAIL %s: stdout was not empty\n' "$name" >&2
+    exit 1
+  fi
+  if [[ -z "$needle" || "$stderr" != *"$needle"* ]]; then
+    printf 'FAIL %s: stderr did not contain the required diagnostic "%s"\n%s\n' "$name" "$needle" "$stderr" >&2
+    exit 1
+  fi
+  printf 'ok   %s: refused (%s, status %s)\n' "$name" "$needle" "$status"
+  exit 0
+)
+
 # expect_pass NAME CMD...: assert command succeeds.
 expect_pass() {
   local name="$1" out

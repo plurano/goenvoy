@@ -114,6 +114,11 @@ jobs:
         run: bash tools/redact-parity_test.sh
       - name: Redaction copies match across modules
         run: bash tools/redact-parity.sh
+      # Why: the workflows job runs on Ubuntu (HISS-21 stated skip for macOS and Windows).
+      - name: Test-claim check detects planted unmet claims
+        run: bash tools/test-claim-calls_test.sh
+      - name: Test comments name calls the test makes
+        run: bash tools/test-claim-calls.sh
       - name: Privileged writes stage and rename
         run: bash tools/privileged-write_test.sh
       - name: Documented module count matches the release manifest
