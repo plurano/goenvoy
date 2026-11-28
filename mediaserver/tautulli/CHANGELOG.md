@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.5](https://github.com/plurano/goenvoy/compare/mediaserver/tautulli/v2.0.4...mediaserver/tautulli/v2.0.5) (2026-11-28)
+
+
+### Bug Fixes
+
+* **arr,mediaserver:** close redaction gaps found in post-merge review ([#348](https://github.com/plurano/goenvoy/issues/348)) ([6293971](https://github.com/plurano/goenvoy/commit/62939717c1adf2a5314b11099e97d70933563340))
+
 ## [2.0.4](https://github.com/golusoris/goenvoy/compare/mediaserver/tautulli/v2.0.3...mediaserver/tautulli/v2.0.4) (2026-11-20)
 
 

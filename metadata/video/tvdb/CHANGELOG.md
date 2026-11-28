@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.9](https://github.com/plurano/goenvoy/compare/metadata/video/tvdb/v1.3.8...metadata/video/tvdb/v1.3.9) (2026-11-28)
+
+
+### Bug Fixes
+
+* **deps:** update module github.com/golusoris/goenvoy/metadata to v1.4.5 ([#367](https://github.com/plurano/goenvoy/issues/367)) ([bb7ff30](https://github.com/plurano/goenvoy/commit/bb7ff301368a6cff3acc8a96cceb65a22e9f99f3))
+* **tvdb:** coalesce concurrent re-logins after a 401 ([#381](https://github.com/plurano/goenvoy/issues/381)) ([2fd8454](https://github.com/plurano/goenvoy/commit/2fd8454385aac8bf25064c16e5df265156565813)), closes [#380](https://github.com/plurano/goenvoy/issues/380)
+
 ## [1.3.8](https://github.com/golusoris/goenvoy/compare/metadata/video/tvdb/v1.3.7...metadata/video/tvdb/v1.3.8) (2026-11-20)
 
 
